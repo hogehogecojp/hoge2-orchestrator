@@ -535,49 +535,71 @@ async function startTask(issue) {
       return true;
     }
 
-    // handlePaneMissing と同じコアに相乗りして自動収束させる（pane 消失と resumeCount /
-    // 上限を合算で管理）。最新の state（resumeCount / wpPort を含む）を渡す。
-    // getTask が null（state レコード喪失）だと resumeCount で上限判定できず、偽の初回
-    // 扱い（resumeCount=1 リセット）で無限リトライに化ける。readState は破損時も例外を
-    // 投げず {issues:{}} を返すため getTask は null になり得る。上限の唯一の安全装置を
-    // 状態喪失で失わないよう、レコードを取れないときは再ディスパッチせず watchdog /
-    // 次ループに委ねる（フォールバックオブジェクトで resumeCount を偽装しない）。
-    let saved = null;
-    try {
-      saved = await getTask(number);
-    } catch (err) {
-      console.warn(`  [submit] state 取得に失敗（今回は再ディスパッチを見送り）: ${err.message}`);
-    }
-    if (!saved) {
-      console.warn(
-        `  [submit] 本文が入力欄に届いていない可能性がありますが、state レコードを取得できず自動再開の上限判定ができないため再ディスパッチを見送ります。watchdog / 次ループに委ねます (issue #${number}, termId=${termId})`
-      );
-      return true;
-    }
-
     console.warn(
       `  [submit] 本文が入力欄に届いていない可能性があります。status:ready へ戻して自動再ディスパッチします (issue #${number}, termId=${termId})`
     );
-    await handleUndeliveredBody(
-      issue,
-      saved,
-      {
-        // GitHub 連携無効時は PR が存在しえないため「PR なし」を返す fake を渡す（scanWatchdog と同方針）。
-        findPRForIssue: GITHUB_INTEGRATION ? github.findPRForIssue.bind(github) : async () => null,
-        resolveTarget,
-        cleanupForIssue,
-        formatCleanupSummary,
-        updateTask,
-        setStatus: (issueNumber, label) => github.setStatus(issueNumber, label),
-        addComment: (issueNumber, body) => github.addComment(issueNumber, body),
-        failTask: (reason) => markTaskFailed(issue, reason, { cleanupWpPort: saved.wpPort ?? wpPort }),
-      },
-      { resumeMax: PANE_RESUME_MAX }
-    );
-    // ディスパッチ失敗として返す（次ループで status:ready を拾い直す）。
-    return false;
+    return await rollbackUndeliveredBody(issue, termId, wpPort, '本文が入力欄に届いていない可能性があります');
   }
   return true;
+}
+
+/**
+ * 「タスク本文をペインへ届けられなかった」ときのロールバック（status:ready へ戻して再ディスパッチ）。
+ *
+ * 呼び出し元は submitToClaude が bodyConfirmed=false を返した経路（#172）。新しいロールバック
+ * 機構を作らず handleUndeliveredBody（handlePaneMissing と同じコア）に相乗りする。
+ * startTask 本体から切り出しているのは、同じ「本文をペインへ届けられなかった」状況を扱う
+ * 経路が今後増えても、resumeCount による上限判定（state レコードを取れないときは
+ * 再ディスパッチしない安全装置）を必ず通させるため。
+ *
+ * @param {object} issue   task-queue issue
+ * @param {string} termId  対象ターミナルID（ログ用）
+ * @param {number|null} wpPort  buildCommand が確保した wp-env ポート（failed 化時のクリーンアップ用）
+ * @param {string} cause   ログに出す理由（state レコードを取れず見送るときの説明に使う）
+ * @returns {Promise<boolean>} startTask の戻り値。再ディスパッチしたら false（次ループで拾い直す）、
+ *   上限判定ができず見送ったら true（watchdog / 次ループに委ねる）
+ */
+async function rollbackUndeliveredBody(issue, termId, wpPort, cause) {
+  const { number } = issue;
+
+  // handlePaneMissing と同じコアに相乗りして自動収束させる（pane 消失と resumeCount /
+  // 上限を合算で管理）。最新の state（resumeCount / wpPort を含む）を渡す。
+  // getTask が null（state レコード喪失）だと resumeCount で上限判定できず、偽の初回
+  // 扱い（resumeCount=1 リセット）で無限リトライに化ける。readState は破損時も例外を
+  // 投げず {issues:{}} を返すため getTask は null になり得る。上限の唯一の安全装置を
+  // 状態喪失で失わないよう、レコードを取れないときは再ディスパッチせず watchdog /
+  // 次ループに委ねる（フォールバックオブジェクトで resumeCount を偽装しない）。
+  let saved = null;
+  try {
+    saved = await getTask(number);
+  } catch (err) {
+    console.warn(`  [submit] state 取得に失敗（今回は再ディスパッチを見送り）: ${err.message}`);
+  }
+  if (!saved) {
+    console.warn(
+      `  [submit] ${cause}が、state レコードを取得できず自動再開の上限判定ができないため再ディスパッチを見送ります。watchdog / 次ループに委ねます (issue #${number}, termId=${termId})`
+    );
+    return true;
+  }
+
+  await handleUndeliveredBody(
+    issue,
+    saved,
+    {
+      // GitHub 連携無効時は PR が存在しえないため「PR なし」を返す fake を渡す（scanWatchdog と同方針）。
+      findPRForIssue: GITHUB_INTEGRATION ? github.findPRForIssue.bind(github) : async () => null,
+      resolveTarget,
+      cleanupForIssue,
+      formatCleanupSummary,
+      updateTask,
+      setStatus: (issueNumber, label) => github.setStatus(issueNumber, label),
+      addComment: (issueNumber, body) => github.addComment(issueNumber, body),
+      failTask: (reason) => markTaskFailed(issue, reason, { cleanupWpPort: saved.wpPort ?? wpPort }),
+    },
+    { resumeMax: PANE_RESUME_MAX }
+  );
+  // ディスパッチ失敗として返す（次ループで status:ready を拾い直す）。
+  return false;
 }
 
 // -------------------------------------------------------
@@ -911,7 +933,14 @@ async function scanWaitingInputIssues() {
 
     let forwardResult;
     try {
-      forwardResult = await submitToClaude(VK_PORT, saved.termId, reply.body);
+      // clearBeforeSend:false — この経路の転送先は「waiting-input＝Claude が y/n 確認や
+      // 権限承認のダイアログを出して止まっているペイン」であることが前提。生きた
+      // ダイアログへ Ctrl-A(\x01) + Ctrl-K(\x0b) を撃つと Claude Code 側がどう解釈するか
+      // （意図しない確定・キャンセル）はこちらから検証できないため、初回クリアは撃たない。
+      // #189 が守りたいのは新規ディスパッチ時のアイドルペインであって、この経路は対象外。
+      forwardResult = await submitToClaude(VK_PORT, saved.termId, reply.body, undefined, {
+        clearBeforeSend: false,
+      });
     } catch (err) {
       console.warn(`  [scan-waiting-input] issue #${issue.number}: 返信転送失敗（次ループ再試行）: ${err.message}`);
       continue;
