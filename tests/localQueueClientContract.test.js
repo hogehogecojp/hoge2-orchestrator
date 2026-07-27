@@ -483,9 +483,13 @@ test('LocalQueueClient: PR 完了条件充足時に checkPRCompletion と setSta
   const completion = await client.checkPRCompletion('vektor-inc', 'example', 73);
   const action = decideInProgressAction({
     comments: [],
-    pr: { state: 'open', merged: false },
+    // scanInProgressIssues と同じ引数の形（draft / reviewGateReady も渡す。#213）。
+    // automerge ラベルの無いタスクなのでレビュー完了マーカーは要求されず、
+    // 完了条件充足 + 非 Draft で waiting-merge に進む（従来挙動）。
+    pr: { state: 'open', merged: false, draft: false },
     prCompletionReady: completion.ready,
     automerge: client.hasAutomergeLabel(issue),
+    reviewGateReady: false,
   });
 
   assert.equal(action.type, 'waiting-merge');

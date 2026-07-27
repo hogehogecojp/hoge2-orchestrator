@@ -72,7 +72,7 @@ const QUEUE_REPO_LABELS = [
   { name: 'status:ready',            color: 'e4e669', description: '実行待ち（承認済み。orchestrator が拾う対象）' },
   { name: 'status:in-progress',      color: '0075ca', description: '実行中' },
   { name: 'status:waiting-input',    color: 'e99695', description: '指示待ち（ユーザーの返信を待っています）' },
-  { name: 'status:waiting-merge',    color: '8a2be2', description: 'マージ待ち（PRがCI通過＆CodeRabbit静観30分済み）' },
+  { name: 'status:waiting-merge',    color: '8a2be2', description: 'マージ待ち（PRがCI通過＆CodeRabbit静観30分済み・非Draft。automerge時はレビュー完了マーカーも確認済み）' },
   { name: 'status:done',             color: '0e8a16', description: '完了' },
   { name: 'status:failed',           color: 'd93f0b', description: '失敗' },
   { name: 'priority:high',           color: 'b60205', description: '優先度：高' },

@@ -52,6 +52,10 @@ automerge の完了ゲートはエージェント非依存の公開契約とし�
 
 SHA は現在の head に固定して照合するため、マーカー付与後に push が入ると TOCTOU 対策として自動マージは保留に戻ります。orchestrator のゲートは常時 ON で、マーカーが揃った場合のみ automerge します。CI 全通過・CodeRabbit 静穏・mergeable 等の従来条件も引き続き前提です。旧マーカー規約との後方互換はありません。
 
+このマーカーは **`status:in-progress` から `status:waiting-merge` への自動遷移にも効きます**。automerge タスクではマーカーが現 head SHA に対して揃うまでメタ issue は `status:in-progress` のままで、タスクカードは「マージ待ち」になりません（マージしないと分かっている段階で「マージ待ち」と表示しないため、遷移条件を automerge のマージゲートと揃えています）。automerge ラベルの無いタスクにはマーカーが付かないため、従来どおり完了条件の充足だけで `status:waiting-merge` へ進みます。あわせて **Draft PR も（automerge かどうかに関わらず）この自動遷移では `status:waiting-merge` になりません**。保留された場合は理由が orchestrator のログに毎ループ出力されます。
+
+なお上記は in-progress からの自動遷移のスコープです。`status:failed` からの事後復旧（`recheckFailedIssues()`：対象 issue に open PR が見つかったケース）や、CLI / `commands.jsonl` 経由の手動ステータス変更は、Draft・マーカーの有無を見ずに `status:waiting-merge` を付けます。
+
 ## クイックスタート（対話セットアップ）
 
 初めて使う場合は、**Claude Code を起動して `/vk-orchestrator-setup` を実行する**のが最短です。対話に答えるだけで、モード選択（ローカル / GitHub）から 3 ファイル（orchestrator / VK Terminals / vk-agents）への保存までまとめて埋められます。

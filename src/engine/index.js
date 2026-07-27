@@ -38,7 +38,7 @@ import { cleanupForIssue, formatCleanupSummary, inspectWorktreeByPort } from './
 import { canTransitionToDone as canTransitionToDoneImpl } from './done-gate.js';
 import { closeSourceIssueBeforeGate as closeSourceIssueBeforeGateImpl } from './source-close.js';
 import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from './pane-resume.js';
-import { decideInProgressAction } from './in-progress-decision.js';
+import { decideInProgressAction, needsReviewGate } from './in-progress-decision.js';
 import { selectAutomergeCandidates } from './automerge-candidates.js';
 import { resolveWaitingMergeAction } from './waiting-merge-action.js';
 import { createScanInProgressMergedHandler } from './scan-in-progress-merged.js';
@@ -650,12 +650,21 @@ function prCompletionOptions() {
   return isCoderabbitEnabled() ? {} : { coderabbitIdleMs: 0 };
 }
 
-async function gatherTargetState(issue) {
+// @param {object} issue  メタ issue
+// @param {object} [opts]
+// @param {boolean} [opts.resolveReviewGate=false]  agent-review-passed マーカーの有無まで解決するか。
+//   マーカー確認は pulls.get + コメント全件 paginate を伴うため、戻り値の reviewGateReady を
+//   実際に使う scan（scanInProgressIssues）だけが true を渡す。他の呼び出し元
+//   （scanAnsweredRecovery / scanWaitingInputIssues）は値を使わないので既定 false のまま
+//   ＝毎ループの無駄な API 消費を作らない（automerge + waiting-input 滞留時に顕著）。
+async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   const target = resolveTarget(issue);
+  const automerge = github.hasAutomergeLabel(issue);
 
   let pr = null;
   let prState = null;
   let prCompletionReady = false;
+  let reviewGateReady = false;
   let prLookupFailed = false;
   try {
     pr = await github.findPRForIssue(target.owner, target.repo, target.number);
@@ -670,11 +679,27 @@ async function gatherTargetState(issue) {
       console.warn(`  [scan] issue #${issue.number}: PR 状態取得失敗: ${err.message}`);
     }
     if (prState && prState.state === 'open' && !prState.merged) {
+      let completion = null;
       try {
-        const completion = await github.checkPRCompletion(target.owner, target.repo, pr.number, prCompletionOptions());
+        completion = await github.checkPRCompletion(target.owner, target.repo, pr.number, prCompletionOptions());
         prCompletionReady = completion.ready;
       } catch (err) {
         console.warn(`  [scan] issue #${issue.number}: PR 完了判定失敗: ${err.message}`);
+      }
+      // agent-review-passed マーカー（現 head SHA 一致）の有無。automerge タスクの
+      // waiting-merge 遷移を tryAutoMerge のレビューゲートと揃えるために使う（#213）。
+      // 取得するのは「この値を使う scan（resolveReviewGate）」かつ「判定に効く状態
+      // （needsReviewGate）」のときだけ。効く条件の定義は in-progress-decision.js 側に
+      // 1 つだけ置き、ここで書き下さない（判定とガードが将来ズレるのを防ぐ）。
+      // 照合は checkPRCompletion が返した headSha で行う
+      // （検証後の push を弾く＝TOCTOU 対策。tryAutoMerge と同じ思想）。
+      if (resolveReviewGate && needsReviewGate({ automerge, prCompletionReady, draft: prState.draft })) {
+        try {
+          reviewGateReady = await github.hasReviewGateMarker(target.owner, target.repo, pr.number, completion.headSha);
+        } catch (err) {
+          // fail-closed: 確認できない間はマージ待ちに出さず in-progress のまま次ループで再試行する。
+          console.warn(`  [scan] issue #${issue.number}: agent-review-passed マーカー確認失敗（マーカー無しとして続行）: ${err.message}`);
+        }
       }
     }
   }
@@ -694,7 +719,7 @@ async function gatherTargetState(issue) {
   }
   comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-  return { target, pr, prState, prCompletionReady, comments, prLookupFailed };
+  return { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, prLookupFailed };
 }
 
 // -------------------------------------------------------
@@ -747,12 +772,13 @@ async function scanInProgressIssues() {
 
     let state;
     try {
-      state = await gatherTargetState(issue);
+      // reviewGateReady を判定に使う唯一の scan なので、ここだけマーカーを解決する。
+      state = await gatherTargetState(issue, { resolveReviewGate: true });
     } catch (err) {
       console.warn(`  [scan-in-progress] issue #${issue.number}: 状態収集失敗: ${err.message}`);
       continue;
     }
-    const { target, pr, prState, prCompletionReady, comments } = state;
+    const { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments } = state;
 
     // PR URL 記録 + アイコン（冪等。状態遷移とは独立）
     if (pr && prState) {
@@ -761,14 +787,28 @@ async function scanInProgressIssues() {
 
     const action = decideInProgressAction({
       comments,
-      pr: prState ? { state: prState.state, merged: prState.merged } : null,
+      // draft も渡す: 修正対応中の Draft PR を「マージ待ち」にしないため（#213）。
+      pr: prState ? { state: prState.state, merged: prState.merged, draft: prState.draft } : null,
       prCompletionReady,
       // automerge 指定時は「完了済み PR に対するマージ判断依頼」の waiting-input で
       // 自動マージを止めない（司のマージ判断依頼コメントによる waiting-input 滞留を防ぐ）。
-      automerge: github.hasAutomergeLabel(issue),
+      automerge,
+      // automerge タスクの waiting-merge 遷移を tryAutoMerge のレビューゲートと揃える（#213）。
+      reviewGateReady,
     });
 
     if (action.type === 'none') {
+      // 完了条件は満たしたのに waiting-merge へ進めなかったケースは、保留理由を毎ループ出す。
+      // ここを無音にすると「作業中」表示のまま誰も進めない終端状態（マーカー付与漏れ・
+      // マーカー付与後の push による SHA ずれ・draft の戻し忘れ）に人が気づけない。
+      // watchdog は PR がある issue には介入しない（pane-resume は has-pr で何もしない）ため、
+      // tryAutoMerge() の保留ログと対称にここが唯一の痕跡になる。
+      if (prCompletionReady && prState?.draft) {
+        console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが PR が Draft のため waiting-merge を保留`);
+      }
+      if (prCompletionReady && automerge && !reviewGateReady && !prState?.draft) {
+        console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが agent-review-passed マーカー（現 head SHA 一致）が無いため waiting-merge を保留`);
+      }
       await handlePrLessParentDone(issue, state, action);
       continue;
     }
@@ -811,9 +851,21 @@ async function scanInProgressIssues() {
       }
       try {
         await github.setStatus(issue.number, 'status:waiting-merge');
+        // 箇条書きは decideInProgressAction が実際に見た条件と 1 対 1 で対応させる（#213）。
+        // CodeRabbit 行は tryAutoMerge() と同じく isCoderabbitEnabled() で分岐する
+        // （無効リポでは prCompletionOptions() が静観 0 分にするため「30 分間なし」は嘘になる）。
+        const lines = [
+          '- CI 全通過',
+          isCoderabbitEnabled()
+            ? '- CodeRabbit の指摘が 30 分間なし'
+            : '- CodeRabbit 監視は無効（静観待機なし）',
+          '- PR は Draft ではない',
+        ];
+        // automerge タスクだけレビュー完了マーカーが遷移条件に含まれる。
+        if (automerge) lines.push('- レビュー完了マーカー（agent-review-passed）を現 head SHA に対して確認済み');
         await github.addComment(
           issue.number,
-          `🟢 マージ待ち\n\nPR: ${prUrl}\n\n- CI 全通過\n- CodeRabbit の指摘が 30 分間なし\n\nマージされたらこの issue は自動で close されます。`
+          `🟢 マージ待ち\n\nPR: ${prUrl}\n\n${lines.join('\n')}\n\nマージされたらこの issue は自動で close されます。`
         );
         console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件充足 → waiting-merge`);
       } catch (err) {
