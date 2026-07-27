@@ -36,6 +36,9 @@ import {
   getTaskConfig,
   getQueueBackend,
   isCoderabbitEnabled,
+  isCoderabbitIgnored,
+  isCoderabbitReviewExpected,
+  loadCoderabbitFeatureConfig,
   getTaskCwd,
   getProtocolConfig,
   getLabelsConfig,
@@ -1457,6 +1460,212 @@ test('isCoderabbitEnabled: features.coderabbit=true は true', () => {
   assert.equal(isCoderabbitEnabled({ features: { coderabbit: true } }), true);
 });
 
+test('isCoderabbitIgnored: features.coderabbit_ignore 未設定は既定 false（抑止しない）', () => {
+  assert.equal(isCoderabbitIgnored({}), false);
+  assert.equal(isCoderabbitIgnored({ features: {} }), false);
+});
+
+test('isCoderabbitIgnored: true / 文字列 "true" は true、それ以外は false', () => {
+  assert.equal(isCoderabbitIgnored({ features: { coderabbit_ignore: true } }), true);
+  assert.equal(isCoderabbitIgnored({ features: { coderabbit_ignore: 'true' } }), true);
+  assert.equal(isCoderabbitIgnored({ features: { coderabbit_ignore: false } }), false);
+  assert.equal(isCoderabbitIgnored({ features: { coderabbit_ignore: 'false' } }), false);
+});
+
+// issue #215 の真理値表: レビューが来る見込みがあるのは「監視 ON かつ抑止 OFF」のときだけ。
+test('isCoderabbitReviewExpected: coderabbit=false なら抑止設定を問わず false', () => {
+  assert.equal(isCoderabbitReviewExpected({ features: { coderabbit: false } }), false);
+  assert.equal(
+    isCoderabbitReviewExpected({ features: { coderabbit: false, coderabbit_ignore: false } }),
+    false,
+  );
+});
+
+test('isCoderabbitReviewExpected: coderabbit=true かつ coderabbit_ignore=true は false（#215）', () => {
+  assert.equal(
+    isCoderabbitReviewExpected({ features: { coderabbit: true, coderabbit_ignore: true } }),
+    false,
+  );
+});
+
+test('isCoderabbitReviewExpected: coderabbit=true かつ coderabbit_ignore=false は true', () => {
+  assert.equal(
+    isCoderabbitReviewExpected({ features: { coderabbit: true, coderabbit_ignore: false } }),
+    true,
+  );
+  // 両方未設定は既定（監視 ON・抑止 OFF）＝レビューが来る見込みあり。
+  assert.equal(isCoderabbitReviewExpected({}), true);
+});
+
+// -------------------------------------------------------
+// loadCoderabbitFeatureConfig: 設定パネルが編集する vk-agents 正本を優先し、
+// 無ければ orchestrator 設定へフォールバックする（#215 の原因 2）。
+// -------------------------------------------------------
+function withCoderabbitSources({ orchestrator, vkAgents }, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-cr-src-'));
+  const orchestratorConfigPath = join(dir, 'orchestrator.json');
+  const vkAgentsConfigPath = join(dir, 'vk-agents.json');
+  writeFileSync(orchestratorConfigPath, JSON.stringify(orchestrator ?? {}));
+  if (vkAgents !== null) writeFileSync(vkAgentsConfigPath, JSON.stringify(vkAgents ?? {}));
+  try {
+    return fn({ orchestratorConfigPath, vkAgentsConfigPath });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('loadCoderabbitFeatureConfig: vk-agents 正本にキーがあれば orchestrator 設定より優先する', () => {
+  withCoderabbitSources(
+    {
+      orchestrator: { features: { coderabbit: true, coderabbit_ignore: false } },
+      vkAgents: { features: { coderabbit: false, coderabbit_ignore: true } },
+    },
+    (paths) => {
+      assert.deepEqual(loadCoderabbitFeatureConfig(paths), {
+        features: { coderabbit: false, coderabbit_ignore: true },
+      });
+    },
+  );
+});
+
+test('loadCoderabbitFeatureConfig: 正本に無いキーだけ orchestrator 設定へフォールバックする', () => {
+  withCoderabbitSources(
+    {
+      orchestrator: { features: { coderabbit: false, coderabbit_ignore: true } },
+      vkAgents: { features: { coderabbit: true } },
+    },
+    (paths) => {
+      assert.deepEqual(loadCoderabbitFeatureConfig(paths), {
+        features: { coderabbit: true, coderabbit_ignore: true },
+      });
+    },
+  );
+});
+
+test('loadCoderabbitFeatureConfig: 両方に無ければキーを持たない（呼び出し側の既定に委ねる）', () => {
+  withCoderabbitSources({ orchestrator: { github: {} }, vkAgents: { skills: {} } }, (paths) => {
+    assert.deepEqual(loadCoderabbitFeatureConfig(paths), {});
+  });
+});
+
+test('loadCoderabbitFeatureConfig: 正本が存在しなくても例外を投げず orchestrator 設定を使う', () => {
+  withCoderabbitSources(
+    { orchestrator: { features: { coderabbit: false } }, vkAgents: null },
+    (paths) => {
+      assert.deepEqual(loadCoderabbitFeatureConfig(paths), { features: { coderabbit: false } });
+    },
+  );
+});
+
+test('loadCoderabbitFeatureConfig: 正本が不正 JSON なら警告のみで orchestrator 設定へフォールバックする', () => {
+  withCoderabbitSources(
+    { orchestrator: { features: { coderabbit: false } }, vkAgents: {} },
+    (paths) => {
+      writeFileSync(paths.vkAgentsConfigPath, '{ broken json');
+      const savedWarn = console.warn;
+      const warnings = [];
+      console.warn = (msg) => warnings.push(String(msg));
+      try {
+        assert.deepEqual(loadCoderabbitFeatureConfig(paths), { features: { coderabbit: false } });
+      } finally {
+        console.warn = savedWarn;
+      }
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /vk-agents 設定の読み込みに失敗/);
+    },
+  );
+});
+
+test('loadCoderabbitFeatureConfig: 正本パス未指定なら homeDir 配下の ~/.vk-agents/config.json を読む', () => {
+  withSavedEnv(['VK_AGENTS_CONFIG', 'VK_AGENTS_CONFIG_PATH'], () => {
+    delete process.env.VK_AGENTS_CONFIG;
+    delete process.env.VK_AGENTS_CONFIG_PATH;
+    const fakeHome = mkdtempSync(join(tmpdir(), 'vko-cr-home-'));
+    try {
+      const homeConfigPath = join(fakeHome, '.vk-agents', 'config.json');
+      mkdirSync(dirname(homeConfigPath), { recursive: true });
+      writeFileSync(homeConfigPath, JSON.stringify({ features: { coderabbit_ignore: true } }));
+      assert.deepEqual(loadCoderabbitFeatureConfig({ cfg: {}, homeDir: fakeHome }), {
+        features: { coderabbit_ignore: true },
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
+test('loadCoderabbitFeatureConfig: home 正本が無いとき vk-agents リポジトリ直下 config.json は読まない', () => {
+  // #215: 揮発パス（vk-agents リポジトリ直下・同梱ディレクトリ）は
+  // マージ挙動を左右する値の読み取り元にしない。
+  // READ 用の resolveVkAgentsConfigPath() へ戻すとこのテストが落ちる（リグレッション検出）。
+  withSavedEnv(['VK_AGENTS_CONFIG', 'VK_AGENTS_CONFIG_PATH', 'VK_AGENTS_DIR', 'VK_AGENTS_REPO_PATH'], () => {
+    delete process.env.VK_AGENTS_CONFIG;
+    delete process.env.VK_AGENTS_CONFIG_PATH;
+    delete process.env.VK_AGENTS_DIR;
+    delete process.env.VK_AGENTS_REPO_PATH;
+    const fakeHome = mkdtempSync(join(tmpdir(), 'vko-cr-nohome-'));
+    const fakeRepo = mkdtempSync(join(tmpdir(), 'vko-cr-repo-'));
+    try {
+      // vk-agents リポジトリと判定される目印（detectVkAgentsRepoPath / repoPath 解決の対象）。
+      mkdirSync(join(fakeRepo, 'scripts'), { recursive: true });
+      writeFileSync(join(fakeRepo, 'scripts', 'sync.sh'), '#!/bin/sh\n');
+      writeFileSync(
+        join(fakeRepo, 'config.json'),
+        JSON.stringify({ features: { coderabbit: true, coderabbit_ignore: true } }),
+      );
+      // home 正本（<homeDir>/.vk-agents/config.json）は作らない。
+      assert.equal(existsSync(join(fakeHome, '.vk-agents', 'config.json')), false);
+
+      // リポジトリ直下の coderabbit_ignore: true を拾わず、既定（= 30 分待つ）へ倒れる。
+      assert.deepEqual(
+        loadCoderabbitFeatureConfig({ cfg: { vkAgents: { repoPath: fakeRepo } }, homeDir: fakeHome }),
+        {},
+      );
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(fakeRepo, { recursive: true, force: true });
+    }
+  });
+});
+
+test('loadCoderabbitFeatureConfig: orchestrator 設定が不正 JSON でも throw せず正本と既定値で判定する', () => {
+  // 純関数化で本関数は tryAutoMerge() の try の外から呼ばれる。ここで throw すると
+  // マージ判定だけでなくそのティックの残り手順まで巻き込んで中断するため、
+  // 両ソースの読み込み失敗を対称に警告どまりにする。
+  const dir = mkdtempSync(join(tmpdir(), 'vko-cr-broken-'));
+  try {
+    const orchestratorConfigPath = join(dir, 'orchestrator.json');
+    const vkAgentsConfigPath = join(dir, 'vk-agents.json');
+    writeFileSync(orchestratorConfigPath, '{ broken json');
+    writeFileSync(vkAgentsConfigPath, JSON.stringify({ features: { coderabbit: false } }));
+
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(String(msg));
+    let resolved;
+    try {
+      resolved = loadCoderabbitFeatureConfig({ orchestratorConfigPath, vkAgentsConfigPath });
+    } finally {
+      console.warn = savedWarn;
+    }
+    // 正本側は読めているのでその値を使う。
+    assert.deepEqual(resolved, { features: { coderabbit: false } });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /orchestrator 設定の読み込みに失敗/);
+
+    // 両方壊れていても throw せず、既定（監視 ON・抑止 OFF ＝ 30 分待つ）へ倒れる。
+    writeFileSync(vkAgentsConfigPath, '{ broken too');
+    console.warn = () => {};
+    try {
+      assert.deepEqual(loadCoderabbitFeatureConfig({ orchestratorConfigPath, vkAgentsConfigPath }), {});
+    } finally {
+      console.warn = savedWarn;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('getTaskCwd: config 無しで専用ディレクトリを既定値として作成して返す', () => {
   withoutTaskEnv(() => {
     const tmpHome = mkdtempSync(join(tmpdir(), 'vko-task-home-'));
@@ -1780,6 +1989,9 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
   assert.equal(coderabbitField.type, 'boolean');
   assert.equal(coderabbitField.default, true);
   assert.match(coderabbitField.help, /CodeRabbit/);
+  // #215: OFF は自動マージの待機省略にも効く。語を借りず動作で説明する（「静観」は未定義語）。
+  assert.match(coderabbitField.help, /「CodeRabbit のコメントを 30 分待つ」処理を省略/);
+  assert.doesNotMatch(coderabbitField.help, /静観/);
 
   const reviewAssetsRepoField = group.fields.find((f) => f.key === 'org.review_assets_repo');
   assert.ok(reviewAssetsRepoField);
@@ -1799,6 +2011,14 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
   assert.equal(coderabbitIgnoreField.default, false);
   assert.match(coderabbitIgnoreField.label, /@coderabbitai ignore/);
   assert.match(coderabbitIgnoreField.help, /features\.coderabbit/);
+  // #215: 抑止設定は自動マージの待機にも効くようになったため、help もその実態を説明する。
+  // 「静観」は README・設定パネル・issue コメントのどこでも定義していない語なので使わず、動作で書く。
+  assert.match(coderabbitIgnoreField.help, /「CodeRabbit のコメントを 30 分待つ」処理を省略/);
+  assert.doesNotMatch(coderabbitIgnoreField.help, /静観/);
+  // features.coderabbit が OFF なら @coderabbitai ignore の記載自体が行われないため、
+  // 「この設定は効果がありません」は修正後も真。誤読を招くので消さない。
+  assert.match(coderabbitIgnoreField.help, /この設定は効果がありません/);
+  assert.match(coderabbitIgnoreField.help, /CodeRabbit 監視を有効化/);
 
   const engineField = group.fields.find((f) => f.key === 'staff_wp_dev.engine');
   assert.ok(engineField);

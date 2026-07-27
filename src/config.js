@@ -1140,8 +1140,8 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
               { value: 'codex',  label: 'Codex' },
             ],
             help: 'マルチリポジトリタスク（vk-multi-repo-task）を新規作成するときの既定エンジン。未設定時は Claude にフォールバックします' },
-          { key: 'features.coderabbit', label: 'CodeRabbit 監視を有効化', type: 'boolean', default: true, help: 'OFF で PR 後の CodeRabbit 監視をスキップし、/code-review 等での確認を案内します。社外・個人リポジトリなど CodeRabbit 未導入の環境では OFF 推奨です' },
-          { key: 'features.coderabbit_ignore', label: 'CodeRabbit レビューをスキップ（PR 本文に @coderabbitai ignore を記載）', type: 'boolean', default: false, help: 'ON で /vk-pr が PR 本文に @coderabbitai ignore を記載し、CodeRabbit レビューを抑止します。features.coderabbit が OFF のときは監視自体がスキップされるため、この設定は効果がありません' },
+          { key: 'features.coderabbit', label: 'CodeRabbit 監視を有効化', type: 'boolean', default: true, help: 'OFF で PR 後の CodeRabbit 監視をスキップし、/code-review 等での確認を案内します。\nOFF のときは automerge ラベル付きタスクの自動マージでも「CodeRabbit のコメントを 30 分待つ」処理を省略し、CI 通過などの条件が揃った時点でマージします。\n社外・個人リポジトリなど CodeRabbit 未導入の環境では OFF 推奨です' },
+          { key: 'features.coderabbit_ignore', label: 'CodeRabbit レビューをスキップ（PR 本文に @coderabbitai ignore を記載）', type: 'boolean', default: false, help: 'ON で /vk-pr が PR 本文に @coderabbitai ignore を記載し、CodeRabbit レビューを抑止します。\nレビューが来ないため、automerge ラベル付きタスクの自動マージでも「CodeRabbit のコメントを 30 分待つ」処理を省略し、CI 通過などの条件が揃った時点でマージします。\n上の「CodeRabbit 監視を有効化」（features.coderabbit）が OFF のときは @coderabbitai ignore の記載も 30 分待機も行われないため、この設定は効果がありません' },
         ],
       },
     ],
@@ -1222,17 +1222,101 @@ export function getQueueBackend(cfg = loadUnifiedConfig()) {
   return DEFAULT_QUEUE.backend;
 }
 
+// CodeRabbit 関連の判定が見る設定キー。
+const CODERABBIT_FEATURE_PATHS = ['features.coderabbit', 'features.coderabbit_ignore'];
+
 /**
- * CodeRabbit 監視が有効かどうかを解決する（automerge の CodeRabbit 静観ゲートの要否判定に使う）。
+ * CodeRabbit 判定（有効か / レビュー抑止か）が読む設定を、正しい優先順位で 1 つに束ねる。
+ *
+ * #100 以降、設定パネルの Agents グループ（features.coderabbit / features.coderabbit_ignore を含む）は
+ * vk-agents 正本 ~/.vk-agents/config.json を直接編集し、orchestrator 設定 ~/.vk-orchestrator/config.json
+ * には値が残らない。にもかかわらず判定側が orchestrator 設定だけを読んでいたため、設定パネルの
+ * CodeRabbit OFF が自動マージのコメント待ち判定に届いていなかった（#215）。
+ * そこで正本にキーがあれば正本を優先し、無ければ orchestrator 設定へフォールバックする
+ * （orchestrator 設定に値が残っている環境の互換維持）。
+ *
+ * 読み取りでも「書き込み先」の正本パス（resolveVkAgentsCanonicalConfigPath）を使う。
+ * READ 用の resolveVkAgentsConfigPath() は home 正本が無いとき vk-agents リポジトリ直下・
+ * 同梱ディレクトリ（vendor/vk-agents-public/config.json）まで落ちるが、それらは re-clone /
+ * re-install で消える揮発パスであり、マージ挙動を左右する値の読み取り元にはできない。
+ * 正本パス（env / config での明示上書き > ~/.vk-agents/config.json）は vk-agents 側ルール
+ * （rules/coderabbit-monitoring.md の前提条件）が定める解決順序と一致し、各ペインの
+ * エージェントと orchestrator が同じファイルから同じ判定を読むことになる。
+ *
+ * どちらのソースも読み込み失敗（不正 JSON 等）は警告だけ出して、読めた側と既定値で判定を続ける
+ * （毎ループ呼ばれる自動マージ判定を設定ファイル 1 つの破損で落とさない）。両方読めなければ
+ * 既定＝監視 ON・抑止 OFF＝「30 分待つ」に倒れるため、失敗方向は常にマージを急がない側になる。
+ * @param {{ cfg?: object, orchestratorConfigPath?: string, vkAgentsConfigPath?: string, homeDir?: string }} [options]
+ * @returns {object} features.coderabbit / features.coderabbit_ignore だけを持つ config 相当オブジェクト
+ */
+export function loadCoderabbitFeatureConfig(options = {}) {
+  // options.cfg が明示された場合は読み込み自体を起こさない（純粋な判定として使える）。
+  let orchestratorConfig = options.cfg ?? {};
+  if (options.cfg === undefined) {
+    try {
+      orchestratorConfig = loadUnifiedConfig(options.orchestratorConfigPath ?? resolveConfigPath());
+    } catch (err) {
+      console.warn(`[Config] orchestrator 設定の読み込みに失敗したため CodeRabbit 設定は正本と既定値で判定します: ${err.message}`);
+    }
+  }
+  const vkAgentsConfigPath =
+    options.vkAgentsConfigPath
+    ?? resolveVkAgentsCanonicalConfigPath(orchestratorConfig, { homeDir: options.homeDir });
+
+  let vkAgentsConfig = {};
+  try {
+    vkAgentsConfig = readJsonObject(vkAgentsConfigPath);
+  } catch (err) {
+    console.warn(`[Config] vk-agents 設定の読み込みに失敗したため CodeRabbit 設定は orchestrator 設定側と既定値で判定します: ${err.message}`);
+  }
+
+  const out = {};
+  for (const path of CODERABBIT_FEATURE_PATHS) {
+    const source = hasOwnPath(vkAgentsConfig, path)
+      ? vkAgentsConfig
+      : hasOwnPath(orchestratorConfig, path)
+        ? orchestratorConfig
+        : null;
+    if (source) setByPath(out, path, getByPath(source, path));
+  }
+  return out;
+}
+
+/**
+ * CodeRabbit 監視が有効かどうかを解決する。
  * features.coderabbit は既定 true。明示的に false（真偽値 / 文字列 "false"）のときだけ無効扱いにする。
  * 未設定・不正値は安全側で有効（true）とみなす。
- * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @param {object} [cfg] 判定対象の config（既定は vk-agents 正本優先で解決した CodeRabbit 設定）
  * @returns {boolean}
  */
-export function isCoderabbitEnabled(cfg = loadUnifiedConfig()) {
+export function isCoderabbitEnabled(cfg = loadCoderabbitFeatureConfig()) {
   if (!hasOwnPath(cfg, 'features.coderabbit')) return true;
   const raw = getByPath(cfg, 'features.coderabbit');
   return !(raw === false || raw === 'false');
+}
+
+/**
+ * CodeRabbit のレビューを抑止する設定かどうかを解決する。
+ * features.coderabbit_ignore が ON のとき /vk-pr は PR 本文に `@coderabbitai ignore` を記載し、
+ * CodeRabbit はその PR にレビューを投稿しない。
+ * 既定は false（抑止しない）。旧 GUI が保存した文字列 "true" も真として扱う。
+ * @param {object} [cfg] 判定対象の config（既定は vk-agents 正本優先で解決した CodeRabbit 設定）
+ * @returns {boolean}
+ */
+export function isCoderabbitIgnored(cfg = loadCoderabbitFeatureConfig()) {
+  const raw = getByPath(cfg ?? {}, 'features.coderabbit_ignore');
+  return raw === true || raw === 'true';
+}
+
+/**
+ * CodeRabbit のレビューが投稿される見込みがあるかを解決する
+ * （automerge で CodeRabbit のコメントを 30 分待つ必要があるかの判定に使う）。
+ * 監視が無効なリポジトリ、またはレビューを抑止している設定では、待ってもコメントは来ないため false。
+ * @param {object} [cfg] 判定対象の config（既定は vk-agents 正本優先で解決した CodeRabbit 設定）
+ * @returns {boolean}
+ */
+export function isCoderabbitReviewExpected(cfg = loadCoderabbitFeatureConfig()) {
+  return isCoderabbitEnabled(cfg) && !isCoderabbitIgnored(cfg);
 }
 
 /**

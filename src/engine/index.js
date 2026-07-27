@@ -14,7 +14,7 @@ import {
   getQueueBackend,
   getTaskConfig,
   getTaskCwd,
-  isCoderabbitEnabled,
+  loadCoderabbitFeatureConfig,
   loadUnifiedConfig,
   resolveVkAgentsConfigPath,
   resolveVkTerminalsApiHost,
@@ -41,6 +41,7 @@ import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from './
 import { decideInProgressAction, needsReviewGate } from './in-progress-decision.js';
 import { selectAutomergeCandidates } from './automerge-candidates.js';
 import { resolveWaitingMergeAction } from './waiting-merge-action.js';
+import { coderabbitGateLine, prCompletionOptions } from './coderabbit-gate.js';
 import { createScanInProgressMergedHandler } from './scan-in-progress-merged.js';
 import { createPrLessParentDoneHandler } from './pr-less-parent-done.js';
 import { createReconcileOrphanedMergedTasks } from './reconcile-orphaned-merged.js';
@@ -641,15 +642,10 @@ async function resolveWpEnvEnabled(issue, target = resolveTarget(issue)) {
 // - findPRForIssue で PR を検知（あれば getPRState / 完了条件 checkPRCompletion）
 // - decision-record コメント検知のため、対象 issue と PR のコメントを時系列で結合
 // 失敗は warn で握り、取得できた範囲を返す（次ループで再試行）。
+// checkPRCompletion に渡すオプション（CodeRabbit のコメント待ちの要否）は coderabbit-gate.js の
+// prCompletionOptions() が純関数として判定する。設定の読み込みはこの関数側で 1 回だけ行い、
+// 同じスナップショットを判定と issue コメントの文言（coderabbitGateLine）で共用する。
 // -------------------------------------------------------
-// checkPRCompletion に渡すオプションを解決する。
-// CodeRabbit 監視が無効なリポジトリ（features.coderabbit=false）では CodeRabbit の
-// 静観（既定 30 分）を待つ意味がないため idle を 0 にし、CI・mergeable・レビューマーカーが
-// 揃った時点で即マージできるようにする。有効時は checkPRCompletion 既定の 30 分をそのまま使う。
-function prCompletionOptions() {
-  return isCoderabbitEnabled() ? {} : { coderabbitIdleMs: 0 };
-}
-
 // @param {object} issue  メタ issue
 // @param {object} [opts]
 // @param {boolean} [opts.resolveReviewGate=false]  agent-review-passed マーカーの有無まで解決するか。
@@ -666,6 +662,10 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   let prCompletionReady = false;
   let reviewGateReady = false;
   let prLookupFailed = false;
+  // CodeRabbit 設定は「この issue の判定 1 回」につき 1 度だけ解決し、完了判定に使った値を
+  // そのまま呼び出し側へ返す。マージ待ちコメントの文言が、マージを許した判定と別時点の
+  // 設定に基づいてズレるのを防ぐ（#215）。PR が無い / open でないときは読み込まない。
+  let coderabbitCfg = {};
   try {
     pr = await github.findPRForIssue(target.owner, target.repo, target.number);
   } catch (err) {
@@ -680,8 +680,9 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
     }
     if (prState && prState.state === 'open' && !prState.merged) {
       let completion = null;
+      coderabbitCfg = loadCoderabbitFeatureConfig();
       try {
-        completion = await github.checkPRCompletion(target.owner, target.repo, pr.number, prCompletionOptions());
+        completion = await github.checkPRCompletion(target.owner, target.repo, pr.number, prCompletionOptions(coderabbitCfg));
         prCompletionReady = completion.ready;
       } catch (err) {
         console.warn(`  [scan] issue #${issue.number}: PR 完了判定失敗: ${err.message}`);
@@ -719,7 +720,7 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   }
   comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-  return { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, prLookupFailed };
+  return { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, prLookupFailed, coderabbitCfg };
 }
 
 // -------------------------------------------------------
@@ -778,7 +779,7 @@ async function scanInProgressIssues() {
       console.warn(`  [scan-in-progress] issue #${issue.number}: 状態収集失敗: ${err.message}`);
       continue;
     }
-    const { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments } = state;
+    const { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, coderabbitCfg } = state;
 
     // PR URL 記録 + アイコン（冪等。状態遷移とは独立）
     if (pr && prState) {
@@ -852,13 +853,12 @@ async function scanInProgressIssues() {
       try {
         await github.setStatus(issue.number, 'status:waiting-merge');
         // 箇条書きは decideInProgressAction が実際に見た条件と 1 対 1 で対応させる（#213）。
-        // CodeRabbit 行は tryAutoMerge() と同じく isCoderabbitEnabled() で分岐する
-        // （無効リポでは prCompletionOptions() が静観 0 分にするため「30 分間なし」は嘘になる）。
+        // CodeRabbit 行は tryAutoMerge() と同じ coderabbitGateLine() を使い、待機 0 分になる条件
+        // （監視無効・レビュー抑止）で「30 分間なし」と嘘を書かないよう文言ソースを 1 つに揃える（#215）。
+        // 渡す設定は完了判定（prCompletionReady）に使ったものと同一スナップショット。
         const lines = [
           '- CI 全通過',
-          isCoderabbitEnabled()
-            ? '- CodeRabbit の指摘が 30 分間なし'
-            : '- CodeRabbit 監視は無効（静観待機なし）',
+          coderabbitGateLine(coderabbitCfg),
           '- PR は Draft ではない',
         ];
         // automerge タスクだけレビュー完了マーカーが遷移条件に含まれる。
@@ -1321,12 +1321,15 @@ async function tryAutoMerge(issue, prRef, prState, prUrl) {
     return;
   }
 
-  // CI + CodeRabbit 静観を再検証する。
+  // CI + CodeRabbit のコメント待ちを再検証する。
   // waiting-merge 到達後に CodeRabbit が再コメントしたケースで誤マージを防ぐ。
-  // CodeRabbit 無効リポでは静観 0 分（即時）になる（prCompletionOptions）。
+  // レビューが来ない設定（監視無効 features.coderabbit=false / レビュー抑止 features.coderabbit_ignore=true）
+  // では待機 0 分（即時）になる（prCompletionOptions）。
+  // 設定はこのマージ判断 1 回につき 1 度だけ解決し、下のマージ完了コメントの文言にも同じ値を使う。
+  const coderabbitCfg = loadCoderabbitFeatureConfig();
   let completion;
   try {
-    completion = await github.checkPRCompletion(prRef.owner, prRef.repo, prRef.number, prCompletionOptions());
+    completion = await github.checkPRCompletion(prRef.owner, prRef.repo, prRef.number, prCompletionOptions(coderabbitCfg));
   } catch (err) {
     console.warn(`  ${tag}: PR完了条件の再検証に失敗（次ループで再試行）: ${err.message}`);
     return;
@@ -1359,9 +1362,9 @@ async function tryAutoMerge(issue, prRef, prState, prUrl) {
       method: 'squash',
       sha: completion.headSha,
     });
-    const coderabbitLine = isCoderabbitEnabled()
-      ? '- CodeRabbitAI のコメントが 30 分間なし'
-      : '- CodeRabbit 監視は無効（静観待機なし）';
+    // 待機 0 分になる条件（監視無効・レビュー抑止）と文言を食い違わせないため、
+    // マージ待ち遷移コメントと同じ coderabbitGateLine() に、ゲート判定と同じ設定を渡す（#215）。
+    const coderabbitLine = coderabbitGateLine(coderabbitCfg);
     await github.addComment(
       issue.number,
       `🤖 automerge ラベルに基づき PR を自動マージしました: ${prUrl}\n\n- CI 全通過\n${coderabbitLine}\n- mergeable=true`
