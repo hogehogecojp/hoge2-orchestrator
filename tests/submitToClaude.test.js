@@ -491,6 +491,98 @@ describe('submitToClaude', () => {
     assert.equal(scenario.sendCalls.length, 1 + 1 + 1 + FAST_OPTIONS.maxRetries,
       'AND 判定なのでカーソル blink 相当のケースでは再送が発火する');
   });
+
+  // ------------------------------------------------------------------------
+  // issue #218: `/api/send` に打ち切り時間（AbortSignal.timeout）を入れた結果、
+  // VK Terminals 側が一時的に詰まると初回の本文送信が abort で reject しうる。
+  // 「無限ハング」を「タスク起動ごとクラッシュ」に置き換えないことを検証する。
+  // ------------------------------------------------------------------------
+
+  /**
+   * 本文送信（クリア・Enter 以外）を先頭 `times` 回だけ abort させる fetch ラッパを被せる。
+   * `times: Infinity` なら本文送信は一度も成功しない。
+   */
+  function failBodySends(times = 1) {
+    const mocked = global.fetch;
+    let bodySendAttempts = 0;
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (u.endsWith('/api/send')) {
+        const body = init?.body ? JSON.parse(init.body) : {};
+        const isBodySend = body.input !== '\r' && body.input !== CLEAR_INPUT_SEQUENCE;
+        if (isBodySend && ++bodySendAttempts <= times) {
+          const err = new Error('The operation was aborted due to timeout');
+          err.name = 'TimeoutError';
+          throw err;
+        }
+      }
+      return mocked(url, init);
+    };
+  }
+
+  /** `/api/states` を全フェーズで失敗させる（getTerminalBaseline が常に null を返す状態）。 */
+  function statesAlwaysError() {
+    for (const phase of ['beforeBody', 'afterBody', 'afterBodyRetry', 'afterEnter']) {
+      scenario.statesByPhase[phase] = 'error';
+    }
+  }
+
+  /** 実際に VK Terminals へ届いた本文送信（クリア・Enter を除く）の回数。 */
+  function deliveredBodySends() {
+    return scenario.sendCalls.filter(
+      c => c.input !== '\r' && c.input !== CLEAR_INPUT_SEQUENCE
+    ).length;
+  }
+
+  it('初回の本文送信が打ち切り(abort)で失敗しても throw せず、本文再送で回復する', async () => {
+    failBodySends(1);
+
+    const result = await submitToClaude(PORT, TERMID, 'hello', 10, FAST_OPTIONS);
+
+    assert.equal(result.ok, true, 'abort を握って回復し、最終結果は ok で返る');
+    assert.equal(result.bodyConfirmed, true, '本文再送でエコーを確認できる');
+    assert.equal(deliveredBodySends(), 1, '成功した本文送信は再送分の 1 回（初回は abort で届いていない）');
+  });
+
+  it('confirm:false では回復手段が無いため、初回の本文送信の失敗はそのまま throw する', async () => {
+    failBodySends(1);
+
+    await assert.rejects(
+      () => submitToClaude(PORT, TERMID, 'hello', 10, { ...FAST_OPTIONS, confirm: false }),
+      /aborted due to timeout/,
+    );
+  });
+
+  // 初回送信 abort と /api/states 取得失敗の co-failure。confirmBodyEchoed は baseline=null を
+  // fail-open(true) で返す契約なので、素で使うと再送ループが一度も回らないまま
+  // bodyConfirmed=true になり、本文未達なのに成功扱いになる（＝startTask の #172 ロールバックが
+  // 発火せず、watchdog の idle 判定まで固着する）。本文送信が一度も成功していない間は
+  // fail-open させないことを検証する。
+  it('states 取得も失敗し本文送信が一度も成功しない場合は bodyConfirmed=false に倒す', async () => {
+    statesAlwaysError();
+    failBodySends(Infinity);
+
+    const result = await submitToClaude(PORT, TERMID, 'hello', 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, false,
+      '本文未達が確定しているので baseline 取得失敗でも fail-open してはいけない');
+    assert.equal(deliveredBodySends(), 0, '本文は一度も届いていない');
+    assert.deepEqual(scenario.submittedInputs, [''],
+      '確定されたのは空の入力欄（本文が入らないまま Enter だけ通っている）');
+  });
+
+  it('states 取得は失敗し続けても、本文が再送で届いていれば bodyConfirmed=true を返す', async () => {
+    statesAlwaysError();
+    failBodySends(1);
+
+    const result = await submitToClaude(PORT, TERMID, 'hello', 10, FAST_OPTIONS);
+
+    // baseline を取れない＝検証不能なので fail-open(true) は正しい。ただしその前提として
+    // 「本文が実際に届いている」ことが必要。ここが 0 回のまま true になるのが #218 の偽陽性。
+    assert.equal(result.bodyConfirmed, true, '検証不能かつ本文は届いているので fail-open が正しい');
+    assert.ok(deliveredBodySends() >= 1, 'bodyConfirmed=true を返す前に本文が実際に届いている');
+    assert.deepEqual(scenario.submittedInputs, ['hello'], '確定された入力は本文そのもの');
+  });
 });
 
 // --------------------------------------------------------------------------

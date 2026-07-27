@@ -628,9 +628,12 @@ export async function reconfirmBodyEcho(port, termId, prompt) {
  *   本文が入力欄にエコーされたことを確認できたか:
  *     - `true`  … エコーを確認できた、またはエコー確認をスキップした
  *                 （本文が空 / 4 文字以上のトークンなし / baseline 取得が API エラー）。
- *                 「取りこぼしを検知しなかった」の意。
- *     - `false` … 本文再送を規定回数使い切ってもエコーを確認できなかった＝本文が
- *                 入力欄に届いていない可能性がある。呼び出し側で警告する材料にする。
+ *                 「取りこぼしを検知しなかった」の意。ただし **本文の `/api/send` が一度も
+ *                 成功していない場合は、上記のスキップ条件に該当しても true には倒さない**
+ *                 （本文未達が確定しているため fail-open する余地がない。issue #218）。
+ *     - `false` … 本文再送を規定回数使い切ってもエコーを確認できなかった、または本文の
+ *                 送信自体が一度も成功しなかった＝本文が入力欄に届いていない可能性がある。
+ *                 呼び出し側で警告する材料にする。
  *     - `null`  … `confirm:false` のため確認自体を行っていない（true/false と区別する）。
  *   既存の呼び出し側は `result.ok` を見るだけなので、この追加フィールドは後方互換。
  */
@@ -664,10 +667,38 @@ export async function submitToClaude(port, termId, prompt, delayMs = 1_000, opti
   //    行頭からずれてスラッシュコマンドとして発火しない（issue #189）。
   //    CLEAR_INPUT_SEQUENCE は空の入力欄では no-op なので既定で常時前置きするが、
   //    生きたダイアログへ制御文字を撃ちたくない呼び出しは clearBeforeSend:false で外せる。
-  if (clearBeforeSend) {
-    await sendToTerminal(port, termId, CLEAR_INPUT_SEQUENCE);
+  //    issue #218 で `/api/send` にも打ち切り時間（AbortSignal.timeout）を入れたため、
+  //    VK Terminals 側が一時的に詰まると初回送信が abort で reject しうる。ここで素通しすると
+  //    submitToClaude ごと throw して startTask が中断し、作成済みペインが孤児のまま
+  //    in-progress ラベルだけが残る。下に本文エコー確認 → 本文再送ループという
+  //    「本文が届かなかった」ときの回復経路があるので、confirm 時はそこへ合流させる。
+  //    confirm:false は回復手段が無く、握りつぶすと空の入力欄へ Enter を撃って本文欠落に
+  //    気づけないため、そのまま throw して呼び出し側に委ねる。
+  //
+  //    ただし abort を握るだけでは足りない。confirmBodyEchoed は baseline=null
+  //    （states 取得失敗＝検証不能）を fail-open で true に倒す契約なので、
+  //    「初回送信 abort」と「states 取得失敗」が同時に起きると再送ループが一度も回らないまま
+  //    bodyConfirmed=true になり、本文未達なのに成功扱いになる。startTask は
+  //    bodyConfirmed===false だけをトリガーに #172 のロールバック（status:ready へ戻して
+  //    再ディスパッチ）を走らせるため、true を返すと issue は in-progress・ペインは空プロンプトの
+  //    まま watchdog の idle 判定（WATCHDOG_IDLE 既定 3 時間）まで固着してしまう。
+  //    そこで「本文の送信が一度も成功していない」間は fail-open させず、必ず false に倒す。
+  let bodyDelivered = false;
+  const evaluateBodyConfirmed = (bl) =>
+    bodyDelivered ? confirmBodyEchoed(bl, echoFragment, body) : false;
+
+  try {
+    if (clearBeforeSend) {
+      await sendToTerminal(port, termId, CLEAR_INPUT_SEQUENCE);
+    }
+    await sendToTerminal(port, termId, body);
+    bodyDelivered = true;
+  } catch (err) {
+    if (!confirm) throw err;
+    console.warn(
+      `  [submitToClaude] 本文の初回送信に失敗しました（エコー確認・本文再送で回復を試みます）: ${err.message}`
+    );
   }
-  await sendToTerminal(port, termId, body);
   await waitAfterBodySend();
 
   if (!confirm) {
@@ -681,7 +712,7 @@ export async function submitToClaude(port, termId, prompt, delayMs = 1_000, opti
   //    最後に取得した baseline は、確認できてもできなくても、続く Enter 確定
   //    チェックの baseline としてそのまま流用する（Enter 送信「直前」の状態のため）。
   let baseline      = await getTerminalBaseline(port, termId);
-  let bodyConfirmed = confirmBodyEchoed(baseline, echoFragment, body);
+  let bodyConfirmed = evaluateBodyConfirmed(baseline);
 
   for (let attempt = 0; !bodyConfirmed && attempt < safeMaxRetries; attempt++) {
     console.warn(
@@ -691,12 +722,13 @@ export async function submitToClaude(port, termId, prompt, delayMs = 1_000, opti
       // Ctrl-A で行頭へ戻してから Ctrl-K で行末まで削除する。空欄では no-op で、追記型の入力欄でも再送を置換にできる。
       await sendToTerminal(port, termId, CLEAR_INPUT_SEQUENCE);
       await sendToTerminal(port, termId, body);
+      bodyDelivered = true;
     } catch (err) {
       console.warn(`  [submitToClaude] 本文再送失敗（処理は継続）: ${err.message}`);
     }
     await waitAfterBodySend();
     baseline      = await getTerminalBaseline(port, termId);
-    bodyConfirmed = confirmBodyEchoed(baseline, echoFragment, body);
+    bodyConfirmed = evaluateBodyConfirmed(baseline);
   }
 
   if (!bodyConfirmed) {

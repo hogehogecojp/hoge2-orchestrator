@@ -673,8 +673,13 @@ async function main() {
           await new Promise((r) => setTimeout(r, 1_200));
 
           // 絶対パスの bin を叩くことで、ペインの cwd や PATH/npx 解決に依存せず確実に起動する。
+          //
+          // timeoutMs は既定（3 秒）ではなく明示で 10 秒にする。GUI 起動直後は上の 1.2 秒待ちだけで
+          // 投入するため、VK Terminals API を持つ Electron main プロセスが初期化で 3 秒以上詰まりうる。
+          // ここはポーリング予算を守る必要のない一発起動パスで、打ち切ると `npm start` の主経路で
+          // 「手動で start を実行してください」に落ちてしまうため、長めに待つ方が素直（issue #218）。
           const cmd = ['node', JSON.stringify(__filename), 'start', ...forwarded].join(' ');
-          await sendToTerminal(port, termId, cmd + '\r');
+          await sendToTerminal(port, termId, cmd + '\r', { timeoutMs: 10_000 });
           console.log(`orchestrator を GUI 内ペインで起動しました: ${cmd}`);
         } catch (err) {
           console.warn(
