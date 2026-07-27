@@ -1,11 +1,19 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import {
   TERMINALS_MODES,
   resolveTerminalsMode,
   resolveTmuxSession,
   resolveTmuxClaudeCommand,
 } from '../src/config.js';
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const BIN_PATH = join(REPO_ROOT, 'bin', 'vk-orchestrator.js');
 
 const ENV_KEYS = ['VK_TERMINALS_MODE', 'VK_TMUX_SESSION', 'VK_TMUX_CLAUDE_CMD'];
 let saved;
@@ -37,6 +45,49 @@ test('resolveTmuxClaudeCommand: 既定 claude / config 反映', () => {
   assert.equal(resolveTmuxClaudeCommand({}), 'claude');
   assert.equal(resolveTmuxClaudeCommand({ tmux: { claudeCommand: 'claude --dangerously-skip-permissions' } }),
     'claude --dangerously-skip-permissions');
+});
+
+test('bin up（tmux モード）: 未定義関数で落ちず doctor 案内を経て tmux 起動まで到達する', () => {
+  // 以前は未定義の warnIfVkAgentsNotSetup() を呼んでいて ReferenceError で必ず落ちていた。
+  // 実 tmux を触らないよう、常に失敗するフェイク tmux を PATH の先頭に置き（セッションを
+  // 作らない）、HOME と config も一時ディレクトリへ隔離する（実ユーザーの設定を書き換えない）。
+  // 自己更新（リモート照会）は VK_ORCHESTRATOR_NO_AUTO_UPDATE=1 で止める。
+  const dir = mkdtempSync(join(tmpdir(), 'vko-up-tmux-'));
+  try {
+    const binDir = join(dir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const fakeTmux = join(binDir, 'tmux');
+    writeFileSync(fakeTmux, '#!/bin/sh\nexit 1\n');
+    chmodSync(fakeTmux, 0o755);
+
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ terminals: { mode: 'tmux' } }));
+
+    const result = spawnSync(process.execPath, [BIN_PATH, 'up'], {
+      encoding: 'utf8',
+      cwd: REPO_ROOT,
+      timeout: 60000,
+      env: {
+        PATH: `${binDir}:/usr/bin:/bin`,
+        HOME: dir,
+        VK_TERMINALS_MODE: 'tmux',
+        VK_ORCHESTRATOR_CONFIG: configPath,
+        VK_ORCHESTRATOR_NO_AUTO_UPDATE: '1',
+      },
+    });
+    const out = `${result.stdout}\n${result.stderr}`;
+    assert.doesNotMatch(out, /ReferenceError/, out);
+    assert.doesNotMatch(out, /warnIfVkAgentsNotSetup/, out);
+    // フェイク tmux が失敗するので、セッション作成失敗のメッセージまで到達して exit 1。
+    assert.match(out, /tmux セッション .* を作成できませんでした/);
+    assert.equal(result.status, 1);
+    // doctor はモード別に判定する: tmux 未導入は必須欠損として案内され、
+    // VK Terminals 未導入は（tmux モードでは任意なので）案内に出ない。
+    assert.match(out, /tmux コマンド導入/);
+    assert.doesNotMatch(out, /VK Terminals 導入/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('index.js: mode で実行面バックエンドが切り替わる（fetch 呼び出し回数で検証）', async () => {

@@ -1,6 +1,6 @@
 /**
  * doctor（初回セットアップ充足判定）のユニットテスト。
- * - モード別（queue.backend）の required 切り替え
+ * - モード別（queue.backend / terminals.mode）の required 切り替え
  * - owner → org.allowed_owners のプリフィル判定
  * - 全充足／一部欠損時の要約（summarizeDoctor）
  * - gh auth token の有無（フェイク execFileSync）
@@ -21,21 +21,27 @@ const BIN_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'vk-
 
 // テスト環境を丸ごと注入するためのヘルパ。
 // homeDir 配下に config（A）・canonical（C）・manifest を任意で用意し、
-// gh 認証 / VK Terminals 導入 / platform / node を明示注入する。
+// gh 認証 / VK Terminals 導入 / tmux 導入 / platform / node を明示注入する。
 function withDoctorEnv(
   {
     config = {},
     queueBackend,
+    terminalsMode,
     allowedOwners,
     hasManifest = true,
     ghAuthenticated = true,
     vkTerminalsInstalled = true,
+    tmuxInstalled = true,
     platform = 'darwin',
     nodeVersion = '20.11.0',
   } = {},
   fn,
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'vko-doctor-'));
+  // resolveTerminalsMode は env VK_TERMINALS_MODE を config より優先するため、
+  // 実行環境の env でテストがぶれないよう退避して外す（finally で復元）。
+  const savedTerminalsModeEnv = process.env.VK_TERMINALS_MODE;
+  delete process.env.VK_TERMINALS_MODE;
   try {
     const configPath = join(dir, 'config.json');
     writeFileSync(configPath, JSON.stringify(config));
@@ -56,6 +62,7 @@ function withDoctorEnv(
       homeDir: dir,
       configPath,
       queueBackend,
+      terminalsMode,
       manifestPath,
       canonicalConfigPath,
       platform,
@@ -68,9 +75,16 @@ function withDoctorEnv(
         if (!vkTerminalsInstalled) throw new Error('vk-terminals not installed');
         return join(dir, 'node_modules', 'vk-terminals');
       },
+      // gh 認証用の execFileSync とは別フック（引数を見ないフェイクで「常に導入済み」に倒れないように）。
+      resolveTmuxVersion: () => {
+        if (!tmuxInstalled) throw new Error('tmux not found');
+        return 'tmux 3.4';
+      },
     };
     return fn(options);
   } finally {
+    if (savedTerminalsModeEnv === undefined) delete process.env.VK_TERMINALS_MODE;
+    else process.env.VK_TERMINALS_MODE = savedTerminalsModeEnv;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -146,6 +160,107 @@ test('runDoctor: マニフェスト有無で vk-agents-setup の ok が変わる
 test('runDoctor: VK Terminals 未導入は vk-terminals を ok=false にする', () => {
   withDoctorEnv({ vkTerminalsInstalled: false, allowedOwners: ['vektor-inc'] }, (options) => {
     assert.equal(byId(runDoctor(options), 'vk-terminals').ok, false);
+  });
+});
+
+test('runDoctor: vk-terminals モード（既定）では VK Terminals 必須・tmux 要件は出ない', () => {
+  withDoctorEnv({ terminalsMode: 'vk-terminals', allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor(options);
+    assert.equal(byId(reqs, 'vk-terminals').required, true);
+    assert.equal(
+      reqs.find((r) => r.id === 'tmux'),
+      undefined,
+      'vk-terminals モードでは tmux 要件の行を出さないこと',
+    );
+    // プラットフォームは GUI 前提の文言のまま。
+    assert.match(byId(reqs, 'platform').label, /WSL2/);
+    assert.equal(byId(reqs, 'terminals.mode').current, 'vk-terminals（既定）');
+    assert.equal(byId(reqs, 'terminals.mode').ok, true);
+    assert.equal(byId(reqs, 'terminals.mode').required, true);
+  });
+});
+
+test('runDoctor: tmux モードでは VK Terminals は任意・tmux 要件が必須になる', () => {
+  withDoctorEnv({ terminalsMode: 'tmux', allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor(options);
+    assert.equal(byId(reqs, 'vk-terminals').required, false);
+    assert.match(byId(reqs, 'vk-terminals').hint, /tmux モードでは VK Terminals/);
+    const tmux = byId(reqs, 'tmux');
+    assert.equal(tmux.required, true);
+    assert.equal(tmux.ok, true);
+    assert.equal(tmux.current, 'tmux 3.4');
+    assert.match(tmux.hint, /brew install tmux/);
+    // プラットフォームは GUI 非依存の文言に差し替わる。
+    const platformReq = byId(reqs, 'platform');
+    assert.match(platformReq.label, /macOS \/ Linux/);
+    assert.match(platformReq.hint, /GUI を起動しない/);
+    assert.equal(byId(reqs, 'terminals.mode').current, 'tmux');
+    // group が飛び地にならない（formatDoctorReport の見出しが重複しない）こと。
+    const groups = reqs.map((r) => r.group);
+    const uniqueRuns = groups.filter((g, i) => g !== groups[i - 1]);
+    assert.equal(uniqueRuns.length, new Set(groups).size, 'same group must be contiguous');
+  });
+});
+
+test('runDoctor: tmux モードで tmux 未導入は必須欠損になる', () => {
+  withDoctorEnv({ terminalsMode: 'tmux', tmuxInstalled: false, allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor(options);
+    const tmux = byId(reqs, 'tmux');
+    assert.equal(tmux.ok, false);
+    assert.equal(tmux.current, '未導入');
+    const summary = summarizeDoctor(reqs);
+    assert.equal(summary.allRequiredOk, false);
+    assert.ok(summary.missingRequired.map((r) => r.id).includes('tmux'));
+  });
+});
+
+test('runDoctor: tmux モードは VK Terminals 未導入でも allRequiredOk=true（本 issue の回帰テスト）', () => {
+  withDoctorEnv(
+    { terminalsMode: 'tmux', queueBackend: 'local', vkTerminalsInstalled: false, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const vkTerminals = byId(reqs, 'vk-terminals');
+      assert.equal(vkTerminals.ok, false);
+      assert.equal(vkTerminals.required, false);
+      const summary = summarizeDoctor(reqs);
+      assert.equal(summary.allRequiredOk, true, `missing: ${summary.missingRequired.map((r) => r.id).join(',')}`);
+    },
+  );
+});
+
+test('runDoctor: vk-terminals モードは VK Terminals 未導入なら allRequiredOk=false（緩みの回帰防止）', () => {
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', queueBackend: 'local', vkTerminalsInstalled: false, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const summary = summarizeDoctor(runDoctor(options));
+      assert.equal(summary.allRequiredOk, false);
+      assert.ok(summary.missingRequired.map((r) => r.id).includes('vk-terminals'));
+    },
+  );
+});
+
+test('runDoctor: tmux -V の出力は先頭行・制御文字除去・長さ制限してから current に入れる', () => {
+  withDoctorEnv({ terminalsMode: 'tmux', allowedOwners: ['vektor-inc'] }, (options) => {
+    // 改行で偽の ✅ 行を混ぜ込む／ANSI エスケープ／長すぎる出力を注入する。
+    options.resolveTmuxVersion = () =>
+      `\u001b[32mtmux 3.4\u0007\u001b[0m\n  ✅ 偽の要件行（必須） … なりすまし\n${'x'.repeat(500)}`;
+    const tmux = byId(runDoctor(options), 'tmux');
+    assert.equal(tmux.current, 'tmux 3.4');
+    assert.equal(tmux.ok, true);
+    // レポートに偽の行が混ざらないこと。
+    const report = formatDoctorReport(runDoctor(options));
+    assert.doesNotMatch(report, /偽の要件行/);
+  });
+});
+
+test('runDoctor: terminals.mode を options ではなく config から解決する', () => {
+  withDoctorEnv({ config: { terminals: { mode: 'tmux' } }, allowedOwners: ['vektor-inc'] }, (options) => {
+    // terminalsMode を明示注入しない（config から読む。env はヘルパ側で外している）。
+    delete options.terminalsMode;
+    const reqs = runDoctor(options);
+    assert.equal(byId(reqs, 'terminals.mode').current, 'tmux');
+    assert.equal(byId(reqs, 'vk-terminals').required, false);
+    assert.equal(byId(reqs, 'tmux').required, true);
   });
 });
 

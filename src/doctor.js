@@ -9,11 +9,20 @@
 // doctor はローカル高速判定に限定し、ネットワーク検知（ラベル存在確認など）はしない。
 // gh 認証だけは `gh auth token`（execFileSync 注入可）で確認する。
 //
-// required は固定値ではなく、選択中のモード（queue.backend）から計算する:
+// required は固定値ではなく、選択中のモードから計算する。モードは 2 軸ある:
+//
+// 1) キューの保存先（queue.backend）
 //   - GitHub モード: gh 認証 / github.owner / github.repo / orchestrator.assigneeFilter /
 //                    org.allowed_owners(owner を含む) を required にする。
-//   - ローカルモード: それらは任意。必須は Node / プラットフォーム / VK Terminals /
+//   - ローカルモード: それらは任意。必須は Node / プラットフォーム / 実行面モードの前提 /
 //                    vk-agents 展開 / queue.backend / org.allowed_owners。
+//
+// 2) 実行面モード（terminals.mode）
+//   - vk-terminals モード: VK Terminals 導入を required にする（GUI 前提。platform の
+//                          label / hint も GUI 前提の文言）。tmux 要件は出さない。
+//   - tmux モード: GUI を一切起動しないので VK Terminals 導入は任意（required: false）。
+//                  代わりに tmux コマンドの導入を required にし、platform は GUI 非依存の
+//                  文言（コンテナ環境でも可）に差し替える。
 
 import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
@@ -23,6 +32,7 @@ import {
   loadUnifiedConfig,
   getQueueBackend,
   resolveVkTerminalsDir as realResolveVkTerminalsDir,
+  resolveTerminalsMode,
   isVkAgentsSetup,
   vkAgentsSkillsManifestPath,
   resolveVkAgentsCanonicalConfigPath,
@@ -63,6 +73,25 @@ function readAllowedOwners(canonicalConfigPath) {
 }
 
 /**
+ * tmux コマンドのバージョン文字列（例: "tmux 3.4"）を返す。
+ * 未導入なら execFileSync が throw するので、呼び出し側で未導入扱いにする。
+ *
+ * gh 認証用の options.execFileSync とは分けた専用フックにしている（execFileSync を
+ * 共用すると、引数を見ないフェイクで「tmux 常に導入済み」に倒れてテストが書けない）。
+ * @returns {string}
+ */
+function realResolveTmuxVersion() {
+  return String(
+    realExecFileSync('tmux', ['-V'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000, // doctor はローカル高速判定。ハングで固まらせない（timeout は throw → 未導入扱い）
+      maxBuffer: 64 * 1024, // 想定は "tmux 3.4" 程度。異常な巨大出力は throw させる
+    }) ?? '',
+  ).trim();
+}
+
+/**
  * 要件チェックリストを実状態から計算して返す。
  *
  * 依存注入でテスト可能にするため、副作用のある入力（fs / gh / platform / node / config パス）は
@@ -72,10 +101,12 @@ function readAllowedOwners(canonicalConfigPath) {
  *   configPath?: string,
  *   config?: object,
  *   queueBackend?: 'github'|'local',
+ *   terminalsMode?: 'vk-terminals'|'tmux',
  *   manifestPath?: string,
  *   canonicalConfigPath?: string,
  *   execFileSync?: Function,
  *   resolveVkTerminalsDir?: () => string,
+ *   resolveTmuxVersion?: () => string,
  *   platform?: string,
  *   nodeVersion?: string,
  * }} [options]
@@ -87,6 +118,8 @@ export function runDoctor(options = {}) {
   const cfg = options.config ?? loadUnifiedConfig(configPath);
   const backend = options.queueBackend ?? getQueueBackend(cfg);
   const githubMode = backend === 'github';
+  const terminalsMode = options.terminalsMode ?? resolveTerminalsMode(cfg);
+  const tmuxMode = terminalsMode === 'tmux';
   const platform = options.platform ?? process.platform;
   const nodeVersion = options.nodeVersion ?? process.versions.node;
   const manifestPath = options.manifestPath ?? vkAgentsSkillsManifestPath(homeDir);
@@ -94,6 +127,7 @@ export function runDoctor(options = {}) {
     options.canonicalConfigPath ?? resolveVkAgentsCanonicalConfigPath(cfg, { homeDir });
   const execFileSyncImpl = options.execFileSync ?? realExecFileSync;
   const resolveVkTerminals = options.resolveVkTerminalsDir ?? realResolveVkTerminalsDir;
+  const resolveTmuxVersion = options.resolveTmuxVersion ?? realResolveTmuxVersion;
 
   const requirements = [];
 
@@ -110,23 +144,38 @@ export function runDoctor(options = {}) {
     hint: 'Node.js 20 以上をインストールしてください（例: nvm install 20 / brew install node）。',
   });
 
-  // 0-2 プラットフォーム
+  // 0-2 プラットフォーム（実行面モードで文言が変わる。tmux モードは GUI 非依存）
   const platformOk = platform === 'darwin' || platform === 'linux';
   requirements.push({
     id: 'platform',
     group: '前提',
-    label: '対応プラットフォーム（macOS / WSL2）',
+    label: tmuxMode ? '対応プラットフォーム（macOS / Linux）' : '対応プラットフォーム（macOS / WSL2）',
     required: true,
     target: 'external',
     ok: platformOk,
     current: platform,
-    hint:
-      platform === 'darwin'
+    hint: tmuxMode
+      ? 'tmux モードは GUI を起動しないため、macOS / Linux（コンテナ・SSH 先・WSL2 を含む）であれば動作します。'
+      : platform === 'darwin'
         ? 'macOS では VK Terminals(GUI) をそのまま起動できます。'
         : 'macOS または WSL2(WSLg) 上の Ubuntu で GUI を起動できます。それ以外の環境では別マシンの VK Terminals API を使う構成（~/.vk-terminals/config.json の apiHost + `vk-orchestrator start`）を検討してください。',
   });
 
-  // 0-4 VK Terminals 導入
+  // terminals.mode（実行面のモード選択。以降の required がこの値で変わる）
+  // ※ 他の項目に付いている 0-x / 2-x は SKILL.md のヒアリング順の ID で、配列の順番ではない。
+  //    実行面モード関連はヒアリング項目に無いため番号を振らない。
+  requirements.push({
+    id: 'terminals.mode',
+    group: '前提',
+    label: '実行面モード（モード選択）',
+    required: true,
+    target: 'A',
+    ok: true, // 既定 vk-terminals が常に解決されるため、選択自体は常に充足。以降の required はこの値で変わる。
+    current: tmuxMode ? 'tmux' : 'vk-terminals（既定）',
+    hint: 'config.json の terminals.mode で vk-terminals（既定・GUI）/ tmux を選べます。以降の必須項目はこのモードで変わります。',
+  });
+
+  // 0-4 VK Terminals 導入（vk-terminals モードで必須。tmux モードは GUI を使わないので任意）
   let vkTerminalsOk = false;
   let vkTerminalsDir = '';
   try {
@@ -139,12 +188,43 @@ export function runDoctor(options = {}) {
     id: 'vk-terminals',
     group: '前提',
     label: 'VK Terminals 導入',
-    required: true,
+    required: !tmuxMode,
     target: 'external',
     ok: vkTerminalsOk,
     current: vkTerminalsOk ? vkTerminalsDir : '未導入',
-    hint: '`npm run setup:terminals` で導入してください（GUI は macOS 専用。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
+    hint: tmuxMode
+      ? 'tmux モードでは VK Terminals(GUI) は不要です（vk-terminals モードに切り替えるときだけ `npm run setup:terminals` で導入してください）。'
+      : '`npm run setup:terminals` で導入してください（GUI は macOS 専用。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
   });
+
+  // tmux コマンド導入（tmux モードのみ。vk-terminals モードでは行自体を出さない）
+  if (tmuxMode) {
+    let tmuxVersion = '';
+    try {
+      // 外部コマンドの stdout をそのままレポート／--json に載せない。
+      // 先頭行のみ・ANSI エスケープと制御文字を除去・長さを制限する（想定値は "tmux 3.4" 程度）。
+      // 改行入りの値でレポートの行構造が崩れ、偽の ✅/❌ 行を混ぜ込めるのを防ぐ。
+      tmuxVersion = String(resolveTmuxVersion() ?? '')
+        .split('\n')[0]
+        .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '') // ANSI CSI シーケンス
+        .replace(/[\u0000-\u001f\u007f-\u009f]/g, '') // C0/C1 制御文字
+        .trim()
+        .slice(0, 64);
+    } catch {
+      tmuxVersion = '';
+    }
+    const tmuxOk = tmuxVersion !== '';
+    requirements.push({
+      id: 'tmux',
+      group: '前提',
+      label: 'tmux コマンド導入',
+      required: true,
+      target: 'external',
+      ok: tmuxOk,
+      current: tmuxOk ? tmuxVersion : '未導入',
+      hint: 'tmux をインストールしてください（例: `brew install tmux` / Ubuntu は `sudo apt install tmux`）。',
+    });
+  }
 
   // 0-5 vk-agents スキル展開
   const agentsSetupOk = isVkAgentsSetup({ manifestPath, homeDir });

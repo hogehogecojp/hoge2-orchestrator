@@ -412,8 +412,14 @@ async function main() {
           } else {
             console.warn('[up] vk-agents 設定の投影はスキップしました（config.json 未作成、またはパス未解決）。');
           }
-          await warnIfVkAgentsNotSetup();
+          // 起動前に orchestrator 自身の版ズレを解消する（VK Terminals パスと同じ順序）。
+          // 自己更新が走ると子プロセスで再実行して exit するため、doctor はその後に置く
+          // （更新前コードの診断を利用者に見せないため）。
           await reconcileOrchestratorVersion();
+          // doctor ベースの起動時案内（未定義関数を呼んでいて ReferenceError になっていた箇所）。
+          // doctor は terminals.mode を見てモード別に required を計算するので、tmux モードでも
+          // 「VK Terminals 未導入」を必須欠損にせず正しくゲートできる。
+          await warnIfNotReady();
 
           // engine を起動する start コマンドを tmux window 内で実行する。tmux server が
           // 既存だと server の古い env を引くため、必要な env はコマンド文字列へ焼き込む。
