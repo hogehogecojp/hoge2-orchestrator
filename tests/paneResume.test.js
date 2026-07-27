@@ -12,7 +12,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { handlePaneMissing, normalizeResumeMax } from '../src/engine/pane-resume.js';
+import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from '../src/engine/pane-resume.js';
 
 // console.log / warn を黙らせるためのスタブ
 const silentLogger = { log: () => {}, warn: () => {} };
@@ -272,6 +272,87 @@ describe('handlePaneMissing', () => {
     assert.deepEqual(result, { action: 'failed' });
     assert.match(calls.failTask[0], /上限 0 回/);
     assert.equal(calls.setStatus.length, 0);
+  });
+});
+
+// issue #172: submitToClaude が本文の取りこぼし（bodyConfirmed=false）を返したとき、
+// in-progress のまま放置せず handlePaneMissing と同じコアで status:ready へ戻して
+// 自動再ディスパッチする。トリガ理由の文言以外は pane 消失時と挙動を共有し、
+// resumeCount / 上限（PANE_RESUME_MAX）は pane 消失と合算で管理する。
+describe('handleUndeliveredBody', () => {
+  it('本文未達なら cleanup・state リセットのうえ status:ready へ自動再開する', async () => {
+    const { deps, calls } = makeDeps();
+    const saved = { termId: 22, wpPort: 8888, repo: 'owner/repo' };
+
+    const result = await handleUndeliveredBody(issue, saved, deps, {
+      resumeMax: 3,
+      logger: silentLogger,
+    });
+
+    assert.deepEqual(result, { action: 'resumed', resumeCount: 1 });
+
+    // PR の有無を対象 issue で確認している（PR ありなら通常ルートに任せる保険）
+    assert.deepEqual(calls.findPRForIssue, [['owner', 'repo', 42]]);
+
+    // wp-env の掃除が wpPort 付きで走っている
+    assert.equal(calls.cleanupForIssue.length, 1);
+    assert.deepEqual(calls.cleanupForIssue[0], { issueNumber: 246, wpPort: 8888 });
+
+    // resumeCount 記録 → termId/paneMissingTicks/wpPort の明示リセットの順で state を更新。
+    // termId は必ず null に戻す（残すと生存ペインへの in-progress 再試行経路に入り、
+    // 空プロンプトのゾンビペインへ再送してしまうため）。
+    assert.equal(calls.updateTask.length, 2);
+    assert.deepEqual(calls.updateTask[0], [246, { resumeCount: 1 }]);
+    assert.deepEqual(calls.updateTask[1], [246, { termId: null, paneMissingTicks: 0, wpPort: null }]);
+
+    // status:ready へ再キュー
+    assert.deepEqual(calls.setStatus, [[246, 'status:ready']]);
+
+    // 本文未達を明示する自動再開コメント（pane 消失とは文言が異なる）
+    assert.equal(calls.addComment.length, 1);
+    assert.equal(calls.addComment[0][0], 246);
+    assert.match(calls.addComment[0][1], /本文/);
+    assert.match(calls.addComment[0][1], /（1\/3回目）/);
+
+    // failed 経路には入らない
+    assert.equal(calls.failTask.length, 0);
+  });
+
+  it('resumeCount が pane 消失と合算で上限超過したら failTask に倒す', async () => {
+    const { deps, calls } = makeDeps();
+    // 既に（pane 消失などで）上限まで再開済みのタスク
+    const saved = { termId: 22, wpPort: 8888, resumeCount: 3 };
+
+    const result = await handleUndeliveredBody(issue, saved, deps, {
+      resumeMax: 3,
+      logger: silentLogger,
+    });
+
+    assert.deepEqual(result, { action: 'failed' });
+    assert.equal(calls.failTask.length, 1);
+    assert.match(calls.failTask[0], /termId:22/);
+    assert.match(calls.failTask[0], /上限 3 回/);
+
+    // 再開系の副作用は一切走らない（in-progress のまま放置もしない）
+    assert.equal(calls.setStatus.length, 0);
+    assert.equal(calls.addComment.length, 0);
+    assert.equal(calls.updateTask.length, 0);
+    assert.equal(calls.cleanupForIssue.length, 0);
+  });
+
+  it('PR が既にあるタスクは再開しない（通常ルートに任せる）', async () => {
+    const { deps, calls } = makeDeps({
+      findPRForIssue: async () => ({ number: 99, html_url: 'https://github.com/owner/repo/pull/99' }),
+    });
+
+    const result = await handleUndeliveredBody(issue, { termId: 22, wpPort: 8888 }, deps, {
+      resumeMax: 3,
+      logger: silentLogger,
+    });
+
+    assert.deepEqual(result, { action: 'has-pr' });
+    assert.equal(calls.setStatus.length, 0);
+    assert.equal(calls.failTask.length, 0);
   });
 });
 

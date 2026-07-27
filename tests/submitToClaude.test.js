@@ -12,7 +12,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { submitToClaude } from '../src/terminals/index.js';
+import { submitToClaude, reconfirmBodyEcho } from '../src/terminals/index.js';
 
 // --------------------------------------------------------------------------
 // fetch モックの仕込み
@@ -143,10 +143,12 @@ describe('submitToClaude', () => {
     assert.equal(result.ok, true, '送信結果が ok で返る');
     assert.equal(result.bodyConfirmed, true, 'エコーを確認できたので bodyConfirmed=true');
 
-    // /api/send は 本文 + Enter の計 2 回
-    assert.equal(scenario.sendCalls.length, 2, '再送なしで Enter は 1 回だけ送られる');
-    assert.equal(scenario.sendCalls[0].input, 'hello');
-    assert.equal(scenario.sendCalls[1].input, '\r');
+    // /api/send は 入力欄クリア + 本文 + Enter の計 3 回
+    // （クリアは issue #189 で初回送信前にも常時前置きするようになった。空欄では no-op）
+    assert.equal(scenario.sendCalls.length, 3, '再送なしで Enter は 1 回だけ送られる');
+    assert.equal(scenario.sendCalls[0].input, CLEAR_INPUT_SEQUENCE);
+    assert.equal(scenario.sendCalls[1].input, 'hello');
+    assert.equal(scenario.sendCalls[2].input, '\r');
   });
 
   it('(b) 本文送信で lastLines が変わるが Enter 送信では変わらない → maxRetries 分再送される（旧コードでは失敗するケース）', async () => {
@@ -165,15 +167,17 @@ describe('submitToClaude', () => {
     assert.equal(result.ok, true, '最終的に return される（プロセスは落とさない）');
 
     // /api/send の内訳:
-    //   1 回目: 本文
-    //   2 回目: 最初の Enter
-    //   3 回目: 再送 1 回目
-    //   4 回目: 再送 2 回目（maxRetries=2）
-    // 合計 4 回。Enter は計 3 回（最初の Enter + 再送 maxRetries=2）。
-    assert.equal(scenario.sendCalls.length, 1 + 1 + FAST_OPTIONS.maxRetries,
+    //   1 回目: 入力欄クリア（issue #189 で初回送信前にも前置き）
+    //   2 回目: 本文
+    //   3 回目: 最初の Enter
+    //   4 回目: 再送 1 回目
+    //   5 回目: 再送 2 回目（maxRetries=2）
+    // 合計 5 回。Enter は計 3 回（最初の Enter + 再送 maxRetries=2）。
+    assert.equal(scenario.sendCalls.length, 1 + 1 + 1 + FAST_OPTIONS.maxRetries,
       'maxRetries の回数だけ Enter が再送される');
-    assert.equal(scenario.sendCalls[0].input, 'hello');
-    for (let i = 1; i < scenario.sendCalls.length; i++) {
+    assert.equal(scenario.sendCalls[0].input, CLEAR_INPUT_SEQUENCE);
+    assert.equal(scenario.sendCalls[1].input, 'hello');
+    for (let i = 2; i < scenario.sendCalls.length; i++) {
       assert.equal(scenario.sendCalls[i].input, '\r', `${i} 回目の send は Enter`);
     }
   });
@@ -185,9 +189,9 @@ describe('submitToClaude', () => {
     const result = await submitToClaude(PORT, TERMID, 'hello', 10, FAST_OPTIONS);
 
     assert.equal(result.ok, true);
-    // 本文 + Enter のみ。再送は走らない（baseline=null なら confirmOutputProgressed は true）
-    assert.equal(scenario.sendCalls.length, 2, '再送なしで終わる');
-    assert.equal(scenario.sendCalls[1].input, '\r');
+    // クリア + 本文 + Enter のみ。再送は走らない（baseline=null なら confirmOutputProgressed は true）
+    assert.equal(scenario.sendCalls.length, 3, '再送なしで終わる');
+    assert.equal(scenario.sendCalls[2].input, '\r');
   });
 
   it('(d) confirm: false を渡すと従来通り即 return（baseline 取得もスキップ）', async () => {
@@ -200,7 +204,9 @@ describe('submitToClaude', () => {
     assert.equal(result.ok, true);
     assert.equal(result.bodyConfirmed, null, 'confirm:false では確認しないので bodyConfirmed=null');
     assert.equal(scenario.statesCalls, 0, 'confirm:false では /api/states が呼ばれない');
-    assert.equal(scenario.sendCalls.length, 2, '本文 + Enter の 2 回のみ');
+    assert.equal(scenario.sendCalls.length, 3, 'クリア + 本文 + Enter の 3 回のみ');
+    assert.equal(scenario.sendCalls[0].input, CLEAR_INPUT_SEQUENCE,
+      'confirm:false でも初回送信前のクリアは行う');
   });
 
   it('(e) [RED] コールドスタートのバナーが本文を飲み込み、Enterでバナーが消えるだけで出力は進む → 本文が再送されるべき（現行コードは見逃す）', async () => {
@@ -247,10 +253,11 @@ describe('submitToClaude', () => {
     assert.equal(result.bodyConfirmed, true, '再送でエコーを確認できたので bodyConfirmed=true');
     const bodySends = scenario.sendCalls.filter(c => c.input === 'hello');
     assert.equal(bodySends.length, 2, '飲み込まれた本文は 1 回だけ再送され、エコー確認後は再送を止める');
-    // 本文(2回) + 再送前クリア(1回) + Enter(1回) の計 4 回のみ。
+    // 本文(2回) + クリア(初回送信前・再送前の計 2 回) + Enter(1回) の計 5 回のみ。
     // Enter 側は afterEnter で AND 判定 progressed=true のため再送なし。
-    assert.equal(scenario.sendCalls.length, 4, 'エコー確認後は Enter も 1 回で成功し、余計な再送が起きない');
-    assert.equal(scenario.sendCalls[1].input, CLEAR_INPUT_SEQUENCE, '本文再送の直前に入力行をクリアする');
+    assert.equal(scenario.sendCalls.length, 5, 'エコー確認後は Enter も 1 回で成功し、余計な再送が起きない');
+    assert.equal(scenario.sendCalls[0].input, CLEAR_INPUT_SEQUENCE, '初回の本文送信の直前にも入力行をクリアする');
+    assert.equal(scenario.sendCalls[2].input, CLEAR_INPUT_SEQUENCE, '本文再送の直前に入力行をクリアする');
   });
 
   it('本文再送時は入力行をクリアしてから再送し、Enter で確定される行を重複連結しない', async () => {
@@ -289,8 +296,184 @@ describe('submitToClaude', () => {
     assert.equal(result.bodyConfirmed, true, 'エコー確認をスキップしたので bodyConfirmed=true');
     const bodySends = scenario.sendCalls.filter(c => c.input === 'ok a b');
     assert.equal(bodySends.length, 1, '4 文字以上のトークンが無い本文は再送しない');
-    // 本文(1回) + Enter(1回) の計 2 回。
-    assert.equal(scenario.sendCalls.length, 2, 'エコー確認スキップ時は本文再送が発火しない');
+    // クリア(1回) + 本文(1回) + Enter(1回) の計 3 回。
+    assert.equal(scenario.sendCalls.length, 3, 'エコー確認スキップ時は本文再送が発火しない');
+  });
+
+  // ------------------------------------------------------------------------
+  // issue #189: 投入前に入力欄へ残留文字があると、送信本文がその後ろに連結され
+  // `<残留文字>/vk-kore ...` という行が確定される。先頭の `/` が行頭からずれるため
+  // Claude Code がスラッシュコマンドとして発火しない。
+  // ------------------------------------------------------------------------
+
+  it('(h) [RED] 入力欄に残留文字がある状態で投入しても、確定される行は本文だけになる', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // ユーザーが手で打ちかけた文字がペインの入力欄に残っている状態を模擬する。
+    scenario.inputBuffer = 'ゴミ';
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100,   lastLines: '> ' },
+      afterBody:  { lastOutputTime: 1_000, lastLines: `> ${body}` },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+      scenario.submittedInputs,
+      [body],
+      '残留文字が本文の前に連結されず、スラッシュコマンドが行頭から始まる'
+    );
+    assert.equal(scenario.sendCalls[0].input, CLEAR_INPUT_SEQUENCE,
+      '初回の本文送信の前にも入力欄をクリアする');
+  });
+
+  it('(i) [RED] 残留文字が前置連結された行はエコー確認を通さず、クリア＋再送が発火する', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // 画面には `> ゴミ/vk-kore ...` という汚染行が出ている。断片一致だけの判定では
+    // bodyConfirmed=true になり、クリア＝再送ループがスキップされてしまう。
+    scenario.statesByPhase = {
+      beforeBody:     { lastOutputTime: 100,   lastLines: '> ' },
+      afterBody:      { lastOutputTime: 1_000, lastLines: `> ゴミ${body}` },
+      afterBodyRetry: { lastOutputTime: 1_500, lastLines: `> ${body}` },
+      afterEnter:     { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 2, '汚染行を検知して本文を 1 回だけ再送する');
+    assert.equal(result.bodyConfirmed, true, '再送後の綺麗な行でエコーを確認できる');
+  });
+
+  it('(j) 装飾（枠線・プロンプト記号）だけが前置された行は汚染とみなさない（fail-open）', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100,   lastLines: '│ > ' },
+      afterBody:  { lastOutputTime: 1_000, lastLines: `╭──────────╮\n│ > ${body}\n╰──────────╯` },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, true, '入力欄装飾のみの前置は汚染ではない');
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 1, '装飾だけなら本文再送は起きない');
+  });
+
+  it('(k) 汚染行と綺麗な行が混在する場合は汚染とみなさない（fail-open）', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // 上のログ行（過去の転記）には本文が別の文脈で現れているが、入力欄の行は綺麗。
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100, lastLines: '> ' },
+      afterBody:  {
+        lastOutputTime: 1_000,
+        lastLines: `  ユーザーの依頼: ${body}\n> ${body}`,
+      },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, true, '綺麗な行が 1 本でもあれば汚染とみなさない');
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 1, '再送は起きない');
+  });
+
+  it('(k2) 実データ相当: ステータス行と入力プロンプトが 1 行に潰れ ANSI 残骸が前に付いても汚染としない', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // VK Terminals の states.json で実際に観測される形。行幅で切られた結果、ステータス行の
+    // 末尾に途中で切れた ANSI（ESC が落ちた `3;153;153m`）とプロンプト `❯` + NBSP が
+    // 同じ行に並ぶ。境界文字（`❯`・NBSP）を挟んでいるので残留文字ではない。
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100, lastLines: '❯ ' },
+      afterBody:  {
+        lastOutputTime: 1_000,
+        lastLines: `  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to inte…3;153;153m❯ ${body}`,
+      },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, true, '境界文字を挟んだ前置は残留文字ではない');
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 1, '実データ相当の画面で再送が誤発火しない');
+  });
+
+  it('(l) 本文の先頭トークンが行内に見つからない（折り返し等）場合は従来の断片一致にフォールバックする', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // 先頭トークンが折り返しで分断され、行単位では特定できない。末尾トークン
+    // （headless=1）は画面に出ているので、従来どおり「エコーされた」と判定する。
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100, lastLines: '> ' },
+      afterBody:  {
+        lastOutputTime: 1_000,
+        lastLines: '> /vk-ko\nre https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1',
+      },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, true, '判定不能なら fail-open（従来の includes 判定）');
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 1, 'fail-open なので再送は起きない');
+  });
+
+  it('(m) clearBeforeSend:false では初回クリアを撃たない（生きたダイアログへ制御文字を送らない）', async () => {
+    const result = await submitToClaude(PORT, TERMID, 'hello', 10, {
+      ...FAST_OPTIONS,
+      clearBeforeSend: false,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(scenario.sendCalls.length, 2, '本文 + Enter の 2 回のみ');
+    assert.equal(scenario.sendCalls[0].input, 'hello', '1 回目の send がいきなり本文');
+    assert.equal(scenario.sendCalls[1].input, '\r');
+    assert.ok(
+      !scenario.sendCalls.some(c => c.input === CLEAR_INPUT_SEQUENCE),
+      'クリアシーケンスは一度も送られない'
+    );
+  });
+
+  it('(n) clearBeforeSend:false でも本文再送の直前のクリアは従来どおり撃つ', async () => {
+    // 再送ループのクリアは「追記型の入力欄で再送を置換にする」ために不可欠なので、
+    // clearBeforeSend の対象外（初回クリアだけを外すオプションである）ことを固定する。
+    scenario.statesByPhase = {
+      beforeBody:     { lastOutputTime: 100,   lastLines: 'Fable 5 is back and better than ever!' },
+      afterBody:      { lastOutputTime: 100,   lastLines: 'Fable 5 is back and better than ever!' },
+      afterBodyRetry: { lastOutputTime: 500,   lastLines: 'prompt:hello' },
+      afterEnter:     { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    await submitToClaude(PORT, TERMID, 'hello', 10, { ...FAST_OPTIONS, clearBeforeSend: false });
+
+    const clears = scenario.sendCalls.filter(c => c.input === CLEAR_INPUT_SEQUENCE);
+    assert.equal(clears.length, 1, '再送前のクリアだけが撃たれる');
+    assert.equal(scenario.sendCalls[0].input, 'hello', '初回はクリアなしで本文から始まる');
+    assert.equal(scenario.sendCalls[1].input, CLEAR_INPUT_SEQUENCE, '再送の直前はクリアする');
+  });
+
+  it('(o) 行幅で切られた未終端 OSC が本文の直前に残っていても汚染とみなさない', async () => {
+    const body = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/189 wp-env-port=9100 headless=1';
+    // OSC（ペインタイトル設定）が終端子ごと切り詰められ、ペイロードが可視テキストとして
+    // 本文の直前に地続きで残ったケース。ESC だけを制御文字として落とすと
+    // `]0;pane-title` が残留文字に見えてしまう（偽陽性）。
+    scenario.statesByPhase = {
+      beforeBody: { lastOutputTime: 100, lastLines: '> ' },
+      afterBody:  {
+        lastOutputTime: 1_000,
+        lastLines: `> \x1b]0;vk-terminals pane-title${body}`,
+      },
+      afterEnter: { lastOutputTime: 2_000, lastLines: 'after-enter' },
+    };
+
+    const result = await submitToClaude(PORT, TERMID, body, 10, FAST_OPTIONS);
+
+    assert.equal(result.bodyConfirmed, true, '未終端 OSC の残骸は残留文字とみなさない');
+    const bodySends = scenario.sendCalls.filter(c => c.input === body);
+    assert.equal(bodySends.length, 1, '偽陽性の再送が起きない');
   });
 
   it('AND 判定: lastOutputTime だけ進んで lastLines が同じ場合は progressed と見なさない', async () => {
@@ -304,7 +487,168 @@ describe('submitToClaude', () => {
     await submitToClaude(PORT, TERMID, 'hello', 10, FAST_OPTIONS);
 
     // OR 判定のままだと再送 0 回で終わる。AND 判定であれば maxRetries 分再送される。
-    assert.equal(scenario.sendCalls.length, 1 + 1 + FAST_OPTIONS.maxRetries,
+    // 内訳は クリア(1) + 本文(1) + 最初の Enter(1) + Enter 再送(maxRetries)。
+    assert.equal(scenario.sendCalls.length, 1 + 1 + 1 + FAST_OPTIONS.maxRetries,
       'AND 判定なのでカーソル blink 相当のケースでは再送が発火する');
+  });
+});
+
+// --------------------------------------------------------------------------
+// issue #172: コールドスタートで起動バナーが数回 churn した後にエコーが出現する
+// ケース。バナー描画が長引くと、旧デフォルト（delayMs=500 / maxRetries=2）では
+// 本文の再送回数が足りずエコーを確認できずに bodyConfirmed=false で終わっていた。
+// デフォルトを delayMs=1000 / maxRetries=3 に引き上げることで、バナー churn を
+// 跨いでエコーを確認できるようになることを検証する。
+//
+// 独立した fetch モックを使い、「本文が N 回届くまではバナーが churn（エコー無し）、
+// N 回目でようやくプロンプトに本文がエコーされる」状況を再現する。
+// --------------------------------------------------------------------------
+describe('submitToClaude コールドスタート banner churn (issue #172)', () => {
+  // 実運用に近い、十分長い（4 文字以上のトークンを含む）本文。
+  const BODY = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/999 wp-env-port=9200';
+  // エコーが現れるのに必要な「本文の総送信回数」。
+  //   - 旧デフォルト maxRetries=2 → 本文送信は初回 + 2 = 計 3 回。ここに届かず false。
+  //   - 新デフォルト maxRetries=3 → 本文送信は初回 + 3 = 計 4 回。ここで初めて true。
+  const ECHO_APPEARS_AFTER_BODY_SENDS = 4;
+
+  let savedFetch;
+  let bodySends;
+  let enterSends;
+
+  function states(lastOutputTime, lastLines) {
+    return {
+      ok: true,
+      json: async () => ({
+        terminals: {
+          [TERMID]: { termId: TERMID, waiting: false, lastOutputTime, lastLines },
+        },
+      }),
+    };
+  }
+
+  beforeEach(() => {
+    savedFetch = global.fetch;
+    bodySends  = 0;
+    enterSends = 0;
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (u.endsWith('/api/send')) {
+        const body = init && init.body ? JSON.parse(init.body) : {};
+        if (body.input === '\r') enterSends += 1;
+        else if (body.input === CLEAR_INPUT_SEQUENCE) { /* 入力行クリアは送信回数に数えない */ }
+        else bodySends += 1;
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      if (u.endsWith('/api/states')) {
+        // Enter 送信後は出力が進む（Enter 確定チェックを通す）。
+        if (enterSends > 0) return states(9_000 + enterSends, 'after-enter');
+        // 本文が規定回数届くまではバナーが churn し続け、本文はエコーされない。
+        if (bodySends >= ECHO_APPEARS_AFTER_BODY_SENDS) {
+          return states(5_000 + bodySends, `> ${BODY}`);
+        }
+        return states(1_000 + bodySends, `Banner churn phase ${bodySends} ...`);
+      }
+      throw new Error(`unexpected fetch url in test: ${u}`);
+    };
+  });
+
+  afterEach(() => {
+    global.fetch = savedFetch;
+  });
+
+  it('[RED] デフォルト設定（maxRetries 未指定）でバナー churn を跨いでエコーを確認できる', async () => {
+    // delayMs は小さくして高速化（本挙動は maxRetries に依存するため、これで妥当）。
+    // maxRetries / confirm 系は「デフォルト値」を使わせたいので敢えて渡さない。
+    // 旧デフォルト maxRetries=2 だと本文送信が 3 回どまり → エコー未確認 → bodyConfirmed=false（RED）。
+    // 新デフォルト maxRetries=3 なら本文送信が 4 回に届き → エコー確認 → bodyConfirmed=true（GREEN）。
+    const result = await submitToClaude(PORT, TERMID, BODY, 5);
+
+    assert.equal(result.bodyConfirmed, true,
+      'デフォルト maxRetries でバナー churn 後のエコーを確認できるべき');
+    assert.ok(bodySends >= ECHO_APPEARS_AFTER_BODY_SENDS,
+      `本文がエコー出現に必要な回数まで再送されるべき（実際: ${bodySends}）`);
+  });
+
+  it('旧デフォルト相当 maxRetries=2 ではエコーを確認できない（false）— 不具合の再現', async () => {
+    const result = await submitToClaude(PORT, TERMID, BODY, 5, {
+      maxRetries: 2, confirmTimeoutMs: 200, pollIntervalMs: 30,
+    });
+    assert.equal(result.bodyConfirmed, false,
+      'maxRetries=2 では本文送信が 3 回どまりでエコーを確認できない');
+  });
+
+  it('新デフォルト相当 maxRetries=3 ならエコーを確認できる（true）— 修正後の期待', async () => {
+    const result = await submitToClaude(PORT, TERMID, BODY, 5, {
+      maxRetries: 3, confirmTimeoutMs: 200, pollIntervalMs: 30,
+    });
+    assert.equal(result.bodyConfirmed, true,
+      'maxRetries=3 なら本文送信が 4 回に届きエコーを確認できる');
+  });
+});
+
+// --------------------------------------------------------------------------
+// reconfirmBodyEcho（偽陽性ガード）: 再ディスパッチ発動直前のエコー再確認。
+// bodyConfirmed=false からの再ディスパッチを、真に未達のときだけ通す fail-closed 判定。
+//   - 照合対象が無い（本文が空 / 4 文字以上トークン無し）→ true（スキップ）
+//   - states 取得失敗（baseline=null）→ false（fail-closed で再ディスパッチへ）
+//   - エコー一致 → true / エコー不一致 → false
+// --------------------------------------------------------------------------
+describe('reconfirmBodyEcho（偽陽性ガード）', () => {
+  const FRAG = '/vk-kore https://github.com/vektor-inc/vk-blocks-pro/issues/999';
+
+  let savedFetch;
+  let statesCalls;
+
+  function installStates(behavior) {
+    savedFetch = global.fetch;
+    statesCalls = 0;
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (!u.endsWith('/api/states')) throw new Error(`unexpected fetch url in test: ${u}`);
+      statesCalls += 1;
+      return behavior();
+    };
+  }
+  function termStates(lastLines) {
+    return { ok: true, json: async () => ({ terminals: { [TERMID]: { termId: TERMID, lastOutputTime: 1, lastLines } } }) };
+  }
+
+  afterEach(() => { if (savedFetch) global.fetch = savedFetch; savedFetch = undefined; });
+
+  it('照合対象が無い本文（4文字以上トークン無し）は true を返し、states も引かない', async () => {
+    installStates(() => { throw new Error('should not be called'); });
+    const result = await reconfirmBodyEcho(PORT, TERMID, 'ok a b');
+    assert.equal(result, true, '照合対象が無ければスキップ扱いで true');
+    assert.equal(statesCalls, 0, 'echoFragment=null のときは states を引かない');
+  });
+
+  it('states 取得が API エラー（baseline=null）なら false（fail-closed で再ディスパッチへ）', async () => {
+    installStates(() => { throw new Error('mock api/states error'); });
+    const result = await reconfirmBodyEcho(PORT, TERMID, FRAG);
+    assert.equal(result, false, 'baseline 取得失敗は fail-closed で false');
+  });
+
+  it('states にターミナルが居ない（baseline=null）なら false（fail-closed）', async () => {
+    installStates(() => ({ ok: true, json: async () => ({ terminals: {} }) }));
+    const result = await reconfirmBodyEcho(PORT, TERMID, FRAG);
+    assert.equal(result, false, '対象ターミナル不在も baseline=null で false');
+  });
+
+  it('lastLines に本文の一部がエコーされていれば true', async () => {
+    installStates(() => termStates(`> ${FRAG}`));
+    const result = await reconfirmBodyEcho(PORT, TERMID, FRAG);
+    assert.equal(result, true, 'エコーを積極的に確認できたら true');
+  });
+
+  it('lastLines にエコーが無ければ false（真に未達 → 再ディスパッチへ）', async () => {
+    installStates(() => termStates('Fable 5 is back and better than ever!'));
+    const result = await reconfirmBodyEcho(PORT, TERMID, FRAG);
+    assert.equal(result, false, 'エコー不一致は false');
+  });
+
+  it('[RED] 残留文字が前置連結された行しか無ければ false（汚染検知 → 再ディスパッチへ）', async () => {
+    installStates(() => termStates(`> ゴミ${FRAG}`));
+    const result = await reconfirmBodyEcho(PORT, TERMID, FRAG);
+    assert.equal(result, false, '断片は含まれていても行頭が汚染されていれば未達扱い');
   });
 });

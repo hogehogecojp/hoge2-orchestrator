@@ -21,6 +21,11 @@ const REPO_ROOT = resolve(__dirname, '..');
 const require = createRequire(import.meta.url);
 export const DEFAULT_VENDORED_VK_AGENTS_DIR = join(REPO_ROOT, 'vendor', 'vk-agents-public');
 const DEFAULT_VK_TERMINALS_PORT = 13847;
+const VK_TERMINALS_CONFIG_TARGET_PATH = '~/.vk-terminals/config.json';
+const VK_TERMINALS_SETTINGS_NOTE = 'VK Terminals 本体の設定ファイル（~/.vk-terminals/config.json）に直接保存され、VK Terminals が読み込みます。';
+// VK Terminals 本体スキーマ由来の項目のうち、orchestrator の設定画面には
+// 出したくないキーを列挙する。現状は本体スキーマの全項目を表示する。
+const VK_TERMINALS_SCHEMA_HIDDEN_KEYS = [];
 
 export const GITHUB_TOKEN_RESOLUTION_HELP = 'GitHub トークンを解決できません。gh CLI 未導入の場合は `brew install gh`（Ubuntu: `sudo apt install gh`）でインストールし、`gh auth login` で認証してください。';
 
@@ -50,6 +55,14 @@ export const DEFAULT_TASK = {
   // 割り当て・{wpPort} 展開・マージ後クリーンアップを行い、無効時はそれらを一切行わず
   // {wpPort} を含まないテンプレートに差し替えることで vk-kore 以外のスキル／素のプロンプトも起動できる。
   wpEnv: { enabled: null },
+};
+
+/**
+ * queue セクションの既定値。
+ * キューの永続化先を切り替える。既定はローカル JSON（~/.task-queue/queue.json）。
+ */
+export const DEFAULT_QUEUE = {
+  backend: 'local',
 };
 
 /**
@@ -205,14 +218,15 @@ export function applyConfigToEnv(cfg = {}) {
   set('WATCHDOG_IDLE_MS', o.watchdogIdleMs);
   set('PANE_RESUME_MAX', o.paneResumeMax);
   set('ASSIGNEE_FILTER', o.assigneeFilter);
-  set('TASK_CWD', o.taskCwd);
 
   const vk = cfg.vkTerminals ?? {};
-  // port は ~/.vk-terminals/config.json の `port` が正本。旧 vkTerminals.port は
-  // migrateVkTerminalsLaunchOptions() で初回だけ本体 config へ移し、env へは流さない。
+  // port は ~/.vk-terminals/config.json の `port` が正本のため env へは流さない。
   // host は現在 ~/.vk-terminals/config.json の apiHost が正本。
   // 旧 config.json(vkTerminals.host) を使っている環境だけ後方互換として env へ流す。
   set('VK_TERMINALS_HOST', vk.host);
+
+  const queue = cfg.queue ?? {};
+  set('QUEUE_BACKEND', queue.backend);
 }
 
 /**
@@ -246,62 +260,13 @@ export function migrateLegacyOrchestratorConfig(options = {}) {
   return { migrated: true, sourcePath, targetPath };
 }
 
-/**
- * 旧 orchestrator config の VK Terminals 起動オプションを、本体 config へ初回移行する。
- *
- * port は VK Terminals 本体 config（~/.vk-terminals/config.json）の `port` が正本。
- * 既に本体 config に port がある場合はユーザー設定を尊重して上書きしない。
- * GPU は orchestrator が GUI を spawn する際のオプションなので移行しない。
- * @param {{ orchestratorConfigPath?: string, vkTerminalsConfigPath?: string, homeDir?: string, log?: (message:string)=>void }} [options]
- * @returns {{ migrated: boolean, sourcePath: string, targetPath: string }}
- */
-export function migrateVkTerminalsLaunchOptions(options = {}) {
-  const homeDir = options.homeDir ?? homedir();
-  const log = options.log ?? console.log;
-  const sourcePath = options.orchestratorConfigPath ?? resolveConfigPath();
-  const targetPath = options.vkTerminalsConfigPath ?? join(homeDir, '.vk-terminals', 'config.json');
-
-  let orchestratorConfig;
-  try {
-    orchestratorConfig = readJsonObject(sourcePath);
-  } catch (err) {
-    console.warn(`[Config] ${sourcePath} の読み込みに失敗したため VK Terminals port 移行をスキップしました: ${err.message}`);
-    return { migrated: false, sourcePath, targetPath };
-  }
-
-  // TODO(remove-after: #104 でレガシーキー撤去)
-  if (!hasOwnPath(orchestratorConfig, 'vkTerminals.port')) {
-    return { migrated: false, sourcePath, targetPath };
-  }
-  const legacyPort = getByPath(orchestratorConfig, 'vkTerminals.port');
-  if (legacyPort === undefined || legacyPort === null || legacyPort === '') {
-    return { migrated: false, sourcePath, targetPath };
-  }
-
-  let vkTerminalsConfig;
-  try {
-    vkTerminalsConfig = readJsonObject(targetPath);
-  } catch (err) {
-    console.warn(`[Config] ${targetPath} の読み込みに失敗したため VK Terminals port 移行をスキップしました: ${err.message}`);
-    return { migrated: false, sourcePath, targetPath };
-  }
-  if (hasOwnPath(vkTerminalsConfig, 'port')) {
-    return { migrated: false, sourcePath, targetPath };
-  }
-
-  setByPath(vkTerminalsConfig, 'port', legacyPort);
-  writeJsonAtomic(targetPath, vkTerminalsConfig);
-  log(`[Config] 旧 vkTerminals.port を ${targetPath} の port へ移行しました。`);
-  return { migrated: true, sourcePath, targetPath };
-}
-
 const LEGACY_VK_AGENTS_GUI_KEYS = [
   'features.coderabbit',
   'features.coderabbit_ignore',
   'staff_wp_dev.engine',
+  'staff_review.engine',
   'multi_repo_task.default_engine',
   'org.review_assets_repo',
-  'org.orchestrator_repo',
 ];
 
 /**
@@ -366,9 +331,8 @@ export function migrateLegacyVkAgentsGuiKeys(options = {}) {
 // macOS では HW アクセラがそのまま効くが、WSLg 等の Linux では GPU 初期化に失敗し
 // `Exiting GPU process` / `kTransientFailure` などのエラーが多発する（利用可能な
 // Vulkan ICD がソフトウェア実装のみで SwiftShader へフォールバックするため）。
-// ここでは起動モードを config(vkTerminals.gpu) / env(VK_TERMINALS_GPU) で選べるようにし、
-// bin 側の spawn 引数と追加環境変数へ写像する。GPU モードは VK Terminals 側の config.json
-// には書き出さない（orchestrator が GUI を spawn する時点の起動オプションのため）。
+// ここでは起動モードを env(VK_TERMINALS_GPU) / VK Terminals 本体 config(gpu) で選べるようにし、
+// bin 側の spawn 引数と追加環境変数へ写像する。
 // -------------------------------------------------------
 
 /** GPU 起動モードの取りうる値。 */
@@ -391,17 +355,29 @@ let warnedUnknownGpuMode = false;
 
 /**
  * GUI 起動時の GPU モードを解決する。
- * 優先順位: 環境変数 VK_TERMINALS_GPU > config.json(vkTerminals.gpu) > プラットフォーム既定。
+ * 優先順位: 環境変数 VK_TERMINALS_GPU > ~/.vk-terminals/config.json(gpu) > プラットフォーム既定。
  * 空文字・未知の値はプラットフォーム既定にフォールバックする。撤去した 'hardware' など
  * 非空の未知値が来た場合は、挙動変更に気づけるよう一度だけ警告する（起動は止めない）。
- * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @param {{ homeDir?: string, configPath?: string }} [options]
  * @param {string} [platform] process.platform 互換の値
  * @returns {'off'|'default'}
  */
-export function getVkTerminalsGpuMode(cfg = loadUnifiedConfig(), platform = process.platform) {
-  const raw = String(process.env.VK_TERMINALS_GPU ?? cfg?.vkTerminals?.gpu ?? '')
-    .trim()
-    .toLowerCase();
+export function getVkTerminalsGpuMode(options = {}, platform = process.platform) {
+  const configPath = options.configPath ?? join(options.homeDir ?? homedir(), '.vk-terminals', 'config.json');
+  let rawValue = process.env.VK_TERMINALS_GPU;
+
+  if (rawValue === undefined) {
+    try {
+      const config = readJsonObject(configPath);
+      rawValue = config.gpu ?? '';
+    } catch (err) {
+      const fallback = defaultGpuMode(platform);
+      console.warn(`[Config] ${configPath} の読み込みに失敗したため既定 GPU モード "${fallback}" を使用します: ${err.message}`);
+      return fallback;
+    }
+  }
+
+  const raw = String(rawValue ?? '').trim().toLowerCase();
   if (GPU_MODES.includes(raw)) return raw;
   // 空（＝自動）は正常。非空の未知値（例: 旧 'hardware'）だけ一度警告してフォールバック。
   const fallback = defaultGpuMode(platform);
@@ -490,6 +466,60 @@ export function resolveVkTerminalsDir() {
   return dirname(require.resolve('vk-terminals/package.json'));
 }
 
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function validateVkTerminalsSettingsSchema(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    throw new Error('top-level schema must be an object');
+  }
+  if (!Array.isArray(schema.groups)) {
+    throw new Error('schema.groups must be an array');
+  }
+  for (const [groupIndex, group] of schema.groups.entries()) {
+    if (!group || typeof group !== 'object' || Array.isArray(group)) {
+      throw new Error(`schema.groups[${groupIndex}] must be an object`);
+    }
+    if (!isNonEmptyString(group.label)) {
+      throw new Error(`schema.groups[${groupIndex}].label must be a non-empty string`);
+    }
+    if (!Array.isArray(group.fields)) {
+      throw new Error(`schema.groups[${groupIndex}].fields must be an array`);
+    }
+    for (const [fieldIndex, field] of group.fields.entries()) {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) {
+        throw new Error(`schema.groups[${groupIndex}].fields[${fieldIndex}] must be an object`);
+      }
+      for (const key of ['key', 'label', 'type']) {
+        if (!isNonEmptyString(field[key])) {
+          throw new Error(`schema.groups[${groupIndex}].fields[${fieldIndex}].${key} must be a non-empty string`);
+        }
+      }
+      if (field.options !== undefined && !Array.isArray(field.options)) {
+        throw new Error(`schema.groups[${groupIndex}].fields[${fieldIndex}].options must be an array`);
+      }
+    }
+  }
+  return schema;
+}
+
+/**
+ * vk-terminals 同梱の設定スキーマを読み込む。
+ * @param {string} vkDir VK Terminals パッケージのルートディレクトリ
+ * @returns {object|null}
+ */
+export function loadVkTerminalsSettingsSchema(vkDir) {
+  const schemaPath = join(vkDir, 'settings-schema.json');
+  try {
+    const schema = JSON.parse(readFileSync(schemaPath, 'utf8'));
+    return validateVkTerminalsSettingsSchema(schema);
+  } catch (err) {
+    console.warn(`[Config] ${schemaPath} を読み込めませんでした: ${err.message}`);
+    return null;
+  }
+}
+
 function getByPath(obj, path) {
   return path.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj);
 }
@@ -553,7 +583,7 @@ function readJsonObject(path) {
   }
 }
 
-function writeJsonAtomic(path, obj) {
+export function writeJsonAtomic(path, obj) {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
   const tmpPath = join(
@@ -708,6 +738,82 @@ export function resolveVkTerminalsApiPort(options = {}) {
 }
 
 /**
+ * VK Terminals がタスク一覧表示に読む、正規化済み task-queue snapshot のパス。
+ * @param {{ homeDir?: string }} [options]
+ * @returns {string}
+ */
+export function resolveTasksViewPath(options = {}) {
+  return join(options.homeDir ?? homedir(), '.task-queue', 'tasks-view.json');
+}
+
+/**
+ * VK Terminals がタスク一覧表示に読む、宣言的ウィジェット（tasks-widget.json）のパス。
+ * tasks-view.json の後継となる新形式で、当面は両方を dual-write する。
+ * @param {{ homeDir?: string }} [options]
+ * @returns {string}
+ */
+export function resolveTasksWidgetPath(options = {}) {
+  return join(options.homeDir ?? homedir(), '.task-queue', 'tasks-widget.json');
+}
+
+/**
+ * VK Terminals がステータス変更依頼を追記する commands.jsonl のパス。
+ * @param {{ homeDir?: string }} [options]
+ * @returns {string}
+ */
+export function resolveCommandsPath(options = {}) {
+  return join(options.homeDir ?? homedir(), '.task-queue', 'commands.jsonl');
+}
+
+/**
+ * up 起動時に VK Terminals 本体 config へ tasks-view.json のパスを注入する。
+ * 既存キーは保持し、tasksViewPath だけを上書きする。
+ * @param {{ homeDir?: string, configPath?: string, tasksViewPath?: string }} [options]
+ * @returns {{ configPath: string, tasksViewPath: string }}
+ */
+export function writeVkTerminalsTasksViewConfig(options = {}) {
+  const homeDir = options.homeDir ?? homedir();
+  const configPath = options.configPath ?? join(homeDir, '.vk-terminals', 'config.json');
+  const tasksViewPath = options.tasksViewPath ?? resolveTasksViewPath({ homeDir });
+  const config = readJsonObject(configPath);
+  config.tasksViewPath = tasksViewPath;
+  writeJsonAtomic(configPath, config);
+  return { configPath, tasksViewPath };
+}
+
+/**
+ * up 起動時に VK Terminals 本体 config へ tasks-widget.json のパスを注入する。
+ * 既存キーは保持し、tasksWidgetPath だけを上書きする。
+ * @param {{ homeDir?: string, configPath?: string, tasksWidgetPath?: string }} [options]
+ * @returns {{ configPath: string, tasksWidgetPath: string }}
+ */
+export function writeVkTerminalsTasksWidgetConfig(options = {}) {
+  const homeDir = options.homeDir ?? homedir();
+  const configPath = options.configPath ?? join(homeDir, '.vk-terminals', 'config.json');
+  const tasksWidgetPath = options.tasksWidgetPath ?? resolveTasksWidgetPath({ homeDir });
+  const config = readJsonObject(configPath);
+  config.tasksWidgetPath = tasksWidgetPath;
+  writeJsonAtomic(configPath, config);
+  return { configPath, tasksWidgetPath };
+}
+
+/**
+ * up 起動時に VK Terminals 本体 config へ commands.jsonl のパスを注入する。
+ * 既存キーは保持し、commandsPath だけを上書きする。
+ * @param {{ homeDir?: string, configPath?: string, commandsPath?: string }} [options]
+ * @returns {{ configPath: string, commandsPath: string }}
+ */
+export function writeVkTerminalsCommandsConfig(options = {}) {
+  const homeDir = options.homeDir ?? homedir();
+  const configPath = options.configPath ?? join(homeDir, '.vk-terminals', 'config.json');
+  const commandsPath = options.commandsPath ?? resolveCommandsPath({ homeDir });
+  const config = readJsonObject(configPath);
+  config.commandsPath = commandsPath;
+  writeJsonAtomic(configPath, config);
+  return { configPath, commandsPath };
+}
+
+/**
  * vk-agents の Claude グローバル派生設定パス。
  * sync.sh --claude-global と同じ場所へ、vk-agents config.json の投影として書く。
  * @param {string} [homeDir]
@@ -830,7 +936,7 @@ function applyVkAgentsGuiSettings(vkAgentsConfig, cfg) {
     setByPath(out, 'org.allowed_owners', allowedOwners);
   }
 
-  for (const key of ['org.review_assets_repo', 'org.orchestrator_repo']) {
+  for (const key of ['org.review_assets_repo']) {
     if (!hasOwnPath(cfg, key)) continue;
     const raw = String(getByPath(cfg, key) ?? '').trim();
     if (raw === '') {
@@ -847,6 +953,15 @@ function applyVkAgentsGuiSettings(vkAgentsConfig, cfg) {
       deleteByPath(out, 'staff_wp_dev.engine');
     } else if (raw === 'claude' || raw === 'codex') {
       setByPath(out, 'staff_wp_dev.engine', raw);
+    }
+  }
+
+  if (hasOwnPath(cfg, 'staff_review.engine')) {
+    const raw = String(getByPath(cfg, 'staff_review.engine') ?? '').trim();
+    if (raw === '') {
+      deleteByPath(out, 'staff_review.engine');
+    } else if (raw === 'claude' || raw === 'codex') {
+      setByPath(out, 'staff_review.engine', raw);
     }
   }
 
@@ -887,8 +1002,8 @@ export function writeVkAgentsSettings(cfg = {}, options = {}) {
     hasOwnPath(cfg, 'skills.disabled') ||
     hasOwnPath(cfg, 'org.allowed_owners') ||
     hasOwnPath(cfg, 'org.review_assets_repo') ||
-    hasOwnPath(cfg, 'org.orchestrator_repo') ||
     hasOwnPath(cfg, 'staff_wp_dev.engine') ||
+    hasOwnPath(cfg, 'staff_review.engine') ||
     hasOwnPath(cfg, 'multi_repo_task.default_engine');
   if (!hasConfig && !hasGuiSettings && options.force !== true) return null;
 
@@ -909,6 +1024,85 @@ export function writeVkAgentsSettings(cfg = {}, options = {}) {
   return { configPath, globalSettingsPath };
 }
 
+function vkTerminalsPortField() {
+  return {
+    key: 'port',
+    label: 'API ポート',
+    type: 'number',
+    help: `VK Terminals 本体の API サーバーが待ち受けるポート番号（既定: ${DEFAULT_VK_TERMINALS_PORT}）`,
+  };
+}
+
+function insertVkTerminalsPortField(fields) {
+  const next = fields.map((field) => ({ ...field }));
+  if (next.some((field) => field.key === 'port')) return next;
+  const apiHostIndex = next.findIndex((field) => field.key === 'apiHost');
+  next.splice(apiHostIndex >= 0 ? apiHostIndex + 1 : 0, 0, vkTerminalsPortField());
+  return next;
+}
+
+function vkTerminalsPortOnlySettingsGroup() {
+  return {
+    label: 'VK Terminals（本体設定）',
+    tab: 'terminals',
+    note: VK_TERMINALS_SETTINGS_NOTE,
+    targetPath: VK_TERMINALS_CONFIG_TARGET_PATH,
+    fields: [vkTerminalsPortField()],
+  };
+}
+
+function resolveVkTerminalsSettingsSchemaForDescriptor(options) {
+  let vkTerminalsDir = options.vkTerminalsDir;
+  if (vkTerminalsDir === undefined) {
+    try {
+      vkTerminalsDir = resolveVkTerminalsDir();
+    } catch (err) {
+      console.warn(`[Config] VK Terminals のインストールディレクトリを解決できないため settings-schema.json を読み込めません: ${err.message}`);
+      return null;
+    }
+  }
+  if (!vkTerminalsDir) return null;
+  return loadVkTerminalsSettingsSchema(vkTerminalsDir);
+}
+
+function buildVkTerminalsSettingsGroups(options = {}) {
+  const schema = resolveVkTerminalsSettingsSchemaForDescriptor(options);
+  if (!schema) {
+    console.warn('[Config] settings-schema.json が見つからない／読めないため、VK Terminals 本体設定は orchestrator 独自項目（port）のみ表示します。');
+    return [vkTerminalsPortOnlySettingsGroup()];
+  }
+
+  const hiddenKeys = new Set(options.hiddenKeys ?? VK_TERMINALS_SCHEMA_HIDDEN_KEYS);
+  const groups = [];
+  for (const group of schema.groups) {
+    const fields = group.fields
+      .filter((field) => !hiddenKeys.has(field.key))
+      .map((field) => ({ ...field }));
+    if (fields.length === 0) continue;
+    const label = schema.groups.length === 1
+      ? 'VK Terminals（本体設定）'
+      : `VK Terminals（本体設定）: ${group.label}`;
+    groups.push({
+      label,
+      tab: 'terminals',
+      note: VK_TERMINALS_SETTINGS_NOTE,
+      targetPath: VK_TERMINALS_CONFIG_TARGET_PATH,
+      fields,
+    });
+  }
+
+  if (groups.length > 0) {
+    groups[0] = {
+      ...groups[0],
+      fields: insertVkTerminalsPortField(groups[0].fields),
+    };
+  } else {
+    console.warn('[Config] settings-schema.json に表示可能なスキーマ項目が無いため、VK Terminals 本体設定は orchestrator 独自項目（port）のみ表示します。');
+    return [vkTerminalsPortOnlySettingsGroup()];
+  }
+  return groups;
+}
+
 /**
  * VK Terminals の設定パネル用「設定ディスクリプタ」を組み立てる。
  *
@@ -918,74 +1112,46 @@ export function writeVkAgentsSettings(cfg = {}, options = {}) {
  * ことで、GUI から config.json を直接手編集せずに済むようにする。
  *
  * @param {string} [targetPath] 編集対象の config.json パス（既定は解決済みパス）
+ * @param {{ vkTerminalsDir?: string, hiddenKeys?: string[] }} [options]
  * @returns {object} 設定ディスクリプタ
  */
-export function buildSettingsDescriptor(targetPath = resolveConfigPath()) {
+export function buildSettingsDescriptor(targetPath = resolveConfigPath(), options = {}) {
   return {
     title: 'VK Orchestrator 設定',
-    note: '保存後の反映タイミングは項目によって異なります（各グループの説明をご確認ください）。',
     targetPath,
     tabs: [
-      { id: 'orchestrator', label: 'Orchestrator' },
-      { id: 'terminals', label: 'Terminals' },
-      { id: 'agents', label: 'Agents' },
+      { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+      { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
+      { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
     ],
     groups: [
+      {
+        label: 'オーケストレーター',
+        tab: 'orchestrator',
+        fields: [
+          { key: 'queue.backend', label: 'タスクの保存先', type: 'select', default: 'local',
+            options: [
+              { value: 'local',  label: 'ローカル（既定）' },
+              { value: 'github', label: 'GitHub' },
+            ],
+            help: 'オーケストレーターが処理するタスクの保存先を選びます。\nローカル: ローカルの JSON（~/.task-queue/queue.json）でタスクを管理します（既定）。task-queue リポジトリは不要で、純ローカルタスクは `vk-orchestrator task` コマンドで登録します。\nGitHub: task-queue リポジトリに Issue を登録して管理します。この場合は、同じ Orchestrator タブ内・下方の「GitHub」グループの「タスク登録リポジトリ名」（および GitHub オーナー）が必要です。' },
+          { key: 'orchestrator.pollIntervalMs',  label: 'ポーリング間隔 (ms)',  type: 'number', help: '新しいタスクを確認する間隔をミリ秒で指定します（GitHub モードでは task-queue の Issue を、ローカルモードではローカルのタスクを確認します）。\n例: 60000 = 1 分' },
+          { key: 'orchestrator.watchdogIdleMs',  label: 'ウォッチドッグ idle (ms)', type: 'number', help: 'この時間ターミナルが無活動だと停滞とみなす閾値をミリ秒で指定します。\n例: 10800000 = 3 時間' },
+          { key: 'orchestrator.paneResumeMax',   label: 'ペイン消失時の自動再開上限 (回)', type: 'number', help: '作業ペイン消失時（PR 未生成に限る）に自動で再実行する上限回数。超えると failed になり手動確認が必要（既定: 3）' },
+          { key: 'task.commandTemplate', label: 'issue を処理する Claude のコマンドテンプレート', type: 'text', placeholder: '/vk-kore {issueUrl} wp-env-port={wpPort} headless=1', help: 'issue に対して仕様検討・実装・プルリク作成・レビューまで自動で処理してマージできる状態にする Claude のコマンドを指定してください。未指定の場合は、次の形式で投げられます。\n/vk-kore {issueUrl} wp-env-port={wpPort} headless=1\n{issueUrl} と {wpPort} は自動で置換します。\n独自のコマンドを使用する場合、オーケストレーターと円滑に連携するための決め事がいくつかあります。詳しくは docs/agent-rules.md をご確認ください。デフォルトの /vk-kore スキルは vendor/vk-agents-public/skills/vk-kore/ にありますので、必要に応じてそれを参考に独自のスキルをご利用の PC の .claude に作ってください。' },
+        ],
+      },
+      ...buildVkTerminalsSettingsGroups(options),
       {
         label: 'GitHub',
         tab: 'orchestrator',
         note: 'GitHub トークンは `gh auth login` で管理します（このパネルでの入力は廃止）。',
         fields: [
-          { key: 'github.owner',      label: 'タスク登録リポジトリのオーナー', type: 'text', help: 'task-queue の Issue を登録・管理するリポジトリのオーナー名（ユーザー名または組織名。例: vektor-inc）' },
-          { key: 'github.repo',       label: 'タスク登録リポジトリ名',       type: 'text', help: 'task-queue の Issue を登録・管理するリポジトリ名（例: task-queue）' },
-          { key: 'github.sourceOrg',  label: '作業対象リポジトリのオーナー（組織・省略可）', type: 'text', help: '作業対象リポジトリが属する組織名。この組織を横断検索して `task-queue` ラベル付き Issue を取り込む。未指定時はタスク登録リポジトリのオーナーと同じ組織を対象にする', emptyToNull: true },
+          { key: 'github.owner',      label: 'GitHub オーナー（ユーザー／組織）', type: 'text', help: '取り込み・タスク登録の基点となる GitHub のユーザー／組織名。両モード共通で、取り込み対象組織（下の「作業対象リポジトリのオーナー」が未指定のときの既定）として使われます。GitHub モードではタスク登録リポジトリ（task-queue）のオーナーも兼ねます。\n例: vektor-inc' },
+          { key: 'github.repo',       label: 'タスク登録リポジトリ名',       type: 'text', visibleWhen: { key: 'queue.backend', value: 'local', hide: true }, help: 'オーケストレーターが処理する Issue を登録・管理するリポジトリ名。GitHub モードでのみ使用します（ローカルモードでは非表示・不要）。\n例: task-queue' },
+          { key: 'github.sourceOrg',  label: '作業対象リポジトリのオーナー（組織・省略可）', type: 'text', help: '作業対象リポジトリが属する組織名。この組織を横断検索して `task-queue` ラベル付き Issue を取り込む。未指定時は GitHub オーナーと同じ組織を対象にする', emptyToNull: true },
           { key: 'github.queueLabel', label: '取り込みラベル名',           type: 'text', help: '作業対象リポジトリの Issue にこのラベルが付いていると、オーケストレーターのタスクとして取り込みます' },
-        ],
-      },
-      {
-        label: 'オーケストレーター',
-        tab: 'orchestrator',
-        fields: [
-          { key: 'orchestrator.pollIntervalMs',  label: 'ポーリング間隔 (ms)',  type: 'number', help: 'GitHub をポーリングして新しいタスクを確認する間隔（ミリ秒。例: 60000 = 1 分）' },
-          { key: 'orchestrator.watchdogIdleMs',  label: 'ウォッチドッグ idle (ms)', type: 'number', help: 'この時間ターミナルが無活動だと停滞とみなす閾値（ミリ秒。例: 10800000 = 3 時間）' },
-          { key: 'orchestrator.paneResumeMax',   label: 'ペイン消失時の自動再開上限 (回)', type: 'number', help: '作業ペイン消失時（PR 未生成に限る）に自動で再実行する上限回数。超えると failed になり手動確認が必要（既定: 3）' },
           { key: 'orchestrator.assigneeFilter',  label: '担当者フィルタ (login)', type: 'text', help: 'この GitHub ログイン名が assign されている Issue だけを取り込む。空＝一切取り込まない（安全側の既定）。全件取り込むには all と入力', emptyToNull: true },
-          { key: 'orchestrator.taskCwd',         label: 'タスク用ペインの Claude Code 起点ディレクトリ', type: 'text', help: 'タスク着手時に開くペインの Claude Code の起点ディレクトリを指定してください。自分のリポジトリ置き場を指定しておくと、探索・クローンがそこ基準で進みます。未設定の場合は専用ディレクトリ ~/vk-orchestrator-tasks（自動作成）で起動し、ホームディレクトリや機密ディレクトリを起点にしません。なお、ここで指定するのはあくまで起点で、操作権限があれば他のディレクトリのファイルも操作できます。別のディレクトリにある既存リポジトリを扱いたい場合も、スキルや Claude のグローバル設定であらかじめ対象リポジトリを指定しておけば、そちらで作業します。相対パスは orchestrator 起動時の作業ディレクトリ基準で解決します。', emptyToNull: true },
-        ],
-      },
-      {
-        label: 'VK Terminals（本体設定）',
-        tab: 'terminals',
-        note: 'VK Terminals 本体の設定ファイル（~/.vk-terminals/config.json）に直接保存され、VK Terminals が読み込みます。',
-        targetPath: '~/.vk-terminals/config.json',
-        fields: [
-          { key: 'apiHost',        label: 'API ホスト', type: 'text', help: 'VK Terminals の API サーバーが待ち受けるホスト（既定: 127.0.0.1）' },
-          { key: 'port',           label: 'API ポート', type: 'number', help: `VK Terminals 本体の API サーバーが待ち受けるポート番号（既定: ${DEFAULT_VK_TERMINALS_PORT}）` },
-          { key: 'initialCommand', label: '初期コマンド', type: 'text', help: '各ペイン起動時に自動実行するコマンド' },
-          { key: 'additionalPanes', label: '追加ペイン (JSON 配列)', type: 'json', help: '起動時に追加で開くペインの定義（JSON 配列。例: [{"cwd":"/path"}]）' },
-          { key: 'newPaneAutoLaunchClaude', label: 'Claude Code を自動的に起動する', type: 'boolean', default: false, help: 'チェックが入っている場合、新規ペインを開いた時に自動的に Claude Code が起動します。オフの場合は素のターミナルで起動します。' },
-          { key: 'newPaneStartupDir', label: '新規ペインを開く時の初期ディレクトリ', type: 'text', placeholder: '/path/to/project', help: '新規ペインを開く時の作業ディレクトリを絶対パスで指定します。「Claude Code を自動的に起動する」が有効な場合は Claude もこのディレクトリで起動します。未入力の場合、または存在しないパスの場合はホームディレクトリで起動します。' },
-        ],
-      },
-      {
-        label: 'VK Terminals 起動オプション（オーケストレーター制御）',
-        tab: 'terminals',
-        note: 'orchestrator が VK Terminals を起動する際の制御値です。変更は次回の VK Terminals 起動時に反映されます。API ホストと API ポートは「VK Terminals（本体設定）」で設定してください。',
-        fields: [
-          { key: 'vkTerminals.gpu',             label: 'GPU モード',          type: 'select',
-            options: [
-              { value: '',         label: '自動（推奨・macOS は通常起動 / その他は off）' },
-              { value: 'off',      label: 'off（GPU 無効・エラーログ抑制）' },
-              { value: 'default',  label: 'default（Chromium 任せ）' },
-            ],
-            help: 'orchestrator が VK Terminals を起動する際の GUI(Electron) GPU 利用モード。空=自動（macOS は通常起動 / その他は off）、off=GPU 無効でエラーログ抑制、default=Chromium 任せ' },
-        ],
-      },
-      {
-        label: 'issue を処理する Claude のコマンド',
-        tab: 'orchestrator',
-        fields: [
-          { key: 'task.commandTemplate', label: 'コマンドテンプレート', type: 'text', placeholder: '/vk-kore {issueUrl} wp-env-port={wpPort} headless=1', help: 'issue に対して仕様検討・実装・プルリク作成・レビューまで自動で処理してマージできる状態にする Claude のコマンドを指定してください。未指定の場合は /vk-kore {issueUrl} wp-env-port={wpPort} headless=1 のような形式で投げられます。{issueUrl} と {wpPort} は自動で置換します。独自のコマンドを使用する場合、オーケストレーターと円滑に連携するための決め事がいくつかあります。詳しくは docs/agent-rules.md をご確認ください。デフォルトの /vk-kore スキルは vendor/vk-agents-public/skills/vk-kore/ にありますので、必要に応じてそれを参考に独自のスキルをご利用の PC の .claude に作ってください。' },
         ],
       },
       {
@@ -994,23 +1160,29 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath()) {
         note: 'エージェント共通設定は vk-agents の config に保存され、各スキル／エージェントが読み込みます。',
         targetPath: resolveVkAgentsCanonicalConfigPath(),
         fields: [
-          { key: 'workspace.search_paths', label: '作業ディレクトリ（複数指定可・優先順）', type: 'lines', placeholder: '/Users/you/Documents/git\n/Users/you/ghq', help: 'エージェント（vk-kore 等）が作業対象リポジトリのローカルクローンを探す起点ディレクトリを、1 行に 1 つ・絶対パスで指定します（上の行ほど優先）。上から順に走査し、origin が対象リポジトリと一致する既存クローンを最大 4 階層まで自動検出して使います。どのパスにも見つからない場合は 1 行目のディレクトリへクローンします。未設定の場合はクローンの場所を都度確認します。' },
-          { key: 'org.review_assets_repo', label: 'レビュー用アセットリポジトリ', type: 'text', placeholder: 'owner/repo', pattern: OWNER_REPO_PATTERN, invalidMessage: 'owner/repo の形式で入力してください（例: vektor-inc/task-queue）', help: 'PR・テスト報告用の画像/GIF を保存するリポジトリを <owner>/<repo> 形式で指定します（例: vektor-inc/review-assets）。形式が正しくない値は反映されません。空欄時は画像アップロードをスキップし、テキスト記述にフォールバックします', emptyToNull: true },
-          { key: 'org.orchestrator_repo', label: '連携ルール取得先リポジトリ', type: 'text', placeholder: 'owner/repo', pattern: OWNER_REPO_PATTERN, invalidMessage: 'owner/repo の形式で入力してください（例: vektor-inc/task-queue）', help: 'vk-kore が task-queue 連携ルール（docs/agent-rules.md）を取得するリポジトリを <owner>/<repo> 形式で指定します（例: vektor-inc/vk-orchestrator）。形式が正しくない値は反映されません。空欄時は vektor-inc/vk-orchestrator にフォールバックします', emptyToNull: true },
+          { key: 'workspace.search_paths', label: '作業ディレクトリ（複数指定可・優先順）', type: 'lines', placeholder: '/Users/you/Documents/git\n/Users/you/ghq', help: '作業対象リポジトリのローカルクローンを探す起点ディレクトリを、1 行に 1 つ・絶対パスで指定します（上の行ほど優先）。\nこの設定は次の 2 つの場面で使われます。\n(1) issue を処理するスキルがクローンを探すとき\n(2) オーケストレーターがタスク着手時にタスクペインを開く場所を決めるとき\n上から順に走査し、origin が対象リポジトリと一致する既存クローンを最大 4 階層まで自動検出して、そのディレクトリでスキルの作業とペインを開始します。見つからない場合、スキルは 1 行目のディレクトリへクローンします。\nオーケストレーターのペインは、対象リポジトリを特定できないとき・この設定が未設定のとき・検出できないときは、専用ディレクトリ ~/vk-orchestrator-tasks（自動作成。ホームディレクトリや機密ディレクトリは起点にしません）で開きます。' },
+          { key: 'org.review_assets_repo', label: 'レビュー用アセットリポジトリ', type: 'text', placeholder: 'owner/repo', pattern: OWNER_REPO_PATTERN, invalidMessage: 'owner/repo の形式で入力してください（例: vektor-inc/task-queue）', help: 'PR・テスト報告用の画像/GIF を保存するリポジトリを <owner>/<repo> 形式で指定します。\n例: vektor-inc/review-assets\n形式が正しくない値は反映されません。空欄時は画像アップロードをスキップし、テキスト記述にフォールバックします', emptyToNull: true },
           { key: 'staff_wp_dev.engine', label: 'staff-wp-dev（和田）の実行エンジン', type: 'select',
             options: [
-              { value: '',       label: '未設定（既定: claude）' },
-              { value: 'claude', label: 'claude' },
-              { value: 'codex',  label: 'codex（単独作業のみ・push/PR は司が担当）' },
+              { value: '',       label: '未設定（既定: Claude）' },
+              { value: 'claude', label: 'Claude' },
+              { value: 'codex',  label: 'Codex（単独作業のみ・push/PR は司が担当）' },
             ],
-            help: 'staff-wp-dev（和田）を起動するときの実行エンジン。未設定時は claude にフォールバックします' },
+            help: 'staff-wp-dev（和田）を起動するときの実行エンジン。未設定時は Claude にフォールバックします' },
+          { key: 'staff_review.engine', label: 'staff-review（麗美）の実行エンジン', type: 'select',
+            options: [
+              { value: '',       label: '未設定（既定: Claude）' },
+              { value: 'claude', label: 'Claude' },
+              { value: 'codex',  label: 'Codex（テスト実行のみ・PR コメント/差し戻しは司が担当）' },
+            ],
+            help: 'staff-review（麗美）を起動するときの実行エンジン。未設定時は Claude にフォールバックします' },
           { key: 'multi_repo_task.default_engine', label: 'vk-multi-repo-task の既定実行エンジン', type: 'select',
             options: [
-              { value: '',       label: '未設定（既定: claude）' },
-              { value: 'claude', label: 'claude' },
-              { value: 'codex',  label: 'codex' },
+              { value: '',       label: '未設定（既定: Claude）' },
+              { value: 'claude', label: 'Claude' },
+              { value: 'codex',  label: 'Codex' },
             ],
-            help: 'マルチリポジトリタスク（vk-multi-repo-task）を新規作成するときの既定エンジン。未設定時は claude にフォールバックします' },
+            help: 'マルチリポジトリタスク（vk-multi-repo-task）を新規作成するときの既定エンジン。未設定時は Claude にフォールバックします' },
           { key: 'features.coderabbit', label: 'CodeRabbit 監視を有効化', type: 'boolean', default: true, help: 'OFF で PR 後の CodeRabbit 監視をスキップし、/code-review 等での確認を案内します。社外・個人リポジトリなど CodeRabbit 未導入の環境では OFF 推奨です' },
           { key: 'features.coderabbit_ignore', label: 'CodeRabbit レビューをスキップ（PR 本文に @coderabbitai ignore を記載）', type: 'boolean', default: false, help: 'ON で /vk-pr が PR 本文に @coderabbitai ignore を記載し、CodeRabbit レビューを抑止します。features.coderabbit が OFF のときは監視自体がスキップされるため、この設定は効果がありません' },
         ],
@@ -1028,7 +1200,7 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath()) {
  */
 export function writeSettingsDescriptor(vkDir = resolveVkTerminalsDir(), targetPath = resolveConfigPath()) {
   const descPath = join(vkDir, 'settings-descriptor.json');
-  writeFileSync(descPath, JSON.stringify(buildSettingsDescriptor(targetPath), null, 2) + '\n');
+  writeFileSync(descPath, JSON.stringify(buildSettingsDescriptor(targetPath, { vkTerminalsDir: vkDir }), null, 2) + '\n');
   return descPath;
 }
 
@@ -1072,26 +1244,58 @@ export function getTaskConfig(cfg = loadUnifiedConfig()) {
 }
 
 /**
+ * queue backend を解決する。
+ * 優先順位: 環境変数 QUEUE_BACKEND > config.json(cfg.queue.backend) > DEFAULT_QUEUE.backend。
+ * 未知の値は安全側で既定（ローカル）backend にフォールバックする。
+ * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @returns {'github'|'local'}
+ */
+export function getQueueBackend(cfg = loadUnifiedConfig()) {
+  const rawValue =
+    process.env.QUEUE_BACKEND !== undefined && process.env.QUEUE_BACKEND !== ''
+      ? process.env.QUEUE_BACKEND
+      : (pruneEmpty(cfg?.queue)?.backend ?? DEFAULT_QUEUE.backend);
+  const backend = String(rawValue ?? '').trim().toLowerCase();
+  if (backend === 'github' || backend === 'local') return backend;
+
+  if (!warnedUnknownQueueBackend) {
+    warnedUnknownQueueBackend = true;
+    console.warn(`[Config] 未知の queue.backend "${backend}" は無視し、既定 "local" を使用します（有効値: github / local）。`);
+  }
+  return DEFAULT_QUEUE.backend;
+}
+
+/**
+ * CodeRabbit 監視が有効かどうかを解決する（automerge の CodeRabbit 静観ゲートの要否判定に使う）。
+ * features.coderabbit は既定 true。明示的に false（真偽値 / 文字列 "false"）のときだけ無効扱いにする。
+ * 未設定・不正値は安全側で有効（true）とみなす。
+ * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @returns {boolean}
+ */
+export function isCoderabbitEnabled(cfg = loadUnifiedConfig()) {
+  if (!hasOwnPath(cfg, 'features.coderabbit')) return true;
+  const raw = getByPath(cfg, 'features.coderabbit');
+  return !(raw === false || raw === 'false');
+}
+
+/**
  * タスク用ペイン（Claude Code）の起点ディレクトリを返す。
- * 優先順位: 環境変数 TASK_CWD > config.json(cfg.orchestrator.taskCwd) > 専用ディレクトリ。
+ * 優先順位: 環境変数 TASK_CWD > 専用ディレクトリ。
  * 未設定時は `~/vk-orchestrator-tasks` を使う。これは $HOME 直下や特定リポジトリ、
  * config.json / .env 等の機密ディレクトリを起点にせず、空・非 git の専用ディレクトリから
  * タスクを始めるための安全側の既定。ただし cwd は隔離ではなく、絶対パス指定での
  * ファイル読み取りを防ぐものではない。
- * env / config の明示値は前後空白を除去し、空文字なら未指定として次の優先順位へ
+ * env の明示値は前後空白を除去し、空文字なら未指定として専用ディレクトリへ
  * フォールバックする。相対パスが指定された場合は process.cwd() 基準で resolve() される。
  * 既定ディレクトリは VK Terminals 側フォールバックで $HOME 起点にならないよう自動作成する。
  * 一方、明示値は typo を隠さないため自動作成せず、存在しない場合は警告だけ出して返す。
- * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @param {object} [_cfg] 旧 API 互換の未使用引数。orchestrator.taskCwd は廃止済み。
  * @param {string} [homeDir] 既定ディレクトリの親となるホームディレクトリ
  * @returns {string}
  */
-export function getTaskCwd(cfg = loadUnifiedConfig(), homeDir = homedir()) {
+export function getTaskCwd(_cfg = {}, homeDir = homedir()) {
   const envValue = String(process.env.TASK_CWD ?? '').trim();
   if (envValue !== '') return resolveExplicitTaskCwd(envValue);
-
-  const configValue = String(cfg?.orchestrator?.taskCwd ?? '').trim();
-  if (configValue !== '') return resolveExplicitTaskCwd(configValue);
 
   const defaultDir = join(homeDir, 'vk-orchestrator-tasks');
   try {
@@ -1103,12 +1307,13 @@ export function getTaskCwd(cfg = loadUnifiedConfig(), homeDir = homedir()) {
 }
 
 const warnedMissingTaskCwds = new Set();
+let warnedUnknownQueueBackend = false;
 
 function resolveExplicitTaskCwd(rawValue) {
   const taskCwd = resolve(rawValue);
   if (!existsSync(taskCwd) && !warnedMissingTaskCwds.has(taskCwd)) {
     warnedMissingTaskCwds.add(taskCwd);
-    console.warn(`[Config] 指定された taskCwd が存在しません。存在しないと VK Terminals 側フォールバックで $HOME 起点になる恐れがあります: ${taskCwd}`);
+    console.warn(`[Config] 指定された TASK_CWD が存在しません。存在しないと VK Terminals 側フォールバックで $HOME 起点になる恐れがあります: ${taskCwd}`);
   }
   return taskCwd;
 }
@@ -1202,6 +1407,7 @@ export function loadConfig(argv = process.argv, options = {}) {
     pollInterval:   Number(process.env.POLL_INTERVAL_MS ?? 60_000),
     watchdogIdle:   Number(process.env.WATCHDOG_IDLE_MS ?? 3 * 60 * 60 * 1000),
     assigneeFilter: readArg('assignee') ?? process.env.ASSIGNEE_FILTER ?? null,
+    queueBackend:   getQueueBackend(),
   };
   if (!cfg.githubToken) {
     throw new Error(`[Config] ${GITHUB_TOKEN_RESOLUTION_HELP}`);

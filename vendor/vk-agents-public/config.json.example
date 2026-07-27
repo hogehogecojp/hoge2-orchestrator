@@ -5,14 +5,24 @@
   "staff_wp_dev": {
     "engine": "claude"
   },
+  "staff_review": {
+    "engine": "claude"
+  },
   "features": {
     "coderabbit": true,
+    "coderabbit_ignore": false,
     "task_queue": true
   },
   "skills": {
     "disabled": []
   },
   "org": {
-    "allowed_owners": ["vektor-inc"]
+    "allowed_owners": ["vektor-inc"],
+    "review_assets_repo": "vektor-inc/review-assets"
+  },
+  "workspace": {
+    "search_paths": [
+      "~/Documents/git"
+    ]
   }
 }

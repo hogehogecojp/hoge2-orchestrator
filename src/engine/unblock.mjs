@@ -1,3 +1,14 @@
+/**
+ * unblock.mjs
+ *
+ * タスク登録リポジトリ（task-queue）で status:waiting-input のまま止まっている Issue を
+ * status:ready に戻し、再度取り込み対象にする。
+ *
+ * ※ この補助スクリプトは GitHub モード（queue.backend = github）専用です。
+ *   ローカルモード（queue.backend = local）では `vk-orchestrator task set-status <id> ready`
+ *   を使ってください（親 #156 決定事項 7・MVP では未対応）。
+ */
+
 import { config } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';

@@ -1,5 +1,5 @@
 import { Octokit } from '@octokit/rest';
-import { getLabelsConfig } from '../config.js';
+import { DEFAULT_LABELS, getLabelsConfig } from '../config.js';
 
 // エージェントレビュー完了マーカーのラベル名 / SHA コメント接頭辞。
 // automerge を使うタスクコマンドがレビュー完了時に付ける公開規約として固定し、
@@ -85,12 +85,40 @@ export class GitHubClient {
       this.pickupEnabled = true;
       this.assignee = normalizedAssignee;
     }
+    // capability 宣言（#138 方針5 / #157）: GitHubClient はトークン前提で構築されるため
+    // 常に GitHub 連携を有効と宣言する。エンジンはこのフラグを見て GitHub 依存処理の
+    // 早期 return を判断する。
+    this.capabilities = { githubIntegration: true };
   }
 
   // listForRepo に渡す assignee フィルタ条件（フィルタなしなら空オブジェクト）。
   // 各 fetch* メソッドの検索条件にスプレッドして使う。
   assigneeQuery() {
     return this.assignee ? { assignee: this.assignee } : {};
+  }
+
+  // キュー（タスク登録リポジトリ）上の全 open issue を一覧取得する。
+  // tasks-view.json スナップショット生成用のインターフェースメソッド。
+  // 一覧はメンバー横断で全タスクを表示するため assignee フィルタは掛けない。
+  // octokit.paginate があれば全ページ取得、無ければ（テストの簡易 octokit モック等）
+  // 単発 listForRepo にフォールバックする。
+  // 後続の LocalQueueClient も同じシグネチャ（引数なし・open issue 配列を返す）で実装する。
+  async listAllQueueIssues() {
+    const params = {
+      owner: this.owner,
+      repo: this.repo,
+      state: 'open',
+      sort: 'updated',
+      direction: 'desc',
+      per_page: 100,
+    };
+
+    if (typeof this.octokit?.paginate === 'function') {
+      return this.octokit.paginate(this.octokit.issues.listForRepo, params);
+    }
+
+    const { data } = await this.octokit.issues.listForRepo(params);
+    return data;
   }
 
   // 途中で止まったissue（in-progress / waiting-input）を取得
@@ -252,6 +280,95 @@ export class GitHubClient {
         }
       }
     }
+  }
+
+  // issue の優先度ラベルを更新する。
+  // status / sequential など priority:* 以外のラベルは維持し、priority ファミリーだけを差し替える。
+  // newPriority は high / medium / low / none を受け付け、none は priority:* を外すだけにする。
+  async setPriority(issueNumber, newPriority) {
+    const labelsConfig = getLabelsConfig();
+    const priorityLabels = labelsConfig.priority ?? {};
+    const nextLabel = newPriority === 'none' ? null : priorityLabels[newPriority];
+    if (newPriority !== 'none' && !nextLabel) {
+      throw new Error(`不明な優先度です: ${newPriority}`);
+    }
+
+    const { data: issue } = await this.octokit.issues.get({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+    });
+
+    const currentLabels = issue.labels.map(l => l.name);
+    const otherLabels = currentLabels.filter(name => !name.startsWith('priority:'));
+    const labels = nextLabel ? [...otherLabels, nextLabel] : otherLabels;
+
+    await this.octokit.issues.setLabels({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+      labels,
+    });
+
+    console.log(`  [GitHub] issue #${issueNumber} priority → ${newPriority}`);
+  }
+
+  // issue の直列実行ラベルを更新する。
+  // sequential 以外のラベルは維持し、parallel の場合も parallel ラベルは付けない。
+  async setSequential(issueNumber, mode) {
+    const labelsConfig = getLabelsConfig();
+    const sequentialLabel = labelsConfig.sequential ?? 'sequential';
+    if (mode !== 'sequential' && mode !== 'parallel') {
+      throw new Error(`不明な実行方式です: ${mode}`);
+    }
+
+    const { data: issue } = await this.octokit.issues.get({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+    });
+
+    const currentLabels = issue.labels.map(l => l.name);
+    const otherLabels = currentLabels.filter(name => name !== sequentialLabel);
+    const labels = mode === 'sequential' ? [...otherLabels, sequentialLabel] : otherLabels;
+
+    await this.octokit.issues.setLabels({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+      labels,
+    });
+
+    console.log(`  [GitHub] issue #${issueNumber} execution → ${mode}`);
+  }
+
+  // issue の自動マージラベルを更新する。
+  // automerge 以外のラベルは維持し、manual の場合は automerge ラベルを外すだけにする。
+  async setAutomerge(issueNumber, mode) {
+    const labelsConfig = getLabelsConfig();
+    const automergeLabel = labelsConfig.automerge ?? DEFAULT_LABELS.automerge;
+    if (mode !== 'automerge' && mode !== 'manual') {
+      throw new Error(`不明な自動マージ指定です: ${mode}`);
+    }
+
+    const { data: issue } = await this.octokit.issues.get({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+    });
+
+    const currentLabels = issue.labels.map(l => l.name);
+    const otherLabels = currentLabels.filter(name => name !== automergeLabel);
+    const labels = mode === 'automerge' ? [...otherLabels, automergeLabel] : otherLabels;
+
+    await this.octokit.issues.setLabels({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+      labels,
+    });
+
+    console.log(`  [GitHub] issue #${issueNumber} automerge → ${mode}`);
   }
 
   // 作業対象リポジトリの Issue の repository_url（"https://api.github.com/repos/{owner}/{repo}" 形式）から
@@ -641,7 +758,7 @@ export class GitHubClient {
   // リトライしても結果が変わらないため即時 throw する。
   // 429 Too Many Requests のみ 4xx でもリトライ対象として残す（レート制限の回復を待つため）。
   //
-  // 戻り値には state / closedAt に加え、title / htmlUrl も含める。
+  // 戻り値には state / closedAt に加え、title / htmlUrl / body / labels も含める。
   // ペインヘッダーに元の作業対象 issue のタイトル・リンクを表示する用途で使う
   // （既存呼び出し側は .state / .closedAt しか参照していないため後方互換）。
   //
@@ -651,7 +768,7 @@ export class GitHubClient {
   //
   // @param {object} [opts]
   // @param {number[]} [opts.retryDelays=[1000,3000,9000]]  リトライ間隔（空配列でリトライなし）
-  // @returns {Promise<{state:string, closedAt:string|null, title:string, htmlUrl:string}>}
+  // @returns {Promise<{state:string, closedAt:string|null, title:string, htmlUrl:string, body:string|null, labels:Array}>}
   async getIssueState(owner, repo, issueNumber, { retryDelays = [1000, 3000, 9000] } = {}) {
     const delays = retryDelays;
     let lastErr;
@@ -665,6 +782,8 @@ export class GitHubClient {
           closedAt: data.closed_at,
           title: data.title,
           htmlUrl: data.html_url,
+          body: data.body,
+          labels: data.labels ?? [],
         };
       } catch (err) {
         lastErr = err;
@@ -956,7 +1075,9 @@ export class GitHubClient {
 
   // issue オブジェクトから automerge ラベルが付いているかを判定する。
   hasAutomergeLabel(issue) {
-    return (issue.labels ?? []).some(l => (typeof l === 'string' ? l : l.name) === 'automerge');
+    const labelsConfig = getLabelsConfig();
+    const automergeLabel = labelsConfig.automerge ?? DEFAULT_LABELS.automerge;
+    return (issue.labels ?? []).some(l => (typeof l === 'string' ? l : l.name) === automergeLabel);
   }
 
   // -------------------------------------------------------

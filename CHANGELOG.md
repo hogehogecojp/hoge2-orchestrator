@@ -1,10 +1,93 @@
 # Changelog
 
+- [ 機能追加 ] 実行面として tmux を選べる tmux モードを追加（`terminals.mode=tmux`。Electron/GUI 不要でコンテナ環境でも動作し、各タスクを tmux ペインに並べて表示）
+
+= 0.23.2 =
+
+- [ 仕様変更 ] vk-terminals を 1.44.0 から 1.46.0 にアップデート
+- [ 不具合修正 ] automerge ラベルを PR 作成後に付与すると waiting-input で滞留した issue がマージ判定に乗らず永久に自動マージされない不具合を修正
+- [ 不具合修正 ] automerge ラベル付きで waiting-input に滞留した issue の PR を GitHub UI 等で外部から手動マージしても close されず waiting-input のまま残る不具合を修正
+- [ 不具合修正 ] ペインの入力欄に残留文字があるとタスク本文がその後ろに連結され、スラッシュコマンドが発火せずタスクが起動しない不具合を修正
+- [ 不具合修正 ] Draft PR やレビュー完了マーカー未付与の automerge タスクでも CI 通過直後にマージ待ちへ遷移し、作業が完了していないのにタスクカードが「マージ待ち」表示になる不具合を修正
+
+= 0.23.1 =
+
+- [ 開発環境 ] リリースタグ push をトリガーに、解凍して npm start で動く zip を生成し vk-blocks-pro と同じ VWS サーバーへ自動デプロイするワークフローを新設
+
+= 0.23.0 =
+
+- [ 機能追加 ] タスク編集フォームに自動マージ（する／しない）の選択コントロールを追加し、GitHub モードでは対象 issue の automerge ラベル、ローカルモードではローカルタスク値へ反映
+- [ 仕様変更 ] vk-terminals を 1.43.0 から 1.44.0 にアップデート
+- [ 不具合修正 ] automerge ラベル判定が設定でのラベル名変更を反映せず綴り直書きになっていた不整合を解消
+
+= 0.22.1 =
+
+- [ 仕様変更 ] vk-terminals を 1.40.0 から 1.43.0 にアップデート
+- [ 開発環境 ] リリース時に同梱 vk-terminals / vk-agents を最新へそろえる release スキルと preflight スクリプトを新設
+
+= 0.22.0 =
+
+- [ 機能追加 ] タスク一覧ウィジェット宣言の各タスクに対象 issue の URL を rel:"target" リンクとして出力（ローカルモードでのタイトルリンク先に利用可能）
+- [ 仕様変更 ] CodeRabbit 監視が無効（features.coderabbit=false）なリポジトリで automerge の CodeRabbit 静観 30 分待機を撤廃し、CI 全通過・mergeable・レビューマーカーが揃った時点で即時マージするよう変更
+
+= 0.21.0 =
+
+- [ 機能追加 ] 設定画面に staff-review（麗美）の実行エンジン（Claude / Codex）を選択するドロップダウンを追加
+- [ 機能追加 ] `queue.backend=local` で GitHub issue に紐づかない純ローカルタスクを登録・一覧・ステータス変更できる CLI を追加
+- [ 機能追加 ] タスクキューの保存先を `queue.backend=local` でローカル JSON（`~/.task-queue/queue.json`）へ切り替えられる中核機能を追加
+- [ 機能追加 ] 設定画面の「オーケストレーター」グループにキューの保存先（ローカル / GitHub）を切り替えるプルダウンを追加（既定はローカル）。ローカル選択時はタスク登録リポジトリ名の入力欄を非表示に
+- [ 機能追加 ] ローカルモードで `GITHUB_TOKEN` 未解決でも純ローカルタスク専用で起動できるように対応（source import・PR 監視・automerge・対象 issue 操作は無効化しログに明示）
+- [ 機能追加 ] tasks-view.json のトップレベルに自分の GitHub ログイン名（viewer）を書き出すよう対応（担当者フィルタの「自分のみ」既定判定に利用）
+- [ 機能追加 ] タスク一覧の表示定義（語彙・色・遷移・操作）を orchestrator に一元化し、宣言的ウィジェット（tasks-widget.json）として書き出して VK Terminals 設定へパスを注入（旧 tasks-view.json とは当面併存）
+- [ 機能追加 ] 初回セットアップスキル `/vk-orchestrator-setup` と、モード（queue.backend）別に必須項目を計算する充足判定 `doctor` コマンドを新設し、`up` の未セットアップ案内を doctor ベースに一般化
+- [ 機能追加 ] サイドバーのタスク編集で複数項目（ステータス／優先度／実行方式）を 1 回でまとめて確定し、1 つでも現在値と食い違えば全て破棄する一括確定コマンド（apply-batch）を新設
+- [ 仕様変更 ] 設定画面 Orchestrator タブを「オーケストレーター」→「GitHub」の 2 グループ構成に整理し、「issue を処理する Claude のコマンド」を独立グループから「オーケストレーター」グループの末尾へ統合
+- [ 仕様変更 ] 設定画面で担当者フィルタ（担当者ログイン）を「オーケストレーター」セクションから「GitHub」セクションへ移動
+- [ 仕様変更 ] 設定画面（Orchestrator・VK Agents タブ）の説明文言で地の文に流し込んでいた箇条書き・例を改行して読みやすく整形
+- [ 仕様変更 ] 設定画面「タスク登録リポジトリ名」の説明文を task-queue 依存の表現からオーケストレーター基準の表現に修正
+- [ 仕様変更 ] 設定ディスクリプタの保存後反映タイミング案内をタブごとの note として出力し、誤解を招く全体 note を撤去
+- [ 仕様変更 ] VK Terminals サイドバーの「VK Orchestrator」セクションから task-queue 項目を削除（導線はタスク一覧見出しのリンクへ一本化）
+- [ 仕様変更 ] vk-terminals を 1.38.0 から 1.40.0 にアップデート（タスク一覧の宣言的ウィジェット描画・設定パネルのタブ別 note・サイドバー／モバイルのステータス表示や PR バッジの共通化などに対応）
+- [ 不具合修正 ] コールドスタート時に起動バナーがタスク本文を飲み込み、ラベルだけ in-progress・ペインが空プロンプトのまま放置される不具合を修正（readiness 待ちと本文再送を強化し、本文未達時は status:ready へ戻して自動再ディスパッチ。`CLAUDE_READY_TIMEOUT_MS` / `CLAUDE_SUBMIT_DELAY_MS` / `CLAUDE_SUBMIT_MAX_RETRIES` で調整可）
+- [ 不具合修正 ] 自前 PR を持たない親調整 issue が全 sub-issue 完了後も in-progress のまま残る不具合を修正
+- [ 不具合修正 ] GitHub API 障害（5xx）で status:in-progress への遷移に失敗した ready タスクが、poll のたびに新規ペインを量産する不具合を修正
+- [ 不具合修正 ] VK Terminals のタスクパネル保存後に tasks-view snapshot が即時更新されず反映待ちがタイムアウトする不具合を修正
+- [ 不具合修正 ] 同一マシンを非ループバックの IP（Tailscale 等でのリモート／モバイル公開）でバインドしている場合に、タスクペインが対象リポジトリのローカルクローンで開かず ~/vk-orchestrator-tasks にフォールバックする不具合を修正
+- [ その他 ] 設定パネルのエンジン選択ドロップダウンの表示ラベルを Codex / Claude 表記に統一
+- [ その他 ] タスク一覧 snapshot 生成のタスクキュー全件取得を GitHubClient のインターフェースメソッド（listAllQueueIssues）経由に整理し、キュークライアントの契約テスト雛形を追加
+
+= 0.20.0 =
+
+- [ 機能追加 ] タスク一覧 snapshot に優先度・直列実行情報を追加し、VK Terminals からの優先度変更・直列/並列切り替え・承認待ち差し戻し依頼に対応
+- [ 仕様変更 ] vk-terminals を 1.29.0 から 1.31.0 にアップデート（タスク一覧に優先度・直列/並列の表示と編集 UI・差し戻し操作を追加・見出しクリックでの折り畳みに対応・タスク操作の反映待ち表示を反映確認まで維持するように変更）
+
+= 0.19.0 =
+
+- [ 機能追加 ] tick ごとに task-queue の全タスク表示用 snapshot（`~/.task-queue/tasks-view.json`）を書き出し、`up` 起動時に VK Terminals 設定へパスを注入
+- [ 機能追加 ] VK Terminals からのステータス変更依頼を `commands.jsonl` で受け付け、CAS と許可遷移チェックを通して GitHub ラベルへ適用
+- [ 仕様変更 ] vk-terminals を 1.25.0 から 1.29.0 にアップデート（設定スキーマ `settings-schema.json` の同梱・設定画面の説明文拡充・入力待ち除外 cwd 設定を config 直編集専用に変更・起動時初回ペインの初期ディレクトリ不具合修正・サイドバー／モバイルのタスク一覧とステータス変更依頼 UI を追加）
+- [ 仕様変更 ] 設定パネルの VK Terminals 本体設定を vk-terminals 同梱の設定スキーマから読み込む方式に変更し、本体との説明文ズレや項目漏れを解消
+- [ 仕様変更 ] VK Terminals の GPU 起動モード設定を本体 config の `gpu` に一本化し、オーケストレーター側の起動オプション設定欄を撤去
+- [ 仕様変更 ] タスクペインの起点ディレクトリを issue 対象リポジトリのローカルクローン（workspace.search_paths から自動検出）に変更し、orchestrator.taskCwd 設定を廃止（未検出時は従来どおり ~/vk-orchestrator-tasks で起動）
+- [ 不具合修正 ] エージェントが手動マージ後にメタ issue を先にクローズすると、ペインの PR ラベルがマージ済み表示に切り替わらず state.json のエントリも消し込まれない不具合を修正
+- [ その他 ] 旧 orchestrator config の `vkTerminals.port` を VK Terminals 本体 config へ初回移行する過渡的な後方互換処理を撤去 (#104)
+- [ その他 ] 同梱 vk-agents-public ドキュメントの Codex 表記を統一
+
+= 0.18.0 =
+
+- [ 仕様変更 ] vk-terminals を 1.24.0 から 1.25.0 にアップデート（ペインの cwd パターン指定でローカル入力待ち判定から除外・実行中／入力待ちペインの誤クローズ防止の確認ダイアログ confirmClose を追加）
+- [ 仕様変更 ] 設定パネルの Agents タブ名を「VK Agents」に変更し、設定項目の説明文言を調整
+- [ 不具合修正 ] GitHub API エラー時にレスポンス本文や認証ヘッダが端末ログへ大量出力され、秘匿情報露出や入力待ち誤判定を引き起こす不具合を修正
+- [ 開発環境 ] 設定項目の説明文言変更（claude → Claude）に追随していなかった設定 descriptor のユニットテスト期待値を修正
+
+= 0.17.0 =
+
 - [ 機能追加 ] 設定パネルの Agents タブに、エージェントの作業ディレクトリ（複数指定・優先順）を設定する欄を追加
-- [ 仕様変更 ] vk-terminals を 1.22.0 から 1.23.0 にアップデート（設定 descriptor の配列入力型 lines に対応）
+- [ 仕様変更 ] vk-terminals を 1.22.0 から 1.24.0 にアップデート（設定 descriptor の配列入力型 lines に対応・モバイル版ターミナル下部の未使用クイック入力コントロールを削除）
+- [ 仕様変更 ] `org.orchestrator_repo` 設定を撤去し、連携ルールのパスを handoff file（`~/.vk-agents/runtime/orchestrator-rules.path`）で agent へ渡す方式に変更
+- [ 不具合修正 ] メタ issue の PR マージ完了コメントの文言が投稿経路で食い違い、完了コメントが二重投稿される不具合を修正
 
 = 0.16.0 =
-- [ 機能追加 ] 実行面として tmux を選べる tmux モードを追加（`terminals.mode=tmux`。Electron/GUI 不要でコンテナ環境でも動作し、各タスクを tmux ペインに並べて表示）
 - [ 機能追加 ] done-gate を sub-issue 対応にし、親 issue の全 sub-issue が closed になるまでメタ issue を done 化しないことで、複数 PR にまたがるタスクで一部マージ時に起きる早期完了・孤児化を防止
 - [ 機能追加 ] up 起動時に作成する orchestrator 用ペインを閉じる保護（ロック）で保護し、誤ってペインを閉じて本体プロセスが停止する事故を防止
 - [ 仕様変更 ] vk-terminals を 1.18.1 から 1.22.0 にアップデート（設定パネルのタブ UI 対応・API 待受ポートを本体 config から設定可能に・ペインの閉じる保護 API 対応・`/api/health` に起動インスタンス識別子 `instanceId` を追加）

@@ -3,3 +3,7 @@ node_modules
 config.json
 vendor/vk-agents-public/config.json
 *.log
+
+# Claude Code のローカル設定・worktree はコミットしない（.claude/skills/ はコミット対象）
+.claude/settings.local.json
+.claude/worktrees/

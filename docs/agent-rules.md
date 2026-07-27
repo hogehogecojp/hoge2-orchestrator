@@ -4,10 +4,12 @@ VK Orchestrator（オーケストレーター）経由で実行されるタス�
 
 オーケストレーターの動作仕様は [README.md](../README.md) を、ラベルの一覧は [task-queue リポジトリ](https://github.com/vektor-inc/task-queue) を参照。このファイルは「エージェントがどう振る舞うべきか」だけを扱う。
 
-## task-queue 経由かどうかの判定
+> **表記について:** 以下のコマンド例に出てくる `<task-queue>` は、メタ issue が置かれるタスク登録リポジトリの `owner/repo` を表すプレースホルダ（issue 番号 `<N>` と同じ扱い）です。**既定は `vektor-inc/task-queue`** ですが、フォークや別 org では変わります（orchestrator の `github.owner` / `github.repo`、env なら `GITHUB_OWNER` / `GITHUB_REPO` で設定。README 参照）。エージェントは値を決め打ちせず、対象 issue の「🤖 …取り込みました → &lt;URL&gt;」コメントの URL（`github.com/<owner>/<repo>/issues/<番号>`）から実際の `owner/repo` を解決して使ってください。
 
-- 対象 issue に「🤖 task-queue で取り込みました → task-queue#NNN」コメントがある
-- または `gh issue list -R vektor-inc/task-queue --state open --json number,title,labels` で `[<対象リポ名>] <元 issue タイトル>` のメタ issue がヒットする
+## オーケストレーター経由かどうかの判定
+
+- 対象 issue に「🤖 オーケストレーターが取り込みました → task-queue#NNN」コメントがある
+- または `gh issue list -R <task-queue> --state open --json number,title,labels` で `[<対象リポ名>] <元 issue タイトル>` のメタ issue がヒットする
 - 全文検索（`--search "<repo> <issue番号>"`）は本文 URL にヒットせず取りこぼすことがあるため、タイトルでの突き合わせを使う
 
 ## automerge ラベル付きタスクではマージ判断で停止しない
@@ -51,7 +53,7 @@ automerge では司（vk-kore）ではなくオーケストレーターが PR �
 
 オーケストレーターは CI / CodeRabbit のステータスしか見ておらず、エージェントチーム内で進行中の対応（レビュー FAIL → 修正 push 等）を知らない。チェックが green になった時点で（かつレビュー完了マーカーが現 head SHA に存在すれば）いつでもマージされうる。逆に言えば、**レビュー完了マーカーを付けない限りは green でも止まる** ので、上記のレビュー完了ゲートが進行中の修正 push に対する第一の安全網になる。それでも次の運用は併せて守ること:
 
-- 修正対応が残っている間は PR を **draft にしておく**
+- 修正対応が残っている間は PR を **draft にしておく**（draft の PR はメタ issue が `status:waiting-merge` にならないため、タスクカードも作業中のまま＝実態と表示が一致する）
 - push 後は `gh pr view --json state` で **マージ済みでないか確認** する
 - マージと入れ違いになった場合は、修正コミットをデフォルトブランチ起点のブランチに cherry-pick してフォローアップ PR を作成する
 
@@ -69,14 +71,14 @@ automerge では司（vk-kore）ではなくオーケストレーターが PR �
 
 ## メタ issue のクローズまで責任を持つ
 
-本来はオーケストレーターが PR マージを検出してメタ issue をクローズするが、Claude がユーザー確認待ちで止まった際に `status:waiting-input` のまま放置される経路がある。task-queue 経由のタスクと認識したら、マージ後の cleanup で下記のクローズ手順まで実施すること。
+本来はオーケストレーターが PR マージを検出してメタ issue をクローズするが、Claude がユーザー確認待ちで止まった際に `status:waiting-input` のまま放置される経路がある。オーケストレーター経由のタスクと認識したら、マージ後の cleanup で下記のクローズ手順まで実施すること。
 
 **前提チェック（手動マージ時のレース対策）**: automerge ラベル付きタスクをユーザーの明示指示で司が手動マージした場合、オーケストレーターも同じマージを検知してクローズ処理・cleanup を実行するため、司の後追い処理と競合してメタ issue に重複（本文の PR ブロック・完了コメントの2重投稿）が生じる。これを防ぐため、クローズ手順は必ず冪等に行う:
 
 - **手順に入る前にメタ issue の state / `status:*` ラベルを確認し、既に closed または `status:done` なら以降の処理（1〜4）をすべてスキップする**（オーケストレーターが処理済みと判断）。
 
   ```bash
-  META=$(gh issue view <N> -R vektor-inc/task-queue --json state,labels --jq '.state + " " + ([.labels[].name] | join(","))')
+  META=$(gh issue view <N> -R <task-queue> --json state,labels --jq '.state + " " + ([.labels[].name] | join(","))')
   # META に "CLOSED" または "status:done" が含まれていれば、以降の 1〜4 をスキップ
   ```
 
@@ -86,9 +88,9 @@ automerge では司（vk-kore）ではなくオーケストレーターが PR �
 1. メタ issue 本文に PR URL を追記（オーケストレーターの標準形式）。**本文に既に同じ `**PR:** <PR_URL>` ブロックがあれば追記しない**（下記スニペットは既存確認込み）
 
    ```bash
-   CURRENT=$(gh issue view <N> -R vektor-inc/task-queue --json body --jq '.body')
+   CURRENT=$(gh issue view <N> -R <task-queue> --json body --jq '.body')
    if ! printf '%s' "$CURRENT" | grep -qF "**PR:** <PR_URL>"; then
-     gh issue edit <N> -R vektor-inc/task-queue --body "$CURRENT
+     gh issue edit <N> -R <task-queue> --body "$CURRENT
 
    ---
 
@@ -99,24 +101,26 @@ automerge では司（vk-kore）ではなくオーケストレーターが PR �
 2. ラベルを `status:done` に変更（remove 対象は現在付いている `status:*` ラベルを動的に取得する）。**既に `status:done` なら何もしない。`CURRENT_STATUS` が空（orchestrator が先に変更済み）なら `--remove-label` を付けない**
 
    ```bash
-   CURRENT_STATUS=$(gh issue view <N> -R vektor-inc/task-queue --json labels --jq '.labels[].name | select(startswith("status:"))')
+   CURRENT_STATUS=$(gh issue view <N> -R <task-queue> --json labels --jq '.labels[].name | select(startswith("status:"))')
    if [ "$CURRENT_STATUS" = "status:done" ]; then
      :  # 既に done のため何もしない
    elif [ -n "$CURRENT_STATUS" ]; then
-     gh issue edit <N> -R vektor-inc/task-queue --remove-label "$CURRENT_STATUS" --add-label "status:done"
+     gh issue edit <N> -R <task-queue> --remove-label "$CURRENT_STATUS" --add-label "status:done"
    else
-     gh issue edit <N> -R vektor-inc/task-queue --add-label "status:done"
+     gh issue edit <N> -R <task-queue> --add-label "status:done"
    fi
    ```
 
-3. 完了コメントを投稿（オーケストレーターと同じ文言）。**同じ PR URL を含む「✅ 完了」コメントが既にあれば投稿しない**（下記スニペットは既存確認込み）
+3. 完了コメントを投稿（オーケストレーターと同じ文言）。**URL の有無を問わず、同一コメント内に既存の「✅ 完了」かつ「マージされました」があれば投稿しない**（下記スニペットは既存確認込み）
 
    ```bash
-   if ! gh issue view <N> -R vektor-inc/task-queue --json comments --jq '.comments[].body' | grep -qF "PR: <PR_URL> がマージされました。"; then
-     gh issue comment <N> -R vektor-inc/task-queue --body "✅ 完了
+   FOUND=$(gh issue view <N> -R <task-queue> --json comments \
+     --jq '[.comments[].body | select(contains("✅ 完了") and contains("マージされました"))] | length')
+   if [ "$FOUND" -eq 0 ]; then
+     gh issue comment <N> -R <task-queue> --body "✅ 完了
 
    PR: <PR_URL> がマージされました。"
    fi
    ```
 
-4. `gh issue close <N> -R vektor-inc/task-queue`
+4. `gh issue close <N> -R <task-queue>`

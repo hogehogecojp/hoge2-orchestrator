@@ -111,4 +111,84 @@ describe('waitForClaudeReady', () => {
     const ready = await waitForClaudeReady(PORT, TERMID, FAST);
     assert.equal(ready, true);
   });
+
+  // ------------------------------------------------------------------------
+  // issue #172: コールドスタートでは起動バナーが一定時間 churn し続けてから
+  // 静止する。churn が旧デフォルト（15秒）を跨ぐと readiness を確認できず false に
+  // 倒れ、描画中の窓へ本文を送って取りこぼす。churn が収まるまで待てるよう
+  // readyTimeoutMs を 45秒へ引き上げる。ここでは実時間を短く（数百 ms）スケール
+  // した churn シーケンスで、短い timeout では false・十分長い（45000相当）
+  // timeout では true になることを検証する。
+  // ------------------------------------------------------------------------
+  it('readyTimeoutMs に NaN / 負数を渡しても既定(45000)にフォールバックして正常動作する', async () => {
+    // env 由来の不正値（"abc"→NaN や負数）が分割代入デフォルトをすり抜けて素通りすると、
+    // deadline = Date.now() + NaN で while が即 false になり readiness ゲートが沈黙のうちに
+    // 無効化される。正の整数へ健全化されていれば、静止シーケンスで通常どおり true を返す。
+    const settling = [
+      { lastOutputTime: 1_000, lastLines: 'starting...' },
+      { lastOutputTime: 2_000, lastLines: 'Welcome to Claude Code' },
+      { lastOutputTime: 2_000, lastLines: 'Welcome to Claude Code' }, // 静止
+    ];
+
+    statesQueue = [...settling];
+    const nanReady = await waitForClaudeReady(PORT, TERMID, {
+      readyTimeoutMs: Number('abc'), quietMs: 120, pollIntervalMs: 30,
+    });
+    assert.equal(nanReady, true, 'NaN は既定 45000 に倒れ、静止を確認して true');
+
+    statesQueue = [...settling];
+    const negReady = await waitForClaudeReady(PORT, TERMID, {
+      readyTimeoutMs: -5, quietMs: 120, pollIntervalMs: 30,
+    });
+    assert.equal(negReady, true, '負数は既定 45000 に倒れ、静止を確認して true');
+
+    statesQueue = [...settling];
+    const zeroReady = await waitForClaudeReady(PORT, TERMID, {
+      readyTimeoutMs: 0, quietMs: 120, pollIntervalMs: 30,
+    });
+    assert.equal(zeroReady, true, '0（即無効化される値）も既定 45000 に倒れて正常動作');
+  });
+
+  it('一定時間 churn 継続後に静止: 短い readyTimeoutMs では false、45000相当なら true', async () => {
+    // 実時間で CHURN_MS の間は出力が変化し続け、その後は同一状態で静止する。
+    const CHURN_MS = 500;
+    let start = null;
+    let seq = 0;
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (!u.endsWith('/api/states')) throw new Error(`unexpected fetch url in test: ${u}`);
+      if (start === null) start = Date.now();
+      const elapsed = Date.now() - start;
+      if (elapsed < CHURN_MS) {
+        // churn 中: 毎回 lastOutputTime / lastLines が変わる（=未静止）
+        seq += 1;
+        return {
+          ok: true,
+          json: async () => ({
+            terminals: { [TERMID]: { termId: TERMID, waiting: false, lastOutputTime: 1_000 + seq, lastLines: `banner churn ${seq}` } },
+          }),
+        };
+      }
+      // churn 収束後: 同一状態を返し続けて静止させる
+      return {
+        ok: true,
+        json: async () => ({
+          terminals: { [TERMID]: { termId: TERMID, waiting: false, lastOutputTime: 999_999, lastLines: 'settled prompt' } },
+        }),
+      };
+    };
+
+    // 短い timeout（churn 継続中に打ち切る）→ 静止を確認できず false
+    const shortReady = await waitForClaudeReady(PORT, TERMID, {
+      readyTimeoutMs: CHURN_MS / 2, quietMs: 120, pollIntervalMs: 30,
+    });
+    assert.equal(shortReady, false, 'churn 継続中に打ち切る短い timeout では readiness 未確認');
+
+    // churn を跨げる十分長い timeout（45000相当）→ 収束後に静止を検知して true
+    start = null; seq = 0; // シーケンスをリセット
+    const longReady = await waitForClaudeReady(PORT, TERMID, {
+      readyTimeoutMs: 45_000, quietMs: 120, pollIntervalMs: 30,
+    });
+    assert.equal(longReady, true, 'churn を跨げる長い timeout（45000相当）なら静止を確認できる');
+  });
 });

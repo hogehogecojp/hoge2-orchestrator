@@ -16,7 +16,7 @@ VK Orchestrator                  … いつ・どのペインに投げ、状態�
 VK Terminals                     … 実際に Claude を動かす実行面
 ```
 
-オーケストレーター経由のタスクに Claude エージェント（vk-kore の司 等）がどう振る舞うべきか（automerge での停止禁止・エージェントレビュー完了マーカー（`agent-review-passed`）の付与責務・メタ issue クローズの責務など）は [`docs/agent-rules.md`](docs/agent-rules.md) を参照してください。
+オーケストレーター経由のタスクに Claude エージェント（vk-kore の司 等）がどう振る舞うべきか（automerge での停止禁止・エージェントレビュー完了マーカー（`agent-review-passed`）の付与責務・メタ issue クローズの責務など）は [`docs/agent-rules.md`](docs/agent-rules.md) を参照してください。orchestrator は各 tick で、このファイルの絶対パスを `~/.vk-agents/runtime/orchestrator-rules.path` に書き出し、エージェントへ handoff します。
 
 ## 前提
 
@@ -52,16 +52,44 @@ automerge の完了ゲートはエージェント非依存の公開契約とし�
 
 SHA は現在の head に固定して照合するため、マーカー付与後に push が入ると TOCTOU 対策として自動マージは保留に戻ります。orchestrator のゲートは常時 ON で、マーカーが揃った場合のみ automerge します。CI 全通過・CodeRabbit 静穏・mergeable 等の従来条件も引き続き前提です。旧マーカー規約との後方互換はありません。
 
-## セットアップ
+このマーカーは **`status:in-progress` から `status:waiting-merge` への自動遷移にも効きます**。automerge タスクではマーカーが現 head SHA に対して揃うまでメタ issue は `status:in-progress` のままで、タスクカードは「マージ待ち」になりません（マージしないと分かっている段階で「マージ待ち」と表示しないため、遷移条件を automerge のマージゲートと揃えています）。automerge ラベルの無いタスクにはマーカーが付かないため、従来どおり完了条件の充足だけで `status:waiting-merge` へ進みます。あわせて **Draft PR も（automerge かどうかに関わらず）この自動遷移では `status:waiting-merge` になりません**。保留された場合は理由が orchestrator のログに毎ループ出力されます。
+
+なお上記は in-progress からの自動遷移のスコープです。`status:failed` からの事後復旧（`recheckFailedIssues()`：対象 issue に open PR が見つかったケース）や、CLI / `commands.jsonl` 経由の手動ステータス変更は、Draft・マーカーの有無を見ずに `status:waiting-merge` を付けます。
+
+## クイックスタート（対話セットアップ）
+
+初めて使う場合は、**Claude Code を起動して `/vk-orchestrator-setup` を実行する**のが最短です。対話に答えるだけで、モード選択（ローカル / GitHub）から 3 ファイル（orchestrator / VK Terminals / vk-agents）への保存までまとめて埋められます。
 
 ```bash
 git clone https://github.com/vektor-inc/vk-orchestrator.git
 cd vk-orchestrator
-brew install gh                      # gh 未導入の場合のみ
-gh auth login                        # ブラウザで GitHub 認証
+npm install                          # VK Terminals も一緒に導入される（optionalDependencies）
+claude                               # このリポジトリのディレクトリで Claude Code を起動
+# プロンプトに /vk-orchestrator-setup と入力すると対話セットアップが始まる
+```
+
+`/vk-orchestrator-setup` はこのリポジトリ内に同梱された**プロジェクトスキル**（`.claude/skills/vk-orchestrator-setup/`）なので、`npm run setup:agents`（vk-agents スキル展開）が未実施でも入口として使えます。充足判定はコード側の `vk-orchestrator doctor` が単一ソースで行い、スキルはその結果を読んで会話と保存に徹します。
+
+CLI だけで「自分の環境で何が足りないか」を確認したい場合は `vk-orchestrator doctor` を使います（✅/❌ の一覧と、次にやるコピペ可能なコマンドを表示。`--json` で要件配列を出力）。必須項目は**選択中のモード（`queue.backend`）から毎回計算**され、GitHub モードでだけ `gh` 認証・`github.owner`/`github.repo`・担当者フィルタ・運用ラベルが必須になります。
+
+```bash
+npx vk-orchestrator doctor           # 充足状況の診断（✅/❌ と次にやるコマンド）
+npx vk-orchestrator doctor --json    # 機械可読（{ id, group, label, required, ok, current, hint, target } の配列＋要約）
+```
+
+## セットアップ（手動）
+
+対話セットアップを使わず手で設定する場合は次のとおりです。
+
+```bash
+git clone https://github.com/vektor-inc/vk-orchestrator.git
+cd vk-orchestrator
+brew install gh                      # gh 未導入の場合のみ（GitHub モードで必要）
+gh auth login                        # ブラウザで GitHub 認証（GitHub モードで必要）
 npm install                          # VK Terminals も一緒に導入される（optionalDependencies）
 cp config.example.json config.json   # 下記の必須項目を編集
 npm run setup:agents                 # 同梱 vk-agents-public から skills/rules を ~/.claude へ展開
+npm run doctor                       # 充足状況を診断（不足があれば次にやるコマンドが出る）
 npm run up                           # 設定を反映して VK Terminals(GUI) と orchestrator を起動
 ```
 
@@ -93,6 +121,34 @@ npm run up                           # 設定を反映して VK Terminals(GUI) �
 
 orchestrator 自身の設定は `~/.vk-orchestrator/config.json` に置くとユーザー固有設定として優先的に読まれます（`VK_ORCHESTRATOR_CONFIG` で明示指定も可）。VK Terminals 本体が読む設定は `~/.vk-terminals/config.json` に保存します。GitHub トークンは通常 `config.json` に保存せず、`gh auth login` に任せます。優先順位は `GITHUB_TOKEN` 環境変数 / `.env` > `config.json`（既存互換の `github.token`） > `gh auth token` > 既定値です。
 
+### キューの保存先（GitHub モード / ローカルモード）
+
+タスクキューの保存先は `queue.backend`（環境変数 `QUEUE_BACKEND`）で 2 モードから選べます。既定はローカルモードです。設定パネル（⚙）の「オーケストレーター」グループ先頭の「キューの保存先」プルダウン、または `config.json` の `queue.backend` で切り替えます。
+
+| モード | `queue.backend` | キューの実体 | task-queue リポジトリ | 主な用途 |
+|---|---|---|---|---|
+| ローカル（既定） | `local` | ローカル JSON（`~/.task-queue/queue.json`） | 不要 | 手元だけでタスクを管理する。task-queue リポジトリを用意しない |
+| GitHub | `github` | task-queue リポジトリの Issue | 必要 | 複数人・複数リポジトリで Issue ベースに運用する |
+
+> **既存ユーザーへの注意:** 既定がローカルに変わったため、`queue.backend` を明記していない環境はアップグレード後にローカルモードで起動します。GitHub モードを継続する場合は `config.json` に `queue.backend: github`（または環境変数 `QUEUE_BACKEND=github`）を明示してください。
+
+- **GitHub モード**では `github.owner` / `github.repo`（タスク登録リポジトリ）と「ラベルの登録」（下記）が必要です。
+- **ローカルモード**では task-queue リポジトリは不要です。設定パネルではローカルモードを選ぶと「タスク登録リポジトリ名」（`github.repo`）が自動的に非表示になり、未設定のまま起動できます。純ローカルタスクは `vk-orchestrator task` コマンド（下記「純ローカルタスク CLI」）で登録・確認します。`github.owner` は、作業対象リポジトリを組織横断検索して取り込む際のオーナーとして**両モードで使用**するため、ローカルモードでも設定してください。
+- 補助スクリプト（`check-status` / `unblock` / `ensure-task-queue-label`）は GitHub 上の Issue を前提とするため **GitHub モード専用**です。ローカルモードでは使えません（MVP では相当スクリプトを提供しません）。
+
+#### トークンレス起動（純ローカルタスク専用運用）
+
+ローカルモードは **`GITHUB_TOKEN` を解決できなくても起動**します（GitHub モードは従来どおりトークン必須で、未解決なら起動を中止します）。トークンが無いローカルモードでは GitHub API アクセスを伴う機能が自動的に無効化され、GitHub に一切触れない「純ローカルタスク専用」で動作します。無効になるのは次の機能です。
+
+- **source import**（作業対象リポジトリからの `task-queue` ラベル付き Issue の取り込み）
+- **PR 監視**（PR 検索・CI 判定・完了条件判定による `waiting-merge` への自動遷移）
+- **automerge**（マージ検知・自動 squash マージ）
+- **対象 issue 操作**（source issue の close・完了コメント投稿など GitHub への書き込み）
+
+無効化された内容は起動時のログ（起動サマリと警告行）に明示されます。純ローカルタスク（issue URL を含まないタスク）の登録 → 実行 → `waiting-merge` → 手動 `done` の一巡は、この状態でも GitHub に触れず動作します（`waiting-merge` への移行と `done` は `vk-orchestrator task set-status` などの手動操作で行います）。トークンを解決できるローカルモードでは、上記の GitHub 連携機能は従来どおりフル稼働します。
+
+以下の「GitHub 認証」「ラベルの登録」は GitHub モードのセットアップ手順です。ローカルモードだけを使う場合、ラベル登録は不要です（GitHub 認証は、issue URL を含むタスクの取り込みや作業対象リポジトリの操作を行う場合に引き続き必要になることがあります）。
+
 ### GitHub 認証
 
 orchestrator は issue/PR の読み書き・ラベル操作・組織横断検索を行うため、GitHub API 認証が必要です。通常は GitHub CLI の認証を使います。
@@ -112,6 +168,8 @@ gh auth status         # 認証状態と scope の確認
 `config.json` は手編集のほか、**`up` で起動した VK Terminals(GUI) のタイトルバー右端 ⚙ ボタンから GUI 上で編集・保存**できます（`up` が設定ディスクリプタを書き出し、環境変数 `VK_TERMINALS_SETTINGS` で GUI に渡します）。保存すると `config.json` がそのまま書き換わります。反映タイミングは orchestrator を再起動したとき（`vkTerminals` セクションの項目は次回 `up`/`apply` 時）です。
 
 ### ラベルの登録
+
+> **GitHub モード専用**: 以下のラベル登録は `queue.backend` が `github` のときだけ必要です。ローカルモード（`queue.backend = local`、既定）では GitHub の Issue ラベルを使わないため実行不要です。
 
 運用に使うラベルは 2 系統あり、それぞれ一括登録コマンドを用意しています。`gh auth login` 済みの状態で実行してください。
 
@@ -141,7 +199,7 @@ npx vk-orchestrator up       # config.json を反映 → GUI 起動 → API 疎�
 # npm start でも同じ（start スクリプトは up に割り当て済み）
 ```
 
-`up` 起動時に `~/.claude/skills/.agent-skills-manifest` が無い場合は、初回セットアップとして `npm run setup:agents` の実行を案内します。manifest が既にある環境では、展開元が private clone か同梱 public 複製かを問わず追加の切替案内は出しません。
+`up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、初回セットアップとして `/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
 
 `up` は VK Terminals API の起動を待ってから、**GUI の中に orchestrator 専用ペイン（Claude を起動しない素のシェル）を開いて `vk-orchestrator start` を自動実行**します。ペイン上部には「オーケストレーター」というタイトルが立つので他ペインと一目で区別でき、GUI を閉じればペインごと orchestrator も終了します。これで **「ペインを開いて Claude を止めて `vk-orchestrator start` を打つ」手動手順は不要**です。
 
@@ -158,8 +216,24 @@ orchestrator を単体で動かしたい場合（別マシンから API を叩�
 ```bash
 npx vk-orchestrator start          # タスク登録リポジトリのキューを確認して実行
 npx vk-orchestrator start --once   # 1 周だけ実行
-npx vk-orchestrator check-status   # 現在の状態を表示
+npx vk-orchestrator check-status   # 現在の状態を表示（GitHub モード専用）
+npx vk-orchestrator doctor         # 初回セットアップの充足状況を診断（--json で要件配列）
 ```
+
+> **補助スクリプトは GitHub モード専用**: `check-status`（`src/engine/check-status.mjs`）・`src/engine/unblock.mjs`・`src/engine/ensure-task-queue-label.mjs` は GitHub 上の Issue を前提とするため、`queue.backend = github` のときだけ使えます。ローカルモードでは対象がなく、キューの確認・状態変更は下記「純ローカルタスク CLI」の `vk-orchestrator task list` / `task set-status` を使ってください（MVP ではローカルモード向けの相当スクリプトは提供しません）。
+
+### 純ローカルタスク CLI
+
+`queue.backend` を `local` にしている環境では、GitHub issue に紐づかない純ローカルタスクを CLI から登録・確認できます。GitHub backend では実行できません。
+
+```bash
+npx vk-orchestrator task add "README の更新" --body "ローカルだけで管理する作業" --priority high --sequential
+npx vk-orchestrator task list
+npx vk-orchestrator task list --status ready --json
+npx vk-orchestrator task set-status 1 done
+```
+
+`task add` の `--status` は既定 `ready`、`--priority` は未指定なら `none` です。保存先はローカルキュー（既定 `~/.task-queue/queue.json`）で、純ローカルタスクには元 issue URL は自動追記されません。
 
 `apply` を使えば VK Terminals を起動せず設定反映だけ行うこともできます。
 
@@ -183,24 +257,31 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `github.owner` / `github.repo` | `GITHUB_OWNER` / `GITHUB_REPO` | タスク登録リポジトリ（task-queue） | `your-org` / `task-queue` |
 | `github.sourceOrg` | `SOURCE_ORG` | 作業対象リポジトリのオーナー（組織） | タスク登録リポジトリのオーナーと同じ |
 | `github.queueLabel` | `QUEUE_LABEL` | 作業対象リポジトリの取り込みラベル名 | `task-queue` |
+| `queue.backend` | `QUEUE_BACKEND` | キューの保存先。`github` は GitHub issues、`local` はローカル JSON（`~/.task-queue/queue.json`） | `local` |
 | `orchestrator.pollIntervalMs` | `POLL_INTERVAL_MS` | ポーリング間隔 | `60000` |
 | `orchestrator.watchdogIdleMs` | `WATCHDOG_IDLE_MS` | ウォッチドッグ閾値 | `10800000` |
-| `orchestrator.paneResumeMax` | `PANE_RESUME_MAX` | ペイン消失時（PR 未生成）の自動再開上限回数 | `3` |
+| `orchestrator.paneResumeMax` | `PANE_RESUME_MAX` | ペイン消失時・本文未達時（PR 未生成）の自動再開上限回数（両者で合算） | `3` |
+| なし | `CLAUDE_READY_TIMEOUT_MS` | Claude Code の起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。コールドスタートの起動バナー churn を跨げるよう設定 | `45000` |
+| なし | `CLAUDE_SUBMIT_DELAY_MS` | 本文送信後の基準待機時間（linear backoff の 1 単位）。再送のたびに待機が伸びる | `1000` |
+| なし | `CLAUDE_SUBMIT_MAX_RETRIES` | 本文・Enter それぞれの最大再送回数（初回と合わせて最大 +1 回まで送信） | `3` |
 | `orchestrator.assigneeFilter` | `ASSIGNEE_FILTER` | 担当者フィルタ。空/未設定は一切取り込まず、全件対象は `all` を明示 | `null`（拾わない） |
-| `orchestrator.taskCwd` | `TASK_CWD` | タスク用ペインの Claude Code 起点ディレクトリ | `~/vk-orchestrator-tasks`（無ければ自動作成） |
+| `workspace.search_paths`（vk-agents config） | なし | 作業対象リポジトリのローカルクローン探索起点。タスク用ペインの起点決定にも使用 | 未設定時は `~/vk-orchestrator-tasks`（無ければ自動作成） |
+| なし | `TASK_CWD` | タスク用ペインの Claude Code 起点ディレクトリの緊急上書き | 未設定 |
 | `~/.vk-terminals/config.json` の `port` / `apiHost` | `VK_TERMINALS_PORT` / `VK_TERMINALS_HOST` | VK Terminals API | `13847` / `127.0.0.1` |
-| `vkTerminals.gpu` | `VK_TERMINALS_GPU` | GUI の GPU 起動モード（下記） | 空=自動 |
+| `~/.vk-terminals/config.json` の `gpu` | `VK_TERMINALS_GPU` | GUI の GPU 起動モード（下記）。設定パネルの「VK Terminals（本体設定）」から編集可 | 空=自動 |
 | `~/.vk-terminals/config.json` の `initialCommand` / `additionalPanes` 等 | 設定パネルから保存 | VK Terminals のペイン構成等 | — |
 
-`orchestrator.taskCwd` はタスク用ペイン（Claude Code）の起点ディレクトリです。どのリポジトリを対象に作業するかは issue の URL で決まり、エージェントは対象リポジトリの既存チェックアウトを探すか、無ければクローンしてそこで作業します。起点はその入口にすぎません。
+タスク用ペイン（Claude Code）の起点ディレクトリは、issue に含まれる対象リポジトリ URL と vk-agents config の `workspace.search_paths` から決まります。上から順に走査し、origin が対象リポジトリと一致する既存クローンを最大 4 階層まで自動検出して、そのディレクトリでペインを開きます。
 
-想定する使い方は、自分のリポジトリ置き場（複数のチェックアウトが並ぶ親ディレクトリ）を `orchestrator.taskCwd`（または env `TASK_CWD`）へ指定しておくことです。探索・クローンがそこ基準で自然に進みますが、環境ごとに異なるため既定にはしていません。
+対象リポジトリを特定できないとき、`workspace.search_paths` が未設定のとき、または検出できないときは、専用ディレクトリ `~/vk-orchestrator-tasks`（無ければ自動作成）で起動します。`$HOME`（ホームディレクトリ）や特定リポジトリ、`config.json` / `.env` のある機密ディレクトリを起点にしないための安全側の既定です。
 
-未設定時は専用ディレクトリ `~/vk-orchestrator-tasks`（無ければ自動作成）で起動します。`$HOME`（ホームディレクトリ）や特定リポジトリ、`config.json` / `.env` のある機密ディレクトリを起点にしないための安全側の既定です。
+`TASK_CWD` 環境変数を設定した場合は緊急上書きとして最優先され、ローカルクローン検出は行いません。config の `orchestrator.taskCwd` は廃止され、読み取りません。
 
-注意: 起点（cwd）は「起点」であって「隔離」ではありません。絶対パス指定でのファイル読み取りは起点に関わらず可能なので、`GITHUB_TOKEN` 等の機密保護は起点設定だけでは達成できません。秘密管理・権限分離は別途行ってください。相対パスを指定した場合はオーケストレーター起動時の作業ディレクトリ基準で解決されます。
+注意: 起点（cwd）は「起点」であって「隔離」ではありません。絶対パス指定でのファイル読み取りは起点に関わらず可能なので、`GITHUB_TOKEN` 等の機密保護は起点設定だけでは達成できません。秘密管理・権限分離は別途行ってください。`TASK_CWD` に相対パスを指定した場合はオーケストレーター起動時の作業ディレクトリ基準で解決されます。
 
-> **`vkTerminals.gpu`（GUI の GPU 起動モード）** — VK Terminals(GUI) は Electron アプリで、macOS 以外（WSLg 等の Linux）では Chromium の GPU 初期化が失敗し `up` 起動時に `Exiting GPU process` / `kTransientFailure` 等のエラーログが大量に出ます。値で挙動を選べます。
+> **`gpu`（GUI の GPU 起動モード）** — VK Terminals(GUI) は Electron アプリで、macOS 以外（WSLg 等の Linux）では Chromium の GPU 初期化が失敗し `up` 起動時に `Exiting GPU process` / `kTransientFailure` 等のエラーログが大量に出ます。値で挙動を選べます。
+>
+> 設定は VK Terminals 本体 config（`~/.vk-terminals/config.json` の `gpu`）に保存します。設定パネルでは「VK Terminals（本体設定）」から編集できます。解決順は `VK_TERMINALS_GPU` 環境変数 > `~/.vk-terminals/config.json` の `gpu` > プラットフォーム既定です。
 >
 > - **空（既定・自動）** — macOS は通常起動、それ以外は `off` 相当。通常はこのままで OK。
 > - **`off`** — GPU を無効化してエラーログを抑制（描画はソフトウェア。ターミナル用途で実害なし）。
@@ -220,11 +301,10 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `features.coderabbit` | — | エージェント側の CodeRabbit 監視を有効化（vk-agents 設定へ投影）。OFF で `/code-review` 等での確認に切替 | `true` |
 | `features.coderabbit_ignore` | — | `features.coderabbit` が ON のとき、`/vk-pr` の PR 本文に `@coderabbitai ignore` を記載して CodeRabbit レビューをスキップ | `false` |
 | `org.review_assets_repo` | — | PR・テスト報告用の画像/GIF を保存するレビュー用アセットリポジトリ（`<owner>/<repo>`、例: `vektor-inc/review-assets`。形式が正しくない値は反映されません） | 空＝画像アップロードをスキップしてテキスト記述 |
-| `org.orchestrator_repo` | — | vk-kore が task-queue 連携ルール（`docs/agent-rules.md`）を取得するリポジトリ（`<owner>/<repo>`、例: `vektor-inc/vk-orchestrator`。形式が正しくない値は反映されません） | 空＝`vektor-inc/vk-orchestrator` |
 | `staff_wp_dev.engine` | — | staff-wp-dev（和田）の実行エンジン（`claude` / `codex`） | 空＝`claude` |
 | `multi_repo_task.default_engine` | — | vk-multi-repo-task を新規作成するときの既定エンジン（`claude` / `codex`） | 空＝`claude` |
 | `vkAgents.repoPath` | `VK_AGENTS_DIR` / `VK_AGENTS_REPO_PATH` | vk-agents リポジトリのパス。未指定は既知の private clone を優先探索し、無ければ同梱 `vendor/vk-agents-public` を使用 | 自動探索 |
 | `vkAgents.disabledSkills` | — | `npm run setup:agents` で展開しないスキル名（vk-agents config の `skills.disabled` へ投影） | `[]` |
 | `vkAgents.allowedOwners` | — | スキル実行を許可する GitHub owner（vk-agents config の `org.allowed_owners` へ投影） | `["vektor-inc"]` |
 
-`task.commandTemplate` は orchestrator 自身が消費します（`{issueUrl}` / `{wpPort}` を置換してペインへ投入）。`features.*` / `org.*` / `staff_wp_dev.*` / `multi_repo_task.*` は既存の vk-agents 投影ロジックが読むトップレベル設定を正とし、`vkAgents.*` は vk-agents の場所と setup 用の不足項目（無効化スキル・許可 owner）だけを持ちます。これらは `setup:agents`/`up`/`apply` 時に vk-agents の `config.json` と `~/.claude/vk-agents-settings.json` へ**投影**され、各ペインの Claude エージェントが読み取ります（orchestrator 自身の CodeRabbit 待機ゲートとは別物です）。
+`task.commandTemplate` は orchestrator 自身が消費します（`{issueUrl}` / `{wpPort}` を置換してペインへ投入）。`features.*` / `org.review_assets_repo` / `staff_wp_dev.*` / `multi_repo_task.*` は既存の vk-agents 投影ロジックが読むトップレベル設定を正とし、`vkAgents.*` は vk-agents の場所と setup 用の不足項目（無効化スキル・許可 owner）だけを持ちます。これらは `setup:agents`/`up`/`apply` 時に vk-agents の `config.json` と `~/.claude/vk-agents-settings.json` へ**投影**され、各ペインの Claude エージェントが読み取ります（orchestrator 自身の CodeRabbit 待機ゲートとは別物です）。連携ルールの在り処は設定ではなく、runtime handoff file（`~/.vk-agents/runtime/orchestrator-rules.path`）で渡されます。

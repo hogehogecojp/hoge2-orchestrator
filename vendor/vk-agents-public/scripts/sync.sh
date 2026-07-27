@@ -15,7 +15,7 @@ CLAUDE_GLOBAL=false
 WORDPRESS=false
 WP_SKILLS_PATH="${HOME}/wordpress-agent-skills"
 WP_SKILLS_REPO="https://github.com/WordPress/agent-skills"
-# config.json の skills.disabled（無効化するスキルのディレクトリ名）を格納する。
+# 個人設定 config.json の skills.disabled（無効化するスキルのディレクトリ名）を格納する。
 # load_disabled_skills で読み込み、sync_claude_global / sync_to_project の両方から参照する。
 DISABLED_SKILLS=()
 
@@ -92,12 +92,27 @@ if [[ -z "$TARGET" ]] && [[ "$CLAUDE_GLOBAL" == false ]]; then
     TARGET="$(pwd)"
 fi
 
-# config.json（リポ直下・git 管理外）から skills.disabled を読み込み DISABLED_SKILLS に格納する。
+# 個人設定 config.json の正本パス。未指定時は永続領域 ~/.vk-agents/config.json を読む。
+VK_AGENTS_CONFIG_PATH="${VK_AGENTS_CONFIG:-$HOME/.vk-agents/config.json}"
+
+# 旧配置（リポ直下・git 管理外）の config.json が残っている初回だけ、新しい正本へコピーする。
+# 既に正本がある場合は、GUI 等が書き込んだ値を上書きしないため何もしない。
+migrate_config() {
+    local legacy_config="$SCRIPT_DIR/../config.json"
+    [[ ! -f "$VK_AGENTS_CONFIG_PATH" ]] || return 0
+    [[ -f "$legacy_config" ]] || return 0
+
+    mkdir -p "$(dirname "$VK_AGENTS_CONFIG_PATH")"
+    cp "$legacy_config" "$VK_AGENTS_CONFIG_PATH"
+    echo "正本を $VK_AGENTS_CONFIG_PATH へ移行しました。今後リポ直下 config.json は読まれません。削除して構いません。"
+}
+
+# 個人設定 config.json（正本）から skills.disabled を読み込み DISABLED_SKILLS に格納する。
 # config.json が無い / skills キーが無い / disabled が無い / JSON が壊れている場合は空リスト扱い
 # （＝現行どおり全スキルをインストール）。壊れた JSON で sync 全体を落とさないよう python3 側で
 # 例外を握りつぶし、1行1要素で吐かせて bash 配列へ読み込む。
 load_disabled_skills() {
-    local config="$SCRIPT_DIR/../config.json"
+    local config="$VK_AGENTS_CONFIG_PATH"
     [[ -f "$config" ]] || return 0
     local line
     while IFS= read -r line; do
@@ -218,7 +233,7 @@ sync_to_project() {
 
     # スキルをプロジェクトに展開（Claude Code のみ）
     # vk-sync-skills は vk-agents リポジトリ固有（config/, scripts/ を参照）のため除外。
-    # config.json の skills.disabled も同様に除外する（target 側にはマニフェスト削除機構が無いため
+    # 個人設定 config.json の skills.disabled も同様に除外する（target 側にはマニフェスト削除機構が無いため
     # 「入れない」だけで要件を満たす）。
     local skills_src="$SCRIPT_DIR/../skills"
     local skip_skills="vk-sync-skills"
@@ -401,29 +416,29 @@ PYEOF
 
     echo "完了: グローバルClaude設定を更新しました"
 
-    # config.json をグローバル設定へ展開
-    # 環境ごとに変えたい設定（例: multi_repo_task.default_engine）をまとめて管理する。
-    # 個人設定 config.json（リポ直下・git 管理外）がある時だけ ~/.claude/vk-agents-settings.json へ複製する。
-    # config.json が無い環境では展開せず（古い展開先があれば掃除し）、各スキルの既定フォールバック
-    # （例: multi_repo_task はエンジン claude）に委ねる。テンプレ config.json.example は
-    # 「cp config.json.example config.json して有効化する」ための雛形で、自動展開はしない。
-    local vk_settings_personal="$SCRIPT_DIR/../config.json"
+    # 個人設定 config.json の非推奨ミラーを移行窓のために展開する。
+    # 現行スキル・ルールは正本（~/.vk-agents/config.json、または VK_AGENTS_CONFIG で指定した絶対パス）を
+    # 直接読むが、--target で各プロジェクトに配布済みの旧スキルコピーは再 sync まで派生ファイルを読む。
+    # その互換のため ~/.claude/vk-agents-settings.json への複製を残す。次リリースで撤去予定（issue #235）。
+    # config.json が無い環境では展開せず（古い展開先があれば掃除し）、各スキルの既定フォールバックに委ねる。
+    # テンプレ config.json.example は「正本へコピーして有効化する」ための雛形で、自動展開はしない。
+    local vk_settings_personal="$VK_AGENTS_CONFIG_PATH"
     local vk_settings_dest="$HOME/.claude/vk-agents-settings.json"
     if [[ -f "$vk_settings_personal" ]]; then
         # JSON として妥当な場合のみ展開する（壊れた設定で上書きしない）
         if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$vk_settings_personal" 2>/dev/null; then
             cp "$vk_settings_personal" "$vk_settings_dest"
-            echo "  → $vk_settings_dest を更新しました（元: config.json）"
+            echo "  → ${vk_settings_dest} を更新しました（元: ${vk_settings_personal}）"
         else
-            echo "  ⚠ $vk_settings_personal が不正な JSON のため $vk_settings_dest は更新しませんでした" >&2
+            echo "  ⚠ ${vk_settings_personal} が不正な JSON のため ${vk_settings_dest} は更新しませんでした" >&2
         fi
     else
         # 個人設定が無い → 展開しない。古い展開先が残っていると意図しない既定になるため掃除する。
         if [[ -f "$vk_settings_dest" ]]; then
             rm -f "$vk_settings_dest"
-            echo "  → config.json が無いため $vk_settings_dest を削除しました（各スキルの既定にフォールバック）"
+            echo "  → ${vk_settings_personal} が無いため ${vk_settings_dest} を削除しました（各スキルの既定にフォールバック）"
         else
-            echo "  → config.json が無いため vk-agents-settings.json は展開しません（各スキルの既定にフォールバック）"
+            echo "  → ${vk_settings_personal} が無いため vk-agents-settings.json は展開しません（各スキルの既定にフォールバック）"
         fi
     fi
 
@@ -494,7 +509,7 @@ PYEOF
                             tmp_skill=$(mktemp)
                             {
                                 cat <<GUARD
-> **前提条件（硬ゲート）:** このスキルは、対象リポジトリの owner が許可リスト \`org.allowed_owners\`（\`~/.claude/vk-agents-settings.json\`）に含まれる場合のみ使用できます。判定手順は \`${RULES_DIR}/repository-access.md\` を参照してください（許可リスト未設定時は確認のうえ続行可）。
+> **前提条件（硬ゲート）:** このスキルは、対象リポジトリの owner が許可リスト \`org.allowed_owners\`（\`~/.vk-agents/config.json\`）に含まれる場合のみ使用できます。判定手順は \`${RULES_DIR}/repository-access.md\` を参照してください（許可リスト未設定時は確認のうえ続行可）。
 
 GUARD
                                 cat "$dest_dir/$rel_path"
@@ -580,6 +595,7 @@ PYEOF
 }
 
 # 実行
+migrate_config
 load_disabled_skills
 if [[ -n "$TARGET" ]]; then sync_to_project "$TARGET"; fi
 if [[ "$CLAUDE_GLOBAL" == true ]]; then sync_claude_global; fi

@@ -1,3 +1,13 @@
+/**
+ * check-status.mjs
+ *
+ * タスク登録リポジトリ（task-queue）のオープン Issue とその status/priority ラベルを一覧表示する。
+ *
+ * ※ この補助スクリプトは GitHub モード（queue.backend = github）専用です。
+ *   ローカルモード（queue.backend = local）では GitHub 上に Issue が無いため対象がありません。
+ *   ローカルキューの確認は `vk-orchestrator task list` を使ってください（親 #156 決定事項 7・MVP では未対応）。
+ */
+
 import { config } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';

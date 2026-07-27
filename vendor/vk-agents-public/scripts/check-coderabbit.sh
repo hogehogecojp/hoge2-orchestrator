@@ -31,27 +31,41 @@ err() {
     printf '%s\n' "$*" >&2
 }
 
-# features.coderabbit フラグ確認
+# features.coderabbit / features.coderabbit_ignore フラグ確認
 #
 # CodeRabbit 未導入の環境（社外・個人リポジトリ等）では、監視ループが新規投稿を
-# 検知できず無限に空振りする。~/.claude/vk-agents-settings.json（sync.sh --claude-global
-# が config.json から丸ごと複製する）の features.coderabbit が false の場合はここで
+# 検知できず無限に空振りする。~/.vk-agents/config.json（または VK_AGENTS_CONFIG で指定した正本）の
+# features.coderabbit が false の場合はここで
 # 即 exit 0 し、呼び出し元の until-loop を待たせない。
 #
-# 判定は「true 扱い（デフォルト有効）」を基本とする: ファイルが無い・キーが無い・
-# JSON パース失敗のいずれも true とみなす（社内メンバー全員の既存環境で挙動を変えない）。
+# CodeRabbit は導入済みだが通常レビューを走らせたくない環境では、
+# features.coderabbit_ignore が true の場合もここで即 exit 0 し、PR 本文側に
+# @coderabbitai ignore を書く運用と合わせて監視をスキップする。
+# features.coderabbit=false が優先で、未導入環境には ignore コメントを書かない。
 #
-# 注意: `jq -r '.features.coderabbit // true'` は書かない。jq の `//` は左辺が
-# false のときも右辺にフォールバックするため、明示的に false を設定していても
-# true に化けてしまう（jq の仕様上のハマりどころ）。素の値を文字列比較する。
-SETTINGS_FILE="${VK_AGENTS_SETTINGS:-$HOME/.claude/vk-agents-settings.json}"
+# 判定は「true 扱い（デフォルト有効）」を基本とする: ファイルが無い・キーが無い・
+# JSON パース失敗のいずれも coderabbit=true / coderabbit_ignore=false とみなす
+# （社内メンバー全員の既存環境で挙動を変えない）。
+#
+# 注意: `jq -r '.features.coderabbit // true'` のように `//` は書かない。jq の
+# `//` は左辺が false のときも右辺にフォールバックするため、明示的に false を
+# 設定していても true に化けてしまう（jq の仕様上のハマりどころ）。
+# 素の値を文字列比較する。
+SETTINGS_FILE="${VK_AGENTS_CONFIG:-$HOME/.vk-agents/config.json}"
 coderabbit_enabled=true
+coderabbit_ignore=false
 if [ -f "$SETTINGS_FILE" ]; then
     val=$(jq -r '.features.coderabbit' "$SETTINGS_FILE" 2>/dev/null || echo true)
     [ "$val" = "false" ] && coderabbit_enabled=false
+    ignore_val=$(jq -r '.features.coderabbit_ignore' "$SETTINGS_FILE" 2>/dev/null || echo false)
+    [ "$ignore_val" = "true" ] && coderabbit_ignore=true
 fi
 if [ "$coderabbit_enabled" = false ]; then
     printf 'CodeRabbit 連携は無効化されています（features.coderabbit: false）\n'
+    exit 0
+fi
+if [ "$coderabbit_ignore" = true ]; then
+    printf 'CodeRabbit レビューは ignore 指定のためスキップします（features.coderabbit_ignore: true）\n'
     exit 0
 fi
 

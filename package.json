@@ -1,6 +1,6 @@
 {
   "name": "vk-orchestrator",
-  "version": "0.16.0",
+  "version": "0.23.2",
   "description": "Reusable orchestrator that drives Claude sessions in VK Terminals from a GitHub issues-based task queue.",
   "type": "module",
   "license": "GPL-2.0-only",
@@ -13,11 +13,13 @@
     "up": "node bin/vk-orchestrator.js up",
     "orchestrator": "node bin/vk-orchestrator.js start",
     "run-once": "node bin/vk-orchestrator.js start --once",
+    "doctor": "node bin/vk-orchestrator.js doctor",
     "check-status": "node bin/vk-orchestrator.js check-status",
     "unblock": "node bin/vk-orchestrator.js unblock",
     "setup:terminals": "node bin/vk-orchestrator.js setup-terminals",
     "setup:agents": "node bin/vk-orchestrator.js setup-agents",
     "bump:terminals": "node scripts/bump-vk-terminals.mjs",
+    "release:preflight": "node scripts/release-preflight.mjs",
     "setup:labels": "node src/engine/ensure-task-queue-label.mjs",
     "setup:queue-labels": "node src/engine/ensure-task-queue-label.mjs --status",
     "test": "node --test tests/*.test.js"
@@ -31,6 +33,6 @@
   },
   "optionalDependencies": {
     "@electron/rebuild": "^3.6.0",
-    "vk-terminals": "git+https://github.com/vektor-inc/vk-terminals.git#1.23.0"
+    "vk-terminals": "git+https://github.com/vektor-inc/vk-terminals.git#1.46.0"
   }
 }

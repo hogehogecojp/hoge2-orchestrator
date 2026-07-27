@@ -53,31 +53,25 @@ export function normalizeResumeMax(value, fallback = DEFAULT_RESUME_MAX) {
 }
 
 /**
- * pane 消失が確定したタスクを、条件を満たせば自動再開（再キュー）する。
+ * 「PR 未生成なら status:ready へ戻して自動再キューし、上限超過なら failed に倒す」
+ * という自動再開の共通コア。pane 消失（handlePaneMissing）と本文未達
+ * （handleUndeliveredBody）で、トリガ理由の文言以外のロジック（PR 確認・resumeCount
+ * の上限判定・cleanup・ready 遷移・state リセット・コメント投稿の順序と副作用）を
+ * 共有する。resumeCount / resumeMax はトリガをまたいで合算で管理する（同じ state の
+ * resumeCount を +1 するため、pane 消失と本文未達が交互に起きても上限が正しく効く）。
  *
  * @param {object}   issue   タスク登録リポジトリ側 issue（{ number, title, body }）
  * @param {object}   saved   state.json のタスクレコード（{ termId, wpPort, resumeCount, ... }）
- * @param {object}   deps
- * @param {function} deps.findPRForIssue        (owner, repo, number) => Promise<pr|null>
- * @param {function} deps.resolveTarget         (issue) => { owner, repo, number }
- * @param {function} deps.cleanupForIssue       ({ issueNumber, wpPort }) => Promise<summary>
- * @param {function} deps.formatCleanupSummary  (summary) => string
- * @param {function} deps.updateTask            (issueNumber, patch) => Promise<void>
- * @param {function} deps.setStatus             (issueNumber, label) => Promise<void>
- * @param {function} deps.addComment            (issueNumber, body) => Promise<void>
- * @param {function} deps.failTask              (reason) => Promise<void> 従来の failed 化処理
- * @param {object}   [options]
- * @param {number}   [options.resumeMax=3]      自動再開の上限回数（NaN・負数等の不正値は既定 3 にフォールバック）
- * @param {string}   [options.logTag='[watchdog]']  呼び出し元のログタグ
- * @param {object}   [options.logger=console]   console 互換オブジェクト
+ * @param {object}   deps    副作用の依存注入（各 handle* の JSDoc 参照）
+ * @param {object}   options 実行オプション（resumeMax / logTag / logger）
+ * @param {object}   messages トリガ固有の文言ビルダ
+ * @param {string}   messages.logTagDefault      logTag 未指定時の既定タグ
+ * @param {function} messages.failReason         (termId, resumeMax) => string 上限超過時の failed 理由
+ * @param {function} messages.resumeCommentHead  (resumeCount, resumeMax) => string 自動再開コメントの先頭行
+ * @param {function} messages.resumeLog          (termId, resumeCount, resumeMax) => string 再開ログ本文
  * @returns {Promise<{action: 'skipped'|'has-pr'|'failed'|'retry'|'resumed', resumeCount?: number}>}
- *   - skipped : PR 確認に失敗（今回は何もしない。次ループで再評価）
- *   - has-pr  : PR あり（通常ルートに任せるため何もしない）
- *   - failed  : 再開上限超過（従来どおり failed に倒した）
- *   - retry   : ready 遷移に失敗（state は据え置き。次ループで pane 消失から再検知）
- *   - resumed : 自動再開した（status:ready へ戻した）
  */
-export async function handlePaneMissing(issue, saved, deps, options = {}) {
+async function runAutoResume(issue, saved, deps, options, messages) {
   const {
     findPRForIssue,
     resolveTarget,
@@ -88,7 +82,7 @@ export async function handlePaneMissing(issue, saved, deps, options = {}) {
     addComment,
     failTask,
   } = deps;
-  const { logTag = '[watchdog]', logger = console } = options;
+  const { logTag = messages.logTagDefault, logger = console } = options;
   // 依存注入経由で不正値（NaN・負数・非数値）が来ても上限判定が壊れないよう健全化する。
   const resumeMax = normalizeResumeMax(options.resumeMax ?? DEFAULT_RESUME_MAX);
 
@@ -109,9 +103,7 @@ export async function handlePaneMissing(issue, saved, deps, options = {}) {
   // 2. 再開上限の判定。超過していたら従来どおり failed＋手動確認に倒す。
   const resumeCount = (saved?.resumeCount ?? 0) + 1;
   if (resumeCount > resumeMax) {
-    await failTask(
-      `作業ペイン（termId:${termId}）が消失しました（自動再開の上限 ${resumeMax} 回を使い切りました）`
-    );
+    await failTask(messages.failReason(termId, resumeMax));
     return { action: 'failed' };
   }
 
@@ -145,8 +137,10 @@ export async function handlePaneMissing(issue, saved, deps, options = {}) {
   }
 
   // 6. state の termId / paneMissingTicks / wpPort を明示的にリセットする。
-  //    再ディスパッチ時に recordTaskStart が上書きする想定だが、消失済みペインの
-  //    残骸を参照させないよう再開時点で消しておく（resumeCount は 3. で記録済み）。
+  //    再ディスパッチ時に recordTaskStart が上書きする想定だが、消失済み・応答なしの
+  //    ペインの残骸を参照させないよう再開時点で消しておく（resumeCount は 3. で記録済み）。
+  //    termId を必ず null に戻すのが重要: 残すと ready ディスパッチが「生存ペインへの
+  //    in-progress 再試行」経路に入り、空プロンプトのゾンビペインへ再送してしまう。
   try {
     await updateTask(issue.number, { termId: null, paneMissingTicks: 0, wpPort: null });
   } catch (err) {
@@ -158,7 +152,7 @@ export async function handlePaneMissing(issue, saved, deps, options = {}) {
     await addComment(
       issue.number,
       [
-        `🔁 作業ペイン消失を検知したため自動再開しました（${resumeCount}/${resumeMax}回目）`,
+        messages.resumeCommentHead(resumeCount, resumeMax),
         cleanupReport ? `\n**クリーンアップ結果:**\n${cleanupReport}` : '',
       ].filter(Boolean).join('\n')
     );
@@ -166,8 +160,71 @@ export async function handlePaneMissing(issue, saved, deps, options = {}) {
     logger.warn(`  ${logTag} issue #${issue.number}: 自動再開コメント投稿失敗（処理は継続）: ${err.message}`);
   }
 
-  logger.log(
-    `  ${logTag} issue #${issue.number}: pane(termId:${termId}) 消失 → 自動再開 ready（${resumeCount}/${resumeMax}回目）`
-  );
+  logger.log(`  ${logTag} issue #${issue.number}: ${messages.resumeLog(termId, resumeCount, resumeMax)}`);
   return { action: 'resumed', resumeCount };
+}
+
+/**
+ * pane 消失が確定したタスクを、条件を満たせば自動再開（再キュー）する。
+ *
+ * @param {object}   issue   タスク登録リポジトリ側 issue（{ number, title, body }）
+ * @param {object}   saved   state.json のタスクレコード（{ termId, wpPort, resumeCount, ... }）
+ * @param {object}   deps
+ * @param {function} deps.findPRForIssue        (owner, repo, number) => Promise<pr|null>
+ * @param {function} deps.resolveTarget         (issue) => { owner, repo, number }
+ * @param {function} deps.cleanupForIssue       ({ issueNumber, wpPort }) => Promise<summary>
+ * @param {function} deps.formatCleanupSummary  (summary) => string
+ * @param {function} deps.updateTask            (issueNumber, patch) => Promise<void>
+ * @param {function} deps.setStatus             (issueNumber, label) => Promise<void>
+ * @param {function} deps.addComment            (issueNumber, body) => Promise<void>
+ * @param {function} deps.failTask              (reason) => Promise<void> 従来の failed 化処理
+ * @param {object}   [options]
+ * @param {number}   [options.resumeMax=3]      自動再開の上限回数（NaN・負数等の不正値は既定 3 にフォールバック）
+ * @param {string}   [options.logTag='[watchdog]']  呼び出し元のログタグ
+ * @param {object}   [options.logger=console]   console 互換オブジェクト
+ * @returns {Promise<{action: 'skipped'|'has-pr'|'failed'|'retry'|'resumed', resumeCount?: number}>}
+ *   - skipped : PR 確認に失敗（今回は何もしない。次ループで再評価）
+ *   - has-pr  : PR あり（通常ルートに任せるため何もしない）
+ *   - failed  : 再開上限超過（従来どおり failed に倒した）
+ *   - retry   : ready 遷移に失敗（state は据え置き。次ループで pane 消失から再検知）
+ *   - resumed : 自動再開した（status:ready へ戻した）
+ */
+export async function handlePaneMissing(issue, saved, deps, options = {}) {
+  return runAutoResume(issue, saved, deps, options, {
+    logTagDefault:     '[watchdog]',
+    failReason:        (termId, resumeMax) =>
+      `作業ペイン（termId:${termId}）が消失しました（自動再開の上限 ${resumeMax} 回を使い切りました）`,
+    resumeCommentHead: (resumeCount, resumeMax) =>
+      `🔁 作業ペイン消失を検知したため自動再開しました（${resumeCount}/${resumeMax}回目）`,
+    resumeLog:         (termId, resumeCount, resumeMax) =>
+      `pane(termId:${termId}) 消失 → 自動再開 ready（${resumeCount}/${resumeMax}回目）`,
+  });
+}
+
+/**
+ * タスク本文がペインに届かなかった（submitToClaude が bodyConfirmed=false を返した）
+ * タスクを、条件を満たせば自動再開（再キュー）する。
+ *
+ * コールドスタート時に起動バナーが本文を飲み込むと、ラベルだけ in-progress・ペインは
+ * 空プロンプトのまま放置される（task-queue#172）。これを in-progress 放置にせず、
+ * handlePaneMissing と同じコア（PR 確認 → 上限判定 → cleanup → status:ready → state
+ * リセット → コメント）に相乗りして自動収束させる。resumeCount / 上限は pane 消失と
+ * 合算で管理する。deps は handlePaneMissing と同一。
+ *
+ * @param {object} issue    handlePaneMissing 参照
+ * @param {object} saved    handlePaneMissing 参照
+ * @param {object} deps     handlePaneMissing 参照
+ * @param {object} [options] handlePaneMissing 参照（logTag 既定は '[submit]'）
+ * @returns {Promise<{action: 'skipped'|'has-pr'|'failed'|'retry'|'resumed', resumeCount?: number}>}
+ */
+export async function handleUndeliveredBody(issue, saved, deps, options = {}) {
+  return runAutoResume(issue, saved, deps, options, {
+    logTagDefault:     '[submit]',
+    failReason:        (termId, resumeMax) =>
+      `タスク本文がペイン（termId:${termId}）に届きませんでした（自動再開の上限 ${resumeMax} 回を使い切りました）`,
+    resumeCommentHead: (resumeCount, resumeMax) =>
+      `🔁 タスク本文がペインに届かなかったため自動再開しました（${resumeCount}/${resumeMax}回目）`,
+    resumeLog:         (termId, resumeCount, resumeMax) =>
+      `本文未達（termId:${termId}）→ 自動再開 ready（${resumeCount}/${resumeMax}回目）`,
+  });
 }

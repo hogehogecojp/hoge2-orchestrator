@@ -5,12 +5,14 @@
     "sourceOrg": "your-org",
     "queueLabel": "task-queue"
   },
+  "queue": {
+    "backend": "local"
+  },
   "orchestrator": {
     "pollIntervalMs": 60000,
     "watchdogIdleMs": 10800000,
     "paneResumeMax": 3,
-    "assigneeFilter": null,
-    "taskCwd": ""
+    "assigneeFilter": null
   },
   "vkTerminals": {
     "port": 13847,
@@ -33,8 +35,7 @@
     "coderabbit_ignore": false
   },
   "org": {
-    "review_assets_repo": "",
-    "orchestrator_repo": ""
+    "review_assets_repo": ""
   },
   "staff_wp_dev": {
     "engine": ""

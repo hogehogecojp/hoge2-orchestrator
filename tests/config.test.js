@@ -17,8 +17,9 @@ import {
   getGitHubTokenFromGh,
   loadConfig,
   migrateLegacyOrchestratorConfig,
-  migrateVkTerminalsLaunchOptions,
   migrateLegacyVkAgentsGuiKeys,
+  resolveCommandsPath,
+  resolveTasksViewPath,
   resolveVkAgentsRepoPath,
   resolveVkAgentsConfigPath,
   resolveVkAgentsCanonicalConfigPath,
@@ -30,7 +31,11 @@ import {
   isVkAgentsSetup,
   writeVkAgentsManifestSource,
   writeVkAgentsSettings,
+  writeVkTerminalsCommandsConfig,
+  writeVkTerminalsTasksViewConfig,
   getTaskConfig,
+  getQueueBackend,
+  isCoderabbitEnabled,
   getTaskCwd,
   getProtocolConfig,
   getLabelsConfig,
@@ -40,6 +45,7 @@ import {
   getVkTerminalsGpuMode,
   gpuLaunchOptions,
   DEFAULT_LABELS,
+  DEFAULT_QUEUE,
 } from '../src/config.js';
 
 function withTmpConfig(obj, fn) {
@@ -65,6 +71,38 @@ function withSavedEnv(keys, fn) {
   }
 }
 
+function withTmpDir(prefix, fn) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function withVkTerminalsSchema(schema, fn) {
+  return withTmpDir('vko-vk-terminals-', (dir) => {
+    writeFileSync(join(dir, 'settings-schema.json'), JSON.stringify(schema, null, 2));
+    return fn(dir);
+  });
+}
+
+function vkTerminalsSchemaFixture(groups = [{
+  label: '基本',
+  fields: [
+    { key: 'apiHost', label: 'API ホスト', type: 'text', help: '既定 127.0.0.1' },
+    { key: 'initialCommand', label: '初期コマンド', type: 'text', help: '各ペイン起動時のコマンド' },
+    { key: 'confirmClose', label: '閉じる確認', type: 'select', options: [{ value: 'busy', label: '実行中のみ確認' }] },
+    { key: 'gpu', label: 'GPU モード', type: 'select', options: [{ value: '', label: '自動' }, { value: 'off', label: 'off' }] },
+  ],
+}]) {
+  return {
+    title: 'VK Terminals 設定',
+    note: '保存後、VK Terminals を再起動すると反映されます。',
+    groups,
+  };
+}
+
 test('loadUnifiedConfig: 存在しないパスは {} を返す', () => {
   assert.deepEqual(loadUnifiedConfig('/no/such/file.json'), {});
 });
@@ -76,21 +114,23 @@ test('loadUnifiedConfig: JSON を読み込む', () => {
 });
 
 test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
-  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'VK_TERMINALS_PORT', 'ASSIGNEE_FILTER', 'TASK_CWD'];
+  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'QUEUE_BACKEND', 'VK_TERMINALS_PORT', 'ASSIGNEE_FILTER', 'TASK_CWD'];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   try {
     applyConfigToEnv({
       github: { owner: 'acme', repo: 'q', queueLabel: 'lbl' },
+      queue: { backend: 'local' },
       orchestrator: { assigneeFilter: 'alice', taskCwd: '/work/task' },
       vkTerminals: { port: 20000 },
     });
     assert.equal(process.env.GITHUB_OWNER, 'acme');
     assert.equal(process.env.GITHUB_REPO, 'q');
     assert.equal(process.env.QUEUE_LABEL, 'lbl');
+    assert.equal(process.env.QUEUE_BACKEND, 'local');
     assert.equal(process.env.VK_TERMINALS_PORT, undefined);
     assert.equal(process.env.ASSIGNEE_FILTER, 'alice');
-    assert.equal(process.env.TASK_CWD, '/work/task');
+    assert.equal(process.env.TASK_CWD, undefined);
   } finally {
     for (const k of keys) {
       if (saved[k] === undefined) delete process.env[k];
@@ -379,6 +419,78 @@ test('resolveVkTerminalsApiPort: 不正 JSON でも例外を投げず既定 1384
   });
 });
 
+test('resolveTasksViewPath: home 配下の tasks-view.json を返す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-tasks-view-path-'));
+  try {
+    assert.equal(
+      resolveTasksViewPath({ homeDir: dir }),
+      join(dir, '.task-queue', 'tasks-view.json'),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveCommandsPath: home 配下の commands.jsonl を返す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-commands-path-'));
+  try {
+    assert.equal(
+      resolveCommandsPath({ homeDir: dir }),
+      join(dir, '.task-queue', 'commands.jsonl'),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkTerminalsTasksViewConfig: 既存設定を保ったまま tasksViewPath を注入する', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkterm-tasks-view-'));
+  try {
+    const configPath = join(dir, '.vk-terminals', 'config.json');
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({ port: 13847, apiHost: '100.64.0.2' }));
+
+    const result = writeVkTerminalsTasksViewConfig({ homeDir: dir });
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+
+    assert.deepEqual(result, {
+      configPath,
+      tasksViewPath: join(dir, '.task-queue', 'tasks-view.json'),
+    });
+    assert.deepEqual(config, {
+      port: 13847,
+      apiHost: '100.64.0.2',
+      tasksViewPath: join(dir, '.task-queue', 'tasks-view.json'),
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkTerminalsCommandsConfig: 既存設定を保ったまま commandsPath を注入する', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkterm-commands-'));
+  try {
+    const configPath = join(dir, '.vk-terminals', 'config.json');
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({ port: 13847, apiHost: '100.64.0.2' }));
+
+    const result = writeVkTerminalsCommandsConfig({ homeDir: dir });
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+
+    assert.deepEqual(result, {
+      configPath,
+      commandsPath: join(dir, '.task-queue', 'commands.jsonl'),
+    });
+    assert.deepEqual(config, {
+      port: 13847,
+      apiHost: '100.64.0.2',
+      commandsPath: join(dir, '.task-queue', 'commands.jsonl'),
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('migrateLegacyOrchestratorConfig: repo 直下 config.json を home 正本へ初回コピーする', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-migrate-'));
   try {
@@ -431,84 +543,6 @@ test('migrateLegacyOrchestratorConfig: home 正本があれば旧配置を上書
   }
 });
 
-test('migrateVkTerminalsLaunchOptions: 旧 vkTerminals.port を本体 config の port へ移行する', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vko-vkterm-migrate-'));
-  try {
-    const sourcePath = join(dir, 'orchestrator.json');
-    const targetPath = join(dir, '.vk-terminals', 'config.json');
-    mkdirSync(dirname(targetPath), { recursive: true });
-    writeFileSync(sourcePath, JSON.stringify({ vkTerminals: { port: 23000, gpu: 'off' } }));
-    writeFileSync(targetPath, JSON.stringify({ apiHost: '127.0.0.1' }) + '\n');
-    const logs = [];
-
-    const result = migrateVkTerminalsLaunchOptions({
-      orchestratorConfigPath: sourcePath,
-      vkTerminalsConfigPath: targetPath,
-      log: (message) => logs.push(message),
-    });
-
-    assert.deepEqual(result, { migrated: true, sourcePath, targetPath });
-    assert.deepEqual(JSON.parse(readFileSync(targetPath, 'utf8')), {
-      apiHost: '127.0.0.1',
-      port: 23000,
-    });
-    assert.equal(logs.length, 1);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('migrateVkTerminalsLaunchOptions: 本体 config に port があれば上書きせず冪等に何もしない', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vko-vkterm-migrate-'));
-  try {
-    const sourcePath = join(dir, 'orchestrator.json');
-    const targetPath = join(dir, '.vk-terminals', 'config.json');
-    mkdirSync(dirname(targetPath), { recursive: true });
-    writeFileSync(sourcePath, JSON.stringify({ vkTerminals: { port: 23000, gpu: 'default' } }));
-    writeFileSync(targetPath, JSON.stringify({ port: 24000, apiHost: '127.0.0.1' }) + '\n');
-
-    const first = migrateVkTerminalsLaunchOptions({
-      orchestratorConfigPath: sourcePath,
-      vkTerminalsConfigPath: targetPath,
-      log: () => {},
-    });
-    const second = migrateVkTerminalsLaunchOptions({
-      orchestratorConfigPath: sourcePath,
-      vkTerminalsConfigPath: targetPath,
-      log: () => {},
-    });
-
-    assert.equal(first.migrated, false);
-    assert.equal(second.migrated, false);
-    assert.deepEqual(JSON.parse(readFileSync(targetPath, 'utf8')), {
-      port: 24000,
-      apiHost: '127.0.0.1',
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('migrateVkTerminalsLaunchOptions: gpu は本体 config へ移行しない', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vko-vkterm-migrate-'));
-  try {
-    const sourcePath = join(dir, 'orchestrator.json');
-    const targetPath = join(dir, '.vk-terminals', 'config.json');
-    writeFileSync(sourcePath, JSON.stringify({ vkTerminals: { gpu: 'off' } }));
-
-    const result = migrateVkTerminalsLaunchOptions({
-      orchestratorConfigPath: sourcePath,
-      vkTerminalsConfigPath: targetPath,
-      log: () => {},
-    });
-
-    assert.equal(result.migrated, false);
-    assert.equal(existsSync(targetPath), false);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test('migrateLegacyVkAgentsGuiKeys: 旧 GUI キーを canonical へ移送し orchestrator config から削除する', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-migrate-'));
   try {
@@ -519,11 +553,11 @@ test('migrateLegacyVkAgentsGuiKeys: 旧 GUI キーを canonical へ移送し orc
       github: { owner: 'vektor-inc' },
       features: { coderabbit: false, coderabbit_ignore: true },
       staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
       multi_repo_task: { default_engine: 'claude' },
       org: {
         allowed_owners: ['vektor-inc'],
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/vk-orchestrator',
       },
       vkTerminals: { gpu: 'off' },
     }));
@@ -550,9 +584,9 @@ test('migrateLegacyVkAgentsGuiKeys: 旧 GUI キーを canonical へ移送し orc
       org: {
         allowed_owners: ['existing-owner'],
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/vk-orchestrator',
       },
       staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
       multi_repo_task: { default_engine: 'claude' },
     });
     assert.equal(logs.length, 1);
@@ -753,6 +787,7 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
       org: { allowed_owners: ['vektor-inc'] },
       features: { task_queue: true },
       staff_wp_dev: { engine: 'claude' },
+      staff_review: { engine: 'claude' },
       multi_repo_task: { default_engine: 'claude' },
     }));
 
@@ -760,10 +795,10 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
       {
         org: {
           review_assets_repo: 'vektor-inc/review-assets',
-          orchestrator_repo: 'vektor-inc/vk-orchestrator',
         },
         features: { coderabbit: false, coderabbit_ignore: true },
         staff_wp_dev: { engine: 'codex' },
+        staff_review: { engine: 'codex' },
         multi_repo_task: { default_engine: 'codex' },
       },
       { configPath, globalSettingsPath },
@@ -775,10 +810,10 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
       org: {
         allowed_owners: ['vektor-inc'],
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/vk-orchestrator',
       },
       features: { task_queue: true, coderabbit: false, coderabbit_ignore: true },
       staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'codex' },
       multi_repo_task: { default_engine: 'codex' },
     });
     assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
@@ -844,7 +879,7 @@ test('writeVkAgentsSettings: up/apply 投影時に canonical の CodeRabbit 設�
   }
 });
 
-test('writeVkAgentsSettings: org リポジトリ設定の空値は vk-agents config から削除しフォールバックへ戻せる', () => {
+test('writeVkAgentsSettings: review_assets_repo の空値は vk-agents config から削除しフォールバックへ戻せる', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
   try {
     const configPath = join(dir, 'config.json');
@@ -853,7 +888,6 @@ test('writeVkAgentsSettings: org リポジトリ設定の空値は vk-agents con
       org: {
         allowed_owners: ['vektor-inc'],
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/custom-orchestrator',
       },
       features: { coderabbit: true },
     }));
@@ -862,7 +896,6 @@ test('writeVkAgentsSettings: org リポジトリ設定の空値は vk-agents con
       {
         org: {
           review_assets_repo: '',
-          orchestrator_repo: null,
         },
       },
       { configPath, globalSettingsPath },
@@ -879,7 +912,7 @@ test('writeVkAgentsSettings: org リポジトリ設定の空値は vk-agents con
   }
 });
 
-test('writeVkAgentsSettings: org リポジトリ設定の不正形式は既存値を保持する', () => {
+test('writeVkAgentsSettings: review_assets_repo の不正形式は既存値を保持する', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
   try {
     const configPath = join(dir, 'config.json');
@@ -887,7 +920,6 @@ test('writeVkAgentsSettings: org リポジトリ設定の不正形式は既存�
     writeFileSync(configPath, JSON.stringify({
       org: {
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/custom-orchestrator',
       },
       features: { coderabbit: true },
     }));
@@ -896,7 +928,6 @@ test('writeVkAgentsSettings: org リポジトリ設定の不正形式は既存�
       {
         org: {
           review_assets_repo: 'review-assets',
-          orchestrator_repo: 'vektor-inc/too/many',
         },
       },
       { configPath, globalSettingsPath },
@@ -906,7 +937,6 @@ test('writeVkAgentsSettings: org リポジトリ設定の不正形式は既存�
     assert.deepEqual(written, {
       org: {
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/custom-orchestrator',
       },
       features: { coderabbit: true },
     });
@@ -916,7 +946,7 @@ test('writeVkAgentsSettings: org リポジトリ設定の不正形式は既存�
   }
 });
 
-test('writeVkAgentsSettings: org リポジトリ設定のドットセグメントは既存値を保持する', () => {
+test('writeVkAgentsSettings: review_assets_repo のドットセグメントは既存値を保持する', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
   try {
     const configPath = join(dir, 'config.json');
@@ -924,7 +954,6 @@ test('writeVkAgentsSettings: org リポジトリ設定のドットセグメン�
     writeFileSync(configPath, JSON.stringify({
       org: {
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/custom-orchestrator',
       },
       features: { coderabbit: true },
     }));
@@ -933,7 +962,6 @@ test('writeVkAgentsSettings: org リポジトリ設定のドットセグメン�
       {
         org: {
           review_assets_repo: '../..',
-          orchestrator_repo: './x',
         },
       },
       { configPath, globalSettingsPath },
@@ -943,7 +971,6 @@ test('writeVkAgentsSettings: org リポジトリ設定のドットセグメン�
     assert.deepEqual(written, {
       org: {
         review_assets_repo: 'vektor-inc/review-assets',
-        orchestrator_repo: 'vektor-inc/custom-orchestrator',
       },
       features: { coderabbit: true },
     });
@@ -959,11 +986,11 @@ test('descriptor の pattern と投影の受理集合が一致する（owner/rep
   // 同一入力に対し「descriptor の pattern が受理するか」と「投影が値を反映する（弾かない）か」が
   // 常に一致することを検証し、両者のドリフトを防ぐ。
   const descriptor = buildSettingsDescriptor('/tmp/does-not-exist-config.json');
-  // 検証対象の 2 フィールド（org.review_assets_repo / org.orchestrator_repo）を取り出す。
+  // 検証対象の owner/repo フィールド（org.review_assets_repo）を取り出す。
   const fields = descriptor.groups
     .flatMap((group) => group.fields ?? [])
-    .filter((field) => field.key === 'org.review_assets_repo' || field.key === 'org.orchestrator_repo');
-  assert.equal(fields.length, 2, '検証対象の owner/repo フィールドが 2 件見つかること');
+    .filter((field) => field.key === 'org.review_assets_repo');
+  assert.equal(fields.length, 1, '検証対象の owner/repo フィールドが 1 件見つかること');
 
   // 既存値を保持したうえで raw 値を投影し、実際に「反映されたか（受理）」を返すヘルパー。
   // 反映されれば trim 済みの raw が書き込まれ、弾かれれば既存値（sentinel）が残る。
@@ -1090,6 +1117,32 @@ test('writeVkAgentsSettings: 和田エンジンの空値は vk-agents config か
   }
 });
 
+test('writeVkAgentsSettings: 麗美エンジンの空値は vk-agents config から削除し既定へ戻せる', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      staff_review: { engine: 'codex', other: true },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings(
+      { staff_review: { engine: '' } },
+      { configPath, globalSettingsPath },
+    );
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, {
+      staff_review: { other: true },
+      features: { coderabbit: true },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('writeVkAgentsSettings: マルチリポタスク既定エンジンの空値は vk-agents config から削除し既定へ戻せる', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
   try {
@@ -1130,6 +1183,7 @@ test('writeVkAgentsSettings: setup:agents 用に features/skills/org/engine を 
           allowedOwners: ['vektor-inc', '  kurudrive  '],
         },
         staff_wp_dev: { engine: 'codex' },
+        staff_review: { engine: 'claude' },
         multi_repo_task: { default_engine: 'claude' },
       },
       { configPath, globalSettingsPath, force: true },
@@ -1141,6 +1195,7 @@ test('writeVkAgentsSettings: setup:agents 用に features/skills/org/engine を 
       skills: { disabled: ['vk-pr', 'vk-sync-skills'] },
       org: { allowed_owners: ['vektor-inc', 'kurudrive'] },
       staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
       multi_repo_task: { default_engine: 'claude' },
     };
     assert.deepEqual(JSON.parse(readFileSync(configPath, 'utf8')), expected);
@@ -1350,6 +1405,58 @@ test('getTaskConfig: 空白のみの TASK_WP_ENV_ENABLED は未指定扱い（tr
   });
 });
 
+test('getQueueBackend: config 無しで既定値 local を返す', () => {
+  withSavedEnv(['QUEUE_BACKEND'], () => {
+    delete process.env.QUEUE_BACKEND;
+    assert.equal(DEFAULT_QUEUE.backend, 'local');
+    assert.equal(getQueueBackend({}), 'local');
+  });
+});
+
+test('getQueueBackend: config.json の queue.backend を読む', () => {
+  withSavedEnv(['QUEUE_BACKEND'], () => {
+    delete process.env.QUEUE_BACKEND;
+    assert.equal(getQueueBackend({ queue: { backend: 'local' } }), 'local');
+  });
+});
+
+test('getQueueBackend: QUEUE_BACKEND env が config.json より優先される', () => {
+  withSavedEnv(['QUEUE_BACKEND'], () => {
+    process.env.QUEUE_BACKEND = 'github';
+    assert.equal(getQueueBackend({ queue: { backend: 'local' } }), 'github');
+  });
+});
+
+test('getQueueBackend: 未知の値は local にフォールバックする', () => {
+  withSavedEnv(['QUEUE_BACKEND'], () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (message) => warnings.push(message);
+    try {
+      process.env.QUEUE_BACKEND = 'unknown';
+      assert.equal(getQueueBackend({ queue: { backend: 'github' } }), 'local');
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /未知の queue\.backend/);
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('isCoderabbitEnabled: features.coderabbit 未設定は既定 true', () => {
+  assert.equal(isCoderabbitEnabled({}), true);
+  assert.equal(isCoderabbitEnabled({ features: {} }), true);
+});
+
+test('isCoderabbitEnabled: features.coderabbit=false（真偽値・文字列）は false', () => {
+  assert.equal(isCoderabbitEnabled({ features: { coderabbit: false } }), false);
+  assert.equal(isCoderabbitEnabled({ features: { coderabbit: 'false' } }), false);
+});
+
+test('isCoderabbitEnabled: features.coderabbit=true は true', () => {
+  assert.equal(isCoderabbitEnabled({ features: { coderabbit: true } }), true);
+});
+
 test('getTaskCwd: config 無しで専用ディレクトリを既定値として作成して返す', () => {
   withoutTaskEnv(() => {
     const tmpHome = mkdtempSync(join(tmpdir(), 'vko-task-home-'));
@@ -1366,26 +1473,36 @@ test('getTaskCwd: config 無しで専用ディレクトリを既定値として�
   });
 });
 
-test('getTaskCwd: config.json の絶対パス指定を返す', () => {
+test('getTaskCwd: config.json の orchestrator.taskCwd は無視して既定へフォールバックする', () => {
   withoutTaskEnv(() => {
+    const tmpHome = mkdtempSync(join(tmpdir(), 'vko-task-home-'));
     const dir = mkdtempSync(join(tmpdir(), 'vko-task-abs-'));
     try {
-      assert.equal(getTaskCwd({ orchestrator: { taskCwd: dir } }), dir);
+      const fallback = join(tmpHome, 'vk-orchestrator-tasks');
+      assert.equal(getTaskCwd({ orchestrator: { taskCwd: dir } }, tmpHome), fallback);
+      assert.equal(existsSync(fallback), true);
     } finally {
+      rmSync(tmpHome, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
     }
   });
 });
 
-test('getTaskCwd: config.json の相対パス指定を絶対パスへ解決する', () => {
+test('getTaskCwd: config.json の相対 taskCwd も無視して既定へフォールバックする', () => {
   withoutTaskEnv(() => {
-    const cwd = getTaskCwd({ orchestrator: { taskCwd: '.' } });
-    assert.equal(isAbsolute(cwd), true);
-    assert.equal(cwd, resolve('.'));
+    const tmpHome = mkdtempSync(join(tmpdir(), 'vko-task-home-'));
+    try {
+      const fallback = join(tmpHome, 'vk-orchestrator-tasks');
+      const cwd = getTaskCwd({ orchestrator: { taskCwd: '.' } }, tmpHome);
+      assert.equal(isAbsolute(cwd), true);
+      assert.equal(cwd, fallback);
+    } finally {
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
   });
 });
 
-test('getTaskCwd: TASK_CWD env が config.json より優先される', () => {
+test('getTaskCwd: TASK_CWD env が config.json の廃止済み taskCwd より優先される', () => {
   withoutTaskEnv(() => {
     const envDir = mkdtempSync(join(tmpdir(), 'vko-task-env-'));
     const configDir = mkdtempSync(join(tmpdir(), 'vko-task-config-'));
@@ -1419,7 +1536,8 @@ test('getTaskCwd: 明示値は存在しなくても自動作成しない', () =>
       const dir = mkdtempSync(join(tmpdir(), 'vko-task-explicit-'));
       try {
         const missing = join(dir, 'missing-task-cwd');
-        const cwd = getTaskCwd({ orchestrator: { taskCwd: missing } });
+        process.env.TASK_CWD = missing;
+        const cwd = getTaskCwd({});
         assert.equal(cwd, resolve(missing));
         assert.equal(existsSync(cwd), false);
       } finally {
@@ -1540,21 +1658,20 @@ test('getLabelsConfig: __proto__ ペイロードでグローバル汚染しな�
 test('buildSettingsDescriptor: 共有契約系フィールドを UI から除外する', () => {
   const desc = buildSettingsDescriptor('/tmp/config.json');
   const labels = desc.groups.map((g) => g.label);
-  assert.ok(labels.includes('issue を処理する Claude のコマンド'));
+  // task.commandTemplate は独立グループを廃止し「オーケストレーター」グループへ統合済み。
+  assert.ok(!labels.includes('issue を処理する Claude のコマンド'));
   assert.ok(!labels.includes('タスク'));
-  assert.equal(
-    labels.indexOf('issue を処理する Claude のコマンド'),
-    labels.indexOf('vk-agents（エージェント共通設定）') - 1,
-  );
   assert.ok(!labels.includes('プロトコル'));
   assert.ok(!labels.includes('ラベル'));
 
   const fieldKeys = desc.groups.flatMap((g) => (g.fields ?? []).map((f) => f.key));
   assert.ok(fieldKeys.includes('task.commandTemplate'));
-  const taskCommandGroup = desc.groups.find((g) => g.label === 'issue を処理する Claude のコマンド');
+  const taskCommandGroup = desc.groups.find((g) => g.label === 'オーケストレーター');
   assert.ok(taskCommandGroup);
   const commandTemplateField = taskCommandGroup.fields.find((f) => f.key === 'task.commandTemplate');
   assert.ok(commandTemplateField);
+  // ラベルは「issue を処理する Claude のコマンドテンプレート」へ変更。
+  assert.equal(commandTemplateField.label, 'issue を処理する Claude のコマンドテンプレート');
   assert.ok(commandTemplateField.placeholder.includes('/vk-kore'));
   assert.match(commandTemplateField.help, /\{issueUrl\}/);
   assert.match(commandTemplateField.help, /\{wpPort\}/);
@@ -1586,6 +1703,32 @@ test('buildSettingsDescriptor: 共有契約系フィールドを UI から除外
   assert.ok(!fieldKeys.includes('task.wpEnv.enabled'));
 });
 
+test('buildSettingsDescriptor: オーケストレーターグループ先頭に queue.backend select を持つ', () => {
+  const desc = buildSettingsDescriptor('/tmp/config.json');
+  const orchestratorGroup = desc.groups.find((g) => g.label === 'オーケストレーター');
+  assert.ok(orchestratorGroup);
+  // queue.backend は「オーケストレーター」グループ先頭に置く。
+  assert.equal(orchestratorGroup.fields[0].key, 'queue.backend');
+  const backendField = orchestratorGroup.fields[0];
+  assert.equal(backendField.type, 'select');
+  // 既定はローカル（DEFAULT_QUEUE.backend / getQueueBackend の解決と一致）。
+  assert.equal(backendField.default, DEFAULT_QUEUE.backend);
+  assert.equal(backendField.default, 'local');
+  const optionValues = backendField.options.map((o) => o.value);
+  assert.deepEqual(optionValues, ['local', 'github']);
+});
+
+test('buildSettingsDescriptor: github.repo は local モードで hide する visibleWhen を宣言する', () => {
+  const desc = buildSettingsDescriptor('/tmp/config.json');
+  const repoField = desc.groups
+    .flatMap((g) => g.fields ?? [])
+    .find((f) => f.key === 'github.repo');
+  assert.ok(repoField);
+  assert.deepEqual(repoField.visibleWhen, { key: 'queue.backend', value: 'local', hide: true });
+  // 必須フラグは持たない（ローカルモードで未設定でも起動できることの担保）。
+  assert.ok(!repoField.required);
+});
+
 test('buildSettingsDescriptor: sourceOrg は空欄保存時に未指定として扱う', () => {
   const desc = buildSettingsDescriptor('/tmp/config.json');
   const sourceOrgField = desc.groups
@@ -1598,17 +1741,32 @@ test('buildSettingsDescriptor: sourceOrg は空欄保存時に未指定として
 test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ', () => {
   const desc = buildSettingsDescriptor('/tmp/config.json');
   assert.deepEqual(desc.tabs, [
-    { id: 'orchestrator', label: 'Orchestrator' },
-    { id: 'terminals', label: 'Terminals' },
-    { id: 'agents', label: 'Agents' },
+    { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+    { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
+    { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
   ]);
   const tabsByLabel = Object.fromEntries(desc.groups.map((group) => [group.label, group.tab]));
   assert.equal(tabsByLabel.GitHub, 'orchestrator');
   assert.equal(tabsByLabel['オーケストレーター'], 'orchestrator');
   assert.equal(tabsByLabel['VK Terminals（本体設定）'], 'terminals');
-  assert.equal(tabsByLabel['VK Terminals 起動オプション（オーケストレーター制御）'], 'terminals');
-  assert.equal(tabsByLabel['issue を処理する Claude のコマンド'], 'orchestrator');
+  assert.equal(tabsByLabel['VK Terminals 起動オプション（オーケストレーター制御）'], undefined);
+  // 独立していた「issue を処理する Claude のコマンド」グループは廃止（オーケストレーターへ統合）。
+  assert.equal(tabsByLabel['issue を処理する Claude のコマンド'], undefined);
   assert.equal(tabsByLabel['vk-agents（エージェント共通設定）'], 'agents');
+
+  // Orchestrator タブ内は「オーケストレーター」→「GitHub」の順。
+  const orchestratorLabels = desc.groups.filter((g) => g.tab === 'orchestrator').map((g) => g.label);
+  assert.deepEqual(orchestratorLabels, ['オーケストレーター', 'GitHub']);
+});
+
+test('buildSettingsDescriptor: 保存後の反映タイミング案内をタブごとの note で持つ', () => {
+  const desc = buildSettingsDescriptor('/tmp/config.json');
+  assert.equal(desc.note, undefined);
+
+  const tabsById = Object.fromEntries(desc.tabs.map((tab) => [tab.id, tab]));
+  assert.equal(tabsById.orchestrator.note, '保存した設定は次回起動時以降に反映されます。');
+  assert.equal(tabsById.terminals.note, '保存した設定は次回起動時以降に反映されます。');
+  assert.equal(tabsById.agents.note, '保存した設定は次回セッション以降に反映されます。');
 });
 
 test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () => {
@@ -1635,16 +1793,6 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
   assert.match(reviewAssetsRepoField.help, /画像アップロードをスキップ/);
   assert.match(reviewAssetsRepoField.help, /テキスト記述/);
 
-  const orchestratorRepoField = group.fields.find((f) => f.key === 'org.orchestrator_repo');
-  assert.ok(orchestratorRepoField);
-  assert.equal(orchestratorRepoField.label, '連携ルール取得先リポジトリ');
-  assert.equal(orchestratorRepoField.type, 'text');
-  assert.equal(orchestratorRepoField.placeholder, 'owner/repo');
-  assert.equal(orchestratorRepoField.emptyToNull, true);
-  assert.match(orchestratorRepoField.help, /<owner>\/<repo>/);
-  assert.match(orchestratorRepoField.help, /vektor-inc\/vk-orchestrator/);
-  assert.match(orchestratorRepoField.help, /形式が正しくない値は反映されません/);
-
   const coderabbitIgnoreField = group.fields.find((f) => f.key === 'features.coderabbit_ignore');
   assert.ok(coderabbitIgnoreField);
   assert.equal(coderabbitIgnoreField.type, 'boolean');
@@ -1662,6 +1810,16 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
   );
   assert.match(engineField.options.find((o) => o.value === 'codex').label, /push\/PR/);
 
+  const reviewEngineField = group.fields.find((f) => f.key === 'staff_review.engine');
+  assert.ok(reviewEngineField);
+  assert.equal(reviewEngineField.label, 'staff-review（麗美）の実行エンジン');
+  assert.equal(reviewEngineField.type, 'select');
+  assert.deepEqual(
+    reviewEngineField.options.map((o) => o.value),
+    ['', 'claude', 'codex'],
+  );
+  assert.match(reviewEngineField.options.find((o) => o.value === 'codex').label, /司が担当/);
+
   const multiRepoEngineField = group.fields.find((f) => f.key === 'multi_repo_task.default_engine');
   assert.ok(multiRepoEngineField);
   assert.equal(multiRepoEngineField.label, 'vk-multi-repo-task の既定実行エンジン');
@@ -1670,13 +1828,17 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
     multiRepoEngineField.options.map((o) => o.value),
     ['', 'claude', 'codex'],
   );
-  assert.equal(multiRepoEngineField.options.find((o) => o.value === 'codex').label, 'codex');
+  assert.equal(multiRepoEngineField.options.find((o) => o.value === 'codex').label, 'Codex');
   assert.match(multiRepoEngineField.help, /vk-multi-repo-task/);
-  assert.match(multiRepoEngineField.help, /claude/);
+  assert.match(multiRepoEngineField.help, /Claude/);
 });
 
 test('buildSettingsDescriptor: Agents グループは workspace.search_paths（lines）を先頭に、CodeRabbit 2項目を末尾に持つ', () => {
   const desc = buildSettingsDescriptor('/tmp/config.json');
+  const orchestratorGroup = desc.groups.find((g) => g.label === 'オーケストレーター');
+  assert.ok(orchestratorGroup);
+  assert.equal(orchestratorGroup.fields.some((field) => field.key === 'orchestrator.taskCwd'), false);
+
   const group = desc.groups.find((g) => g.label === 'vk-agents（エージェント共通設定）');
   assert.ok(group);
 
@@ -1686,6 +1848,8 @@ test('buildSettingsDescriptor: Agents グループは workspace.search_paths（l
   assert.equal(first.type, 'lines');
   assert.match(first.help, /優先/);
   assert.match(first.help, /絶対パス/);
+  assert.match(first.help, /最大 4 階層/);
+  assert.match(first.help, /~/);
 
   // CodeRabbit 2項目が末尾（順序も固定）
   const keys = group.fields.map((f) => f.key);
@@ -1695,54 +1859,199 @@ test('buildSettingsDescriptor: Agents グループは workspace.search_paths（l
   assert.deepEqual(keys, [
     'workspace.search_paths',
     'org.review_assets_repo',
-    'org.orchestrator_repo',
     'staff_wp_dev.engine',
+    'staff_review.engine',
     'multi_repo_task.default_engine',
     'features.coderabbit',
     'features.coderabbit_ignore',
   ]);
 });
 
-test('buildSettingsDescriptor: VK Terminals 本体設定 group は ~/.vk-terminals/config.json を直接指す', () => {
-  const desc = buildSettingsDescriptor('/tmp/config.json');
-  const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
-  assert.ok(group);
-  assert.equal(group.targetPath, '~/.vk-terminals/config.json');
-  assert.deepEqual(
-    group.fields.map((field) => field.key),
-    [
-      'apiHost',
-      'port',
-      'initialCommand',
-      'additionalPanes',
-      'newPaneAutoLaunchClaude',
-      'newPaneStartupDir',
-    ],
-  );
-  assert.equal(group.fields.find((field) => field.key === 'port').type, 'number');
-  assert.match(group.fields.find((field) => field.key === 'port').help, /本体/);
-  assert.equal(group.fields.find((field) => field.key === 'additionalPanes').type, 'json');
-  assert.equal(group.fields.find((field) => field.key === 'newPaneAutoLaunchClaude').type, 'boolean');
-  assert.equal(group.fields.find((field) => field.key === 'newPaneAutoLaunchClaude').default, false);
-  assert.equal(group.fields.find((field) => field.key === 'newPaneStartupDir').type, 'text');
+test('buildSettingsDescriptor: VK Terminals 本体設定は settings-schema.json 由来フィールドと port を表示する', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+    assert.ok(group);
+    assert.equal(group.tab, 'terminals');
+    assert.equal(group.targetPath, '~/.vk-terminals/config.json');
+    assert.match(group.note, /VK Terminals 本体の設定ファイル/);
+    assert.deepEqual(
+      group.fields.map((field) => field.key),
+      ['apiHost', 'port', 'initialCommand', 'confirmClose', 'gpu'],
+    );
+    assert.equal(group.fields.find((field) => field.key === 'port').type, 'number');
+    assert.match(group.fields.find((field) => field.key === 'port').help, /13847/);
+    assert.equal(group.fields.find((field) => field.key === 'confirmClose').type, 'select');
+    assert.deepEqual(group.fields.find((field) => field.key === 'confirmClose').options, [{ value: 'busy', label: '実行中のみ確認' }]);
+  });
 });
 
-test('buildSettingsDescriptor: VK Terminals 起動オプションは GPU だけ orchestrator config 側に残す', () => {
-  const desc = buildSettingsDescriptor('/tmp/orchestrator-config.json');
-  const terminalConfigGroup = desc.groups.find((g) => g.targetPath === '~/.vk-terminals/config.json');
-  const launchGroup = desc.groups.find((g) => g.label === 'VK Terminals 起動オプション（オーケストレーター制御）');
-  assert.ok(terminalConfigGroup);
-  assert.ok(launchGroup);
-  assert.equal(launchGroup.targetPath, undefined);
-  assert.match(launchGroup.note, /orchestrator が VK Terminals を起動する際/);
-  assert.match(launchGroup.note, /API ホストと API ポート/);
-  const terminalKeys = terminalConfigGroup.fields.map((field) => field.key);
-  const launchKeys = launchGroup.fields.map((field) => field.key);
-  assert.deepEqual(launchKeys, ['vkTerminals.gpu']);
-  assert.equal(terminalKeys.includes('port'), true);
-  assert.equal(terminalKeys.includes('vkTerminals.port'), false);
-  assert.equal(terminalKeys.includes('vkTerminals.gpu'), false);
-  assert.equal(terminalKeys.includes('vkTerminals.host'), false);
+test('buildSettingsDescriptor: VK Terminals スキーマ側に port があれば追加挿入しない', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture([{
+    label: '基本',
+    fields: [
+      { key: 'apiHost', label: 'API ホスト', type: 'text' },
+      { key: 'port', label: '本体側 API ポート', type: 'number', help: 'VK Terminals 側の定義' },
+      { key: 'initialCommand', label: '初期コマンド', type: 'text' },
+    ],
+  }]), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+    assert.deepEqual(group.fields.map((field) => field.key), ['apiHost', 'port', 'initialCommand']);
+    assert.equal(group.fields.filter((field) => field.key === 'port').length, 1);
+    assert.equal(group.fields.find((field) => field.key === 'port').label, '本体側 API ポート');
+    assert.equal(group.fields.find((field) => field.key === 'port').help, 'VK Terminals 側の定義');
+  });
+});
+
+test('buildSettingsDescriptor: VK Terminals スキーマが複数グループなら group label を suffix にする', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture([
+    {
+      label: '基本',
+      fields: [
+        { key: 'apiHost', label: 'API ホスト', type: 'text' },
+        { key: 'initialCommand', label: '初期コマンド', type: 'text' },
+      ],
+    },
+    {
+      label: '表示',
+      fields: [
+        { key: 'showUsage', label: '使用量表示', type: 'boolean' },
+      ],
+    },
+  ]), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const terminalGroups = desc.groups.filter((g) => g.targetPath === '~/.vk-terminals/config.json');
+    assert.deepEqual(
+      terminalGroups.map((group) => group.label),
+      ['VK Terminals（本体設定）: 基本', 'VK Terminals（本体設定）: 表示'],
+    );
+    assert.deepEqual(terminalGroups[0].fields.map((field) => field.key), ['apiHost', 'port', 'initialCommand']);
+    assert.deepEqual(terminalGroups[1].fields.map((field) => field.key), ['showUsage']);
+  });
+});
+
+test('buildSettingsDescriptor: apiHost がないスキーマでは port を先頭へ挿入する', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture([{
+    label: '基本',
+    fields: [
+      { key: 'initialCommand', label: '初期コマンド', type: 'text' },
+      { key: 'gpu', label: 'GPU モード', type: 'select', options: [] },
+    ],
+  }]), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+    assert.deepEqual(group.fields.map((field) => field.key), ['port', 'initialCommand', 'gpu']);
+  });
+});
+
+test('buildSettingsDescriptor: hiddenKeys 指定時は該当フィールドだけ除外し、全除外グループは出さない', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture([
+    {
+      label: '基本',
+      fields: [
+        { key: 'apiHost', label: 'API ホスト', type: 'text' },
+        { key: 'initialCommand', label: '初期コマンド', type: 'text' },
+      ],
+    },
+    {
+      label: '表示',
+      fields: [
+        { key: 'showUsage', label: '使用量表示', type: 'boolean' },
+      ],
+    },
+  ]), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', {
+      vkTerminalsDir,
+      hiddenKeys: ['initialCommand', 'showUsage'],
+    });
+    const terminalGroups = desc.groups.filter((g) => g.targetPath === '~/.vk-terminals/config.json');
+    assert.deepEqual(terminalGroups.map((group) => group.label), ['VK Terminals（本体設定）: 基本']);
+    assert.deepEqual(terminalGroups[0].fields.map((field) => field.key), ['apiHost', 'port']);
+  });
+});
+
+test('buildSettingsDescriptor: hiddenKeys で全フィールド除外でも port のみの VK Terminals 本体設定グループを残す', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    try {
+      console.warn = (message) => warnings.push(message);
+      const desc = buildSettingsDescriptor('/tmp/config.json', {
+        vkTerminalsDir,
+        hiddenKeys: ['apiHost', 'initialCommand', 'confirmClose', 'gpu'],
+      });
+      const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+      assert.ok(group);
+      assert.equal(group.targetPath, '~/.vk-terminals/config.json');
+      assert.deepEqual(group.fields.map((field) => field.key), ['port']);
+      assert.ok(warnings.some((message) => /表示可能.*port.*のみ表示/.test(message)));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('buildSettingsDescriptor: settings-schema.json の groups が空配列なら port のみ表示する', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture([]), (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    try {
+      console.warn = (message) => warnings.push(message);
+      const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+      const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+      assert.ok(group);
+      assert.equal(group.targetPath, '~/.vk-terminals/config.json');
+      assert.deepEqual(group.fields.map((field) => field.key), ['port']);
+      assert.ok(warnings.some((message) => /表示可能.*port.*のみ表示/.test(message)));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('buildSettingsDescriptor: settings-schema.json が無い場合は warn して port のみ表示する', () => {
+  withTmpDir('vko-vk-terminals-empty-', (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    try {
+      console.warn = (message) => warnings.push(message);
+      const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+      const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+      assert.ok(group);
+      assert.deepEqual(group.fields.map((field) => field.key), ['port']);
+      const allKeys = desc.groups.flatMap((g) => (g.fields ?? []).map((field) => field.key));
+      assert.equal(allKeys.includes('apiHost'), false);
+      assert.equal(allKeys.includes('initialCommand'), false);
+      assert.equal(allKeys.includes('additionalPanes'), false);
+      assert.equal(allKeys.includes('newPaneAutoLaunchClaude'), false);
+      assert.equal(allKeys.includes('vkTerminals.gpu'), false);
+      assert.equal(desc.groups.some((g) => g.label === 'VK Terminals 起動オプション（オーケストレーター制御）'), false);
+      assert.ok(warnings.some((message) => /port.*のみ表示/.test(message)));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('buildSettingsDescriptor: settings-schema.json が不正 JSON または構造不正でも port のみ表示する', () => {
+  for (const schemaText of ['{', JSON.stringify({ groups: [{ label: '基本', fields: [{ key: 'apiHost', label: 'API ホスト' }] }] })]) {
+    withTmpDir('vko-vk-terminals-invalid-', (vkTerminalsDir) => {
+      writeFileSync(join(vkTerminalsDir, 'settings-schema.json'), schemaText);
+      const savedWarn = console.warn;
+      const warnings = [];
+      try {
+        console.warn = (message) => warnings.push(message);
+        const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+        const group = desc.groups.find((g) => g.label === 'VK Terminals（本体設定）');
+        assert.ok(group);
+        assert.deepEqual(group.fields.map((field) => field.key), ['port']);
+        assert.ok(warnings.some((message) => /settings-schema\.json/.test(message)));
+      } finally {
+        console.warn = savedWarn;
+      }
+    });
+  }
 });
 
 test('buildSettingsDescriptor: vk-agents group は正本リゾルバ（env 上書き）を targetPath に持つ', () => {
@@ -1812,30 +2121,99 @@ test('defaultGpuMode: macOS は default、それ以外は off', () => {
 
 test('getVkTerminalsGpuMode: 未設定はプラットフォーム既定にフォールバック', () => {
   withoutGpuEnv(() => {
-    assert.equal(getVkTerminalsGpuMode({}, 'linux'), 'off');
-    assert.equal(getVkTerminalsGpuMode({}, 'darwin'), 'default');
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'linux'), 'off');
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'darwin'), 'default');
+    });
   });
 });
 
-test('getVkTerminalsGpuMode: config.json の値を採用する', () => {
+test('getVkTerminalsGpuMode: VK Terminals 本体 config.json の gpu を採用する', () => {
   withoutGpuEnv(() => {
-    assert.equal(getVkTerminalsGpuMode({ vkTerminals: { gpu: 'off' } }, 'darwin'), 'off');
-    // 大文字・前後空白は正規化する
-    assert.equal(getVkTerminalsGpuMode({ vkTerminals: { gpu: '  Default ' } }, 'linux'), 'default');
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      const configDir = join(homeDir, '.vk-terminals');
+      mkdirSync(configDir, { recursive: true });
+      const configPath = join(configDir, 'config.json');
+
+      writeFileSync(configPath, JSON.stringify({ gpu: 'off' }));
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'darwin'), 'off');
+
+      // 大文字・前後空白は正規化する
+      writeFileSync(configPath, JSON.stringify({ gpu: '  Default ' }));
+      assert.equal(getVkTerminalsGpuMode({ configPath }, 'linux'), 'default');
+    });
   });
 });
 
-test('getVkTerminalsGpuMode: 未知の値は既定にフォールバックする', () => {
+test('getVkTerminalsGpuMode: null / 空文字はプラットフォーム既定にフォールバックする', () => {
   withoutGpuEnv(() => {
-    assert.equal(getVkTerminalsGpuMode({ vkTerminals: { gpu: 'turbo' } }, 'linux'), 'off');
-    assert.equal(getVkTerminalsGpuMode({ vkTerminals: { gpu: '' } }, 'darwin'), 'default');
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      const configDir = join(homeDir, '.vk-terminals');
+      mkdirSync(configDir, { recursive: true });
+      const configPath = join(configDir, 'config.json');
+
+      writeFileSync(configPath, JSON.stringify({ gpu: null }));
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'linux'), 'off');
+
+      writeFileSync(configPath, JSON.stringify({ gpu: '' }));
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'darwin'), 'default');
+    });
+  });
+});
+
+test('getVkTerminalsGpuMode: 未知の値は warn して既定にフォールバックする', () => {
+  withoutGpuEnv(() => {
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      const configDir = join(homeDir, '.vk-terminals');
+      mkdirSync(configDir, { recursive: true });
+      const configPath = join(configDir, 'config.json');
+      writeFileSync(configPath, JSON.stringify({ gpu: 'turbo' }));
+
+      const savedWarn = console.warn;
+      const warnings = [];
+      try {
+        console.warn = (message) => warnings.push(message);
+        assert.equal(getVkTerminalsGpuMode({ homeDir }, 'linux'), 'off');
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /未知の GPU モード "turbo"/);
+      } finally {
+        console.warn = savedWarn;
+      }
+    });
   });
 });
 
 test('getVkTerminalsGpuMode: env VK_TERMINALS_GPU が config.json より優先される', () => {
   withoutGpuEnv(() => {
-    process.env.VK_TERMINALS_GPU = 'default';
-    assert.equal(getVkTerminalsGpuMode({ vkTerminals: { gpu: 'off' } }, 'linux'), 'default');
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      const configDir = join(homeDir, '.vk-terminals');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ gpu: 'off' }));
+      process.env.VK_TERMINALS_GPU = 'default';
+      assert.equal(getVkTerminalsGpuMode({ homeDir }, 'linux'), 'default');
+    });
+  });
+});
+
+test('getVkTerminalsGpuMode: config 読み込み失敗時は warn して既定にフォールバックする', () => {
+  withoutGpuEnv(() => {
+    withTmpDir('vko-vk-terminals-home-', (homeDir) => {
+      const configDir = join(homeDir, '.vk-terminals');
+      mkdirSync(configDir, { recursive: true });
+      const configPath = join(configDir, 'config.json');
+      writeFileSync(configPath, '{');
+
+      const savedWarn = console.warn;
+      const warnings = [];
+      try {
+        console.warn = (message) => warnings.push(message);
+        assert.equal(getVkTerminalsGpuMode({ homeDir }, 'linux'), 'off');
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /既定 GPU モード "off"/);
+      } finally {
+        console.warn = savedWarn;
+      }
+    });
   });
 });
 
@@ -1855,19 +2233,18 @@ test('GPU_MODES: 取りうる値の一覧（off / default の2択）', () => {
   assert.deepEqual(GPU_MODES, ['off', 'default']);
 });
 
-test('buildSettingsDescriptor: VK Terminals グループに GPU モードの制約付きピッカーがある', () => {
-  const desc = buildSettingsDescriptor('/tmp/config.json');
-  const gpuField = desc.groups
-    .flatMap((g) => g.fields ?? [])
-    .find((f) => f.key === 'vkTerminals.gpu');
-  assert.ok(gpuField);
-  // 自由入力ではなく選択式（enum ピッカー）であること。
-  assert.equal(gpuField.type, 'select');
-  const optionValues = (gpuField.options ?? []).map((o) => o.value);
-  // 空（自動）＋ getVkTerminalsGpuMode が受理する各モードが選択肢に含まれること。
-  assert.deepEqual(optionValues, ['', 'off', 'default']);
-  // 選択肢の値は空文字を除き GPU_MODES に一致する（silent な不正値を防ぐ）。
-  for (const v of optionValues) {
-    if (v !== '') assert.ok(GPU_MODES.includes(v), `未知のモード: ${v}`);
-  }
+test('buildSettingsDescriptor: VK Terminals スキーマ由来の GPU モードピッカーが本体設定グループにある', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const gpuField = desc.groups
+      .flatMap((g) => g.fields ?? [])
+      .find((f) => f.key === 'gpu');
+    assert.ok(gpuField);
+    assert.equal(gpuField.type, 'select');
+    const optionValues = (gpuField.options ?? []).map((o) => o.value);
+    assert.deepEqual(optionValues, ['', 'off']);
+    for (const v of optionValues) {
+      if (v !== '') assert.ok(GPU_MODES.includes(v), `未知のモード: ${v}`);
+    }
+  });
 });

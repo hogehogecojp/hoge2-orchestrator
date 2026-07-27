@@ -1,13 +1,30 @@
-> **注意:** このファイルは https://github.com/vektor-inc/vk-agents で管理されています。内容を変更する場合は、このファイルを直接編集せず、元リポジトリの方で変更してください。
+> **注意:** このファイルは vk-agents-public（vk-agents からの複製）です。直接編集しないでください。改善要望は https://github.com/vektor-inc/vk-orchestrator/issues へお願いします。
 
 # Agent worktree のルール
 
-`Agent` ツールの `isolation: "worktree"` で実装作業を行う際のルールと既知の罠。
+`Agent` ツールの `isolation: "worktree"` で実装作業する際のルールと既知の罠。
 
 ## いつ worktree を使うか
 
 - 実装を伴う長時間タスク（/vk-kore など）でサブエージェントを起動する場合は、`isolation: "worktree"` を指定すること。メインのワーキングツリーを直接変更すると、ユーザーや他エージェントの並行作業と競合するため
-- 読み取りだけのタスク（調査・レビュー）には不要
+- 読み取りだけのタスク（調査・レビュー）では不要
+
+## Codex 経路の worktree 標準パス
+
+司が `git worktree add` で作る worktree（staff-wp-dev の Codex 起動用）は、`<repo>/.claude/worktrees/<英数字名>` に作ること。
+
+- orchestrator のクリーンアップは `/.claude/worktrees/` マーカーでリポジトリルートを推測する。任意パスの worktree では automerge 後の掃除が空振りする
+- `<英数字名>` は Team エージェントの name と同じく英数字にする
+
+## task-queue 管理タスクの worktree パス記録
+
+worktree を作成したら（エンジン問わず）、**作成直後に** `$VK_AGENTS_DIR/scripts/update-task-state.sh <メタissue番号> <worktree絶対パス>` を実行し、`~/.task-queue/state.json` に worktree 絶対パスを記録する。
+
+- メタ issue 番号は **vk-kore 4-8b の必須検証（authorAssociation・URL 形式・owner 照合）を通したもののみ** 使う。未検証の番号で別タスクのエントリを汚染しない
+- 「作成直後」に記録する理由は、wpPort=null タスクでは orchestrator の並行書き込み源が実質 waiting-input 転送時のみで、早期書き込みがレース窓を最小化するため。wpPort の有無で分岐せず無条件に記録してよい。wpPort ありでも orchestrator の snapshot と同値に収束するため無害
+- **claude エンジン経路（Agent isolation:"worktree"）**: worktree パスはハーネスが自動生成するため、サブエージェントへの依頼文に「最終報告に自分の worktree 絶対パス（`git rev-parse --show-toplevel` の結果）を含めること」を明記し、司が報告を受けてから同スクリプトで記録する
+- task-queue 経由でない手動実行では state.json にエントリが無く、スクリプトが自動で no-op になる。気にせず実行してよい
+- branch は記録しない。orchestrator はマージ検知時に PR の headRefName を使うため dead data になる
 
 ## 罠1: worktree はデフォルトブランチから切られる
 
@@ -19,7 +36,7 @@
 
 ## 罠2: wp-env のマウント名が worktree ディレクトリ名になる
 
-worktree 内で wp-env を起動すると、コンテナ内のプラグインフォルダが **worktree ディレクトリ名（例: `agent-ac1fb506bfdbf8271`）** でマウントされる。
+wp-env を worktree 内で起動すると、コンテナ内のプラグインフォルダが **worktree ディレクトリ名（例: `agent-ac1fb506bfdbf8271`）** でマウントされる。
 
 - `package.json` の scripts が `--env-cwd='wp-content/plugins/<本来のプラグイン名>'` をハードコードしている場合、パス不一致で chdir エラーになり `npm run phpunit` 等が落ちる
 - worktree でテスト系コマンドを実行するエージェントには、`--env-cwd='wp-content/plugins/<worktreeディレクトリ名>'` を明示するよう事前に伝えること

@@ -1,0 +1,82 @@
+name: Deploy release zip to VWS
+
+on:
+  push:
+    tags:
+      # GitHub Actions tag filters are glob patterns. This narrows candidates;
+      # the first step below enforces the exact vX.Y.Z release tag format.
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-release-vws-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy_vws:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release tag
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release deploy is only allowed for vX.Y.Z tags: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install production dependencies
+        run: npm ci --omit=optional
+
+      - name: Build release package
+        run: |
+          rm -rf dist/vk-orchestrator dist/vk-orchestrator.zip
+          mkdir -p dist/vk-orchestrator
+
+          cp -R bin src scripts vendor node_modules dist/vk-orchestrator/
+          cp package.json package-lock.json README.md .node-version dist/vk-orchestrator/
+
+          cat > dist/vk-orchestrator/HOW-TO-RUN.md <<'EOF'
+          # VK Orchestrator release package
+
+          解凍後、次のコマンドで起動します。
+
+          ```sh
+          cd vk-orchestrator
+          npm start
+          ```
+
+          初回 `npm start` (`up`) 時に vk-terminals を自動取得します。vk-terminals は electron ベースで、GUI は macOS 専用です。初回取得にはネットワーク接続が必要です。
+
+          設定は `~/.vk-orchestrator/config.json` / `~/.vk-agents/config.json` 等に保存されます。詳細は `README.md` を参照してください。
+          EOF
+
+          (cd dist && zip -r vk-orchestrator.zip vk-orchestrator)
+
+      - name: Smoke test release package
+        run: |
+          cd dist/vk-orchestrator
+          node bin/vk-orchestrator.js doctor --json
+
+      # DEPLOY_PATH_VWS はディレクトリ想定（vk-blocks-pro と同じ場所に `vk-orchestrator.zip` を置く）。
+      # ファイルパス指定だった場合は要調整。
+      - name: Deploy release package to VWS
+        uses: burnett01/rsync-deployments@2651e3eecb4ea772cbe952695d04952e92027b4f # v5.2.1
+        with:
+          switches: -avzr
+          path: dist/vk-orchestrator.zip
+          remote_path: ${{ secrets.DEPLOY_PATH_VWS }}
+          remote_host: ${{ secrets.DEPLOY_HOST_VWS }}
+          remote_port: ${{ secrets.DEPLOY_PORT_VWS }}
+          remote_user: ${{ secrets.DEPLOY_USER_VWS }}
+          remote_key: ${{ secrets.DEPLOY_KEY_VWS }}
+          remote_key_pass: ${{ secrets.DEPLOY_KEYPASS_VWS }}

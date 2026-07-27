@@ -7,11 +7,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, '..', '..', '.env') });
 
 import { GitHubClient } from '../github/index.js';
+import { LocalQueueClient } from '../local-queue/index.js';
 import {
   GITHUB_TOKEN_RESOLUTION_HELP,
   ensureGitHubToken,
+  getQueueBackend,
   getTaskConfig,
   getTaskCwd,
+  isCoderabbitEnabled,
+  loadUnifiedConfig,
+  resolveVkAgentsConfigPath,
+  resolveVkTerminalsApiHost,
   resolveVkTerminalsApiPort,
 } from '../config.js';
 import {
@@ -21,6 +27,7 @@ import {
   postMenu,
   setExternalWaiting,
   setOwnPaneTitle,
+  reconfirmBodyEcho,
   setTerminalPrUrl,
   setTerminalTitle,
   submitToClaude,
@@ -30,15 +37,27 @@ import { recordTaskStart, updateTask, removeTask, getTask, getAllTasks } from '.
 import { cleanupForIssue, formatCleanupSummary, inspectWorktreeByPort } from './cleanup.js';
 import { canTransitionToDone as canTransitionToDoneImpl } from './done-gate.js';
 import { closeSourceIssueBeforeGate as closeSourceIssueBeforeGateImpl } from './source-close.js';
-import { handlePaneMissing, normalizeResumeMax } from './pane-resume.js';
-import { decideInProgressAction } from './in-progress-decision.js';
+import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from './pane-resume.js';
+import { decideInProgressAction, needsReviewGate } from './in-progress-decision.js';
+import { selectAutomergeCandidates } from './automerge-candidates.js';
+import { resolveWaitingMergeAction } from './waiting-merge-action.js';
 import { createScanInProgressMergedHandler } from './scan-in-progress-merged.js';
+import { createPrLessParentDoneHandler } from './pr-less-parent-done.js';
+import { createReconcileOrphanedMergedTasks } from './reconcile-orphaned-merged.js';
 import { findReplyAfterWaitingInput, hasAgentAnsweredAfterWaitingInput } from './decision-record.js';
 import { startKeepAwake } from '../power/keep-awake.js';
 import { createNotifyPaneMerged } from './notify-pane-merged.js';
 import { createWaitingMarkerScanner } from './waiting-marker-scanner.js';
+import { createCommandsFileProcessor, startCommandsFileWatcher } from './commands-file.js';
 import { installPersistentConsoleLogger } from './persistent-logger.js';
 import { createStartLock } from './start-lock.js';
+import { dispatchReadyIssues } from './ready-dispatch.js';
+import { writeAgentRulesHandoff } from './agentRulesHandoff.js';
+import { formatErrorSummary } from './format-error.js';
+import { refreshTasksSnapshots } from './tasks-view.js';
+import { resolveRepoCwd } from './resolve-repo-cwd.js';
+import { isLocalMachineHost } from './local-machine-host.js';
+import { hasGitHubIntegration, disabledGitHubFeatures } from './github-capability.js';
 // コマンド組み立て・ポート割り当て・テンプレート展開は副作用の無い純粋関数として
 // build-command.js に分離してある（テストから安全に import するため）。ここでは
 // 内部利用のために import しつつ、後段で再 export して index.js からも参照可能にする。
@@ -74,6 +93,14 @@ const PANE_MISSING_TICKS = 2;
 // させる。素の Number() のままだと "abc" → NaN で上限判定が常に false になり、
 // 無限リトライ防止が沈黙のうちに無効化されるため必ず健全化を通す。
 const PANE_RESUME_MAX    = normalizeResumeMax(process.env.PANE_RESUME_MAX ?? 3);
+// Claude Code の TUI 起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。
+// コールドスタート・高負荷時は起動バナーの描画（churn）が長引き、旧既定 15 秒では
+// 静止を確認できず描画中の窓へ本文を送って取りこぼす（#172）。既定 45 秒に広げる。
+const CLAUDE_READY_TIMEOUT_MS = Number(process.env.CLAUDE_READY_TIMEOUT_MS ?? 45_000);
+// submitToClaude の本文送信後の基準待機時間（linear backoff の 1 単位）と本文/Enter の
+// 最大再送回数。バナー churn を跨いでエコーを確認できるよう既定を 500→1000 / 2→3 に広げる（#172）。
+const CLAUDE_SUBMIT_DELAY_MS   = Number(process.env.CLAUDE_SUBMIT_DELAY_MS ?? 1000);
+const CLAUDE_SUBMIT_MAX_RETRIES = Number(process.env.CLAUDE_SUBMIT_MAX_RETRIES ?? 3);
 const RUN_ONCE           = process.argv.includes('--once');
 installPersistentConsoleLogger();
 
@@ -93,18 +120,36 @@ function readArgValue(name) {
 // なし / 空は安全側として何も拾わず、全件対象にする場合は "all" を明示する。
 const ASSIGNEE_FILTER = readArgValue('assignee') ?? process.env.ASSIGNEE_FILTER ?? null;
 
+const queueBackend = getQueueBackend();
+
+// トークン未解決時の分岐（#157: capability フラグの初適用 / #138 方針5）。
+// - GitHub モード         : 従来どおりトークン必須（未解決なら exit。挙動不変）。
+// - ローカルモード × 無し : process.exit せず、GitHub 連携無効の純ローカルタスク専用で続行。
+//                           何が無効になるか（source import / PR 監視 / automerge / 対象 issue 操作）を警告に明示する。
+// - ローカルモード × 有り : フル capability（挙動不変）。
 if (!GITHUB_TOKEN) {
-  console.error(`[Error] ${GITHUB_TOKEN_RESOLUTION_HELP}`);
-  process.exit(1);
+  if (queueBackend === 'local') {
+    console.warn('[warn] GITHUB_TOKEN を解決できませんでした。ローカルモード（queue.backend: local）のため純ローカルタスク専用で起動します。');
+    console.warn(`[warn] GitHub 連携が無効のため次の機能はスキップされます: ${disabledGitHubFeatures().join(' / ')}。`);
+    console.warn(`[warn] GitHub 連携を有効化するには: ${GITHUB_TOKEN_RESOLUTION_HELP}`);
+  } else {
+    console.error(`[Error] ${GITHUB_TOKEN_RESOLUTION_HELP}`);
+    process.exit(1);
+  }
 }
 
-const github = new GitHubClient({
+const QueueClient = queueBackend === 'local' ? LocalQueueClient : GitHubClient;
+const github = new QueueClient({
   token: GITHUB_TOKEN,
   owner: GITHUB_OWNER,
   repo:  GITHUB_REPO,
   assignee: ASSIGNEE_FILTER,
   queueLabel: QUEUE_LABEL,
 });
+
+// GitHub 連携 capability。クライアント自身が宣言した値を単一の真実の源にする。
+// トークン無しローカルモードのときだけ false になり、GitHub 依存処理を早期 return でスキップする。
+const GITHUB_INTEGRATION = hasGitHubIntegration(github);
 
 function formatAssigneeMode(client) {
   if (!client.pickupEnabled) return '(なし・拾わない)';
@@ -118,6 +163,64 @@ function formatAssigneeMode(client) {
 // status:in-progress ラベル反映前に並行 loop が同じ ready issue を fetch した場合の
 // レースを抑えるために残す。
 const inFlightIssues = new Set();
+
+function getWorkspaceSearchPaths() {
+  const configPath = resolveVkAgentsConfigPath();
+  if (!configPath) return [];
+  try {
+    const config = loadUnifiedConfig(configPath);
+    const searchPaths = config?.workspace?.search_paths;
+    if (!Array.isArray(searchPaths)) return [];
+    return searchPaths.filter((path) => typeof path === 'string' && path.trim() !== '');
+  } catch (err) {
+    console.warn(`  [task-cwd] vk-agents config の読み込み失敗（検出をスキップ）: ${err.message}`);
+    return [];
+  }
+}
+
+function resolveTaskPaneCwd(issue, target) {
+  const fallback = () => getTaskCwd();
+  const envTaskCwd = String(process.env.TASK_CWD ?? '').trim();
+  if (envTaskCwd !== '') {
+    const cwd = fallback();
+    console.log(`  [task-cwd] TASK_CWD env を使用: ${cwd}`);
+    return cwd;
+  }
+
+  const apiHost = resolveVkTerminalsApiHost();
+  if (!isLocalMachineHost(apiHost)) {
+    const cwd = fallback();
+    console.log(`  [task-cwd] VK Terminals host=${apiHost} は別マシン（このマシンのアドレスに一致せず）のため検出をスキップし、安全既定を使用: ${cwd}`);
+    return cwd;
+  }
+
+  if (target.isSelf) {
+    const cwd = fallback();
+    console.log(`  [task-cwd] issue #${issue.number} は対象リポジトリ未特定のため安全既定を使用: ${cwd}`);
+    return cwd;
+  }
+
+  const searchPaths = getWorkspaceSearchPaths();
+  if (searchPaths.length === 0) {
+    const cwd = fallback();
+    console.log(`  [task-cwd] workspace.search_paths 未設定のため安全既定を使用: ${cwd}`);
+    return cwd;
+  }
+
+  const detected = resolveRepoCwd({
+    owner: target.owner,
+    repo: target.repo,
+    searchPaths,
+  });
+  if (detected) {
+    console.log(`  [task-cwd] ${target.owner}/${target.repo} のローカルクローンを検出: ${detected}`);
+    return detected;
+  }
+
+  const cwd = fallback();
+  console.log(`  [task-cwd] ${target.owner}/${target.repo} のローカルクローン未検出のため安全既定を使用: ${cwd}`);
+  return cwd;
+}
 
 // issue の本文・タイトルから作業対象リポジトリのキー（"owner/repo"）を抽出する。
 // GitHub issue URL を含まない汎用タスクは null（＝他と干渉しない独立タスクとして扱う）。
@@ -238,6 +341,38 @@ const handleScanInProgressMerged = createScanInProgressMergedHandler({
   logger: console,
 });
 
+const handlePrLessParentDone = createPrLessParentDoneHandler({
+  getSubIssueStates: github.listSubIssueStates.bind(github),
+  completeIssue: (issue) => handleScanInProgressMerged(issue, null, {
+    completionComment: '✅ 完了\n\n全サブ issue が完了しました。',
+    logMessage: `  [scan-in-progress] issue #${issue.number}: PR なし親調整 issue の全 sub-issue closed → done`,
+  }),
+  logger: console,
+});
+
+// state.json 残骸の掃除は毎ループのエントリ数分だけメタ issue を読む。
+// GitHub API のリトライが積み上がると watch ループ全体を詰まらせるため単発試行にする。
+function getMetaIssue(issueNumber) {
+  return github.getIssueState(GITHUB_OWNER, GITHUB_REPO, issueNumber, { retryDelays: [] });
+}
+
+const commandsFileProcessor = createCommandsFileProcessor({
+  github,
+  getMetaIssue,
+  logger: console,
+});
+
+const reconcileOrphanedMergedTasks = createReconcileOrphanedMergedTasks({
+  getAllTasks,
+  getMetaIssue,
+  extractPRUrlFromIssueBody: (...args) => github.extractPRUrlFromIssueBody(...args),
+  parsePRUrl: (...args) => github.parsePRUrl(...args),
+  getPRState: (...args) => github.getPRState(...args),
+  notifyPaneMerged,
+  removeTask,
+  logger: console,
+});
+
 const scanWaitingMarkers = createWaitingMarkerScanner({
   fetchWaitingInputIssues: () => github.fetchWaitingInputIssues(),
   getStates,
@@ -253,7 +388,7 @@ const scanWaitingMarkers = createWaitingMarkerScanner({
 // 何度呼んでも重複しない。送信失敗は警告のみで握りつぶし、dispatch を止めない。
 async function syncOrchestratorMenu() {
   try {
-    const section = buildOrchestratorMenu({ owner: GITHUB_OWNER, repo: GITHUB_REPO });
+    const section = buildOrchestratorMenu();
     await postMenu(VK_PORT, section);
   } catch (err) {
     console.log(`[warn] VK Terminals サイドバーメニューの更新に失敗しました: ${err.message}`);
@@ -271,10 +406,12 @@ async function syncOrchestratorMenu() {
 async function startTask(issue) {
   const { number, title, body } = issue;
   console.log(`\n[Task #${number}] "${title}" を起動`);
+  const resolved = resolveTarget(issue);
+  const taskPaneCwd = resolveTaskPaneCwd(issue, resolved);
 
   let termId;
   try {
-    termId = await createNewPane(VK_PORT, getTaskCwd());
+    termId = await createNewPane(VK_PORT, taskPaneCwd);
     console.log(`  → 新規ペイン作成 (termId: ${termId})`);
   } catch (err) {
     console.error(`  新規ペイン作成失敗: ${err.message}`);
@@ -285,7 +422,6 @@ async function startTask(issue) {
   // task-queue のメタ issue 本文に元の作業対象 issue の URL が含まれていれば、
   // その元 issue のタイトル・リンクをヘッダーに出す（issue #23）。解決できない汎用タスクや
   // 元 issue の取得失敗時は従来どおりメタ issue のタイトル・リンクにフォールバックする。
-  const resolved = resolveTarget(issue);
   let resolvedTarget = null;
   if (!resolved.isSelf) {
     // ペインタイトルは付随処理（cosmetic）なので、取得に失敗してもメタ issue へ
@@ -321,7 +457,7 @@ async function startTask(issue) {
   // wp-env 連携の ON/OFF を解決する（設定で明示があればそれ、無ければ対象リポの
   // `.wp-env.json` 有無で自動判定）。結果を buildCommand に渡してポート割り当て・
   // {wpPort} 展開・クリーンアップ用 wpPort 保存の要否を決める。
-  const wpEnvEnabled = await resolveWpEnvEnabled(issue);
+  const wpEnvEnabled = await resolveWpEnvEnabled(issue, resolved);
   let reservedPorts = new Set();
   if (wpEnvEnabled) {
     try {
@@ -371,22 +507,99 @@ async function startTask(issue) {
   // Claude Code の TUI 起動完了を待ってから送信する。コールドスタートや高負荷時に
   // 入力欄が現れる前に本文を送ると取りこぼす可能性があるため（#127 の残存リスク対策）。
   // タイムアウトしても従来どおり送信は試みる（waitForClaudeReady の戻り値で警告のみ出す）。
-  const ready = await waitForClaudeReady(VK_PORT, termId);
+  const ready = await waitForClaudeReady(VK_PORT, termId, { readyTimeoutMs: CLAUDE_READY_TIMEOUT_MS });
   if (!ready) {
     console.warn(`  [ready] Claude 起動完了を確認できませんでした。送信を試みます (termId=${termId})`);
   }
 
   console.log(`  → terminal #${termId} に送信`);
-  const sent = await submitToClaude(VK_PORT, termId, prompt);
+  const sent = await submitToClaude(
+    VK_PORT, termId, prompt, CLAUDE_SUBMIT_DELAY_MS, { maxRetries: CLAUDE_SUBMIT_MAX_RETRIES }
+  );
   if (sent?.bodyConfirmed === false) {
     // 本文再送を規定回数使い切ってもエコーを確認できなかった＝本文が入力欄に
-    // 届いていない可能性がある。プロセスは落とさず（graceful degradation）、
-    // 取りこぼしに気づけるよう明確な警告だけ出す（#4 の握りつぶし防止）。
+    // 届いていない可能性がある。ここで in-progress のまま放置すると、ラベルだけ
+    // in-progress・ペインは空プロンプトのまま詰まる（#172）。status:ready へ戻して
+    // 自動再ディスパッチし、次ループで拾い直させる。
+
+    // 偽陽性ガード: bodyConfirmed=false はエコー確認の偽陽性があり得るため、
+    // ロールバック（再ディスパッチ）を発動する直前に states を取り直して一度だけ
+    // 再確認する。ここで積極的にエコーを確認できたら実際には届いているので通常どおり
+    // 成功扱いにする。reconfirmBodyEcho は throw せず、states 取得失敗は例外ではなく
+    // 戻り値 false（fail-closed）で表す契約なので、ここでは try/catch で包まない。
+    const echoedNow = await reconfirmBodyEcho(VK_PORT, termId, prompt);
+    if (echoedNow) {
+      console.warn(
+        `  [submit] 本文エコーを再確認できたため再ディスパッチしません (issue #${number}, termId=${termId})`
+      );
+      return true;
+    }
+
     console.warn(
-      `  [submit] 本文が入力欄に届いていない可能性があります (issue #${number}, termId=${termId})`
+      `  [submit] 本文が入力欄に届いていない可能性があります。status:ready へ戻して自動再ディスパッチします (issue #${number}, termId=${termId})`
     );
+    return await rollbackUndeliveredBody(issue, termId, wpPort, '本文が入力欄に届いていない可能性があります');
   }
   return true;
+}
+
+/**
+ * 「タスク本文をペインへ届けられなかった」ときのロールバック（status:ready へ戻して再ディスパッチ）。
+ *
+ * 呼び出し元は submitToClaude が bodyConfirmed=false を返した経路（#172）。新しいロールバック
+ * 機構を作らず handleUndeliveredBody（handlePaneMissing と同じコア）に相乗りする。
+ * startTask 本体から切り出しているのは、同じ「本文をペインへ届けられなかった」状況を扱う
+ * 経路が今後増えても、resumeCount による上限判定（state レコードを取れないときは
+ * 再ディスパッチしない安全装置）を必ず通させるため。
+ *
+ * @param {object} issue   task-queue issue
+ * @param {string} termId  対象ターミナルID（ログ用）
+ * @param {number|null} wpPort  buildCommand が確保した wp-env ポート（failed 化時のクリーンアップ用）
+ * @param {string} cause   ログに出す理由（state レコードを取れず見送るときの説明に使う）
+ * @returns {Promise<boolean>} startTask の戻り値。再ディスパッチしたら false（次ループで拾い直す）、
+ *   上限判定ができず見送ったら true（watchdog / 次ループに委ねる）
+ */
+async function rollbackUndeliveredBody(issue, termId, wpPort, cause) {
+  const { number } = issue;
+
+  // handlePaneMissing と同じコアに相乗りして自動収束させる（pane 消失と resumeCount /
+  // 上限を合算で管理）。最新の state（resumeCount / wpPort を含む）を渡す。
+  // getTask が null（state レコード喪失）だと resumeCount で上限判定できず、偽の初回
+  // 扱い（resumeCount=1 リセット）で無限リトライに化ける。readState は破損時も例外を
+  // 投げず {issues:{}} を返すため getTask は null になり得る。上限の唯一の安全装置を
+  // 状態喪失で失わないよう、レコードを取れないときは再ディスパッチせず watchdog /
+  // 次ループに委ねる（フォールバックオブジェクトで resumeCount を偽装しない）。
+  let saved = null;
+  try {
+    saved = await getTask(number);
+  } catch (err) {
+    console.warn(`  [submit] state 取得に失敗（今回は再ディスパッチを見送り）: ${err.message}`);
+  }
+  if (!saved) {
+    console.warn(
+      `  [submit] ${cause}が、state レコードを取得できず自動再開の上限判定ができないため再ディスパッチを見送ります。watchdog / 次ループに委ねます (issue #${number}, termId=${termId})`
+    );
+    return true;
+  }
+
+  await handleUndeliveredBody(
+    issue,
+    saved,
+    {
+      // GitHub 連携無効時は PR が存在しえないため「PR なし」を返す fake を渡す（scanWatchdog と同方針）。
+      findPRForIssue: GITHUB_INTEGRATION ? github.findPRForIssue.bind(github) : async () => null,
+      resolveTarget,
+      cleanupForIssue,
+      formatCleanupSummary,
+      updateTask,
+      setStatus: (issueNumber, label) => github.setStatus(issueNumber, label),
+      addComment: (issueNumber, body) => github.addComment(issueNumber, body),
+      failTask: (reason) => markTaskFailed(issue, reason, { cleanupWpPort: saved.wpPort ?? wpPort }),
+    },
+    { resumeMax: PANE_RESUME_MAX }
+  );
+  // ディスパッチ失敗として返す（次ループで status:ready を拾い直す）。
+  return false;
 }
 
 // -------------------------------------------------------
@@ -409,11 +622,10 @@ function resolveTarget(issue) {
 //   （WordPress 案件のみ ON）。汎用タスク（対象 issue URL 無し）や取得失敗時は false に倒す
 //   （非 WP 前提。存在しない wp-env のポート割り当て・掃除を避ける安全側の既定）。
 // -------------------------------------------------------
-async function resolveWpEnvEnabled(issue) {
+async function resolveWpEnvEnabled(issue, target = resolveTarget(issue)) {
   const configVal = getTaskConfig().wpEnv?.enabled;
   if (typeof configVal === 'boolean') return configVal;
 
-  const target = resolveTarget(issue);
   if (target.isSelf) return false;
 
   try {
@@ -430,15 +642,34 @@ async function resolveWpEnvEnabled(issue) {
 // - decision-record コメント検知のため、対象 issue と PR のコメントを時系列で結合
 // 失敗は warn で握り、取得できた範囲を返す（次ループで再試行）。
 // -------------------------------------------------------
-async function gatherTargetState(issue) {
+// checkPRCompletion に渡すオプションを解決する。
+// CodeRabbit 監視が無効なリポジトリ（features.coderabbit=false）では CodeRabbit の
+// 静観（既定 30 分）を待つ意味がないため idle を 0 にし、CI・mergeable・レビューマーカーが
+// 揃った時点で即マージできるようにする。有効時は checkPRCompletion 既定の 30 分をそのまま使う。
+function prCompletionOptions() {
+  return isCoderabbitEnabled() ? {} : { coderabbitIdleMs: 0 };
+}
+
+// @param {object} issue  メタ issue
+// @param {object} [opts]
+// @param {boolean} [opts.resolveReviewGate=false]  agent-review-passed マーカーの有無まで解決するか。
+//   マーカー確認は pulls.get + コメント全件 paginate を伴うため、戻り値の reviewGateReady を
+//   実際に使う scan（scanInProgressIssues）だけが true を渡す。他の呼び出し元
+//   （scanAnsweredRecovery / scanWaitingInputIssues）は値を使わないので既定 false のまま
+//   ＝毎ループの無駄な API 消費を作らない（automerge + waiting-input 滞留時に顕著）。
+async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   const target = resolveTarget(issue);
+  const automerge = github.hasAutomergeLabel(issue);
 
   let pr = null;
   let prState = null;
   let prCompletionReady = false;
+  let reviewGateReady = false;
+  let prLookupFailed = false;
   try {
     pr = await github.findPRForIssue(target.owner, target.repo, target.number);
   } catch (err) {
+    prLookupFailed = true;
     console.warn(`  [scan] issue #${issue.number}: PR 検索失敗: ${err.message}`);
   }
   if (pr) {
@@ -448,11 +679,27 @@ async function gatherTargetState(issue) {
       console.warn(`  [scan] issue #${issue.number}: PR 状態取得失敗: ${err.message}`);
     }
     if (prState && prState.state === 'open' && !prState.merged) {
+      let completion = null;
       try {
-        const completion = await github.checkPRCompletion(target.owner, target.repo, pr.number);
+        completion = await github.checkPRCompletion(target.owner, target.repo, pr.number, prCompletionOptions());
         prCompletionReady = completion.ready;
       } catch (err) {
         console.warn(`  [scan] issue #${issue.number}: PR 完了判定失敗: ${err.message}`);
+      }
+      // agent-review-passed マーカー（現 head SHA 一致）の有無。automerge タスクの
+      // waiting-merge 遷移を tryAutoMerge のレビューゲートと揃えるために使う（#213）。
+      // 取得するのは「この値を使う scan（resolveReviewGate）」かつ「判定に効く状態
+      // （needsReviewGate）」のときだけ。効く条件の定義は in-progress-decision.js 側に
+      // 1 つだけ置き、ここで書き下さない（判定とガードが将来ズレるのを防ぐ）。
+      // 照合は checkPRCompletion が返した headSha で行う
+      // （検証後の push を弾く＝TOCTOU 対策。tryAutoMerge と同じ思想）。
+      if (resolveReviewGate && needsReviewGate({ automerge, prCompletionReady, draft: prState.draft })) {
+        try {
+          reviewGateReady = await github.hasReviewGateMarker(target.owner, target.repo, pr.number, completion.headSha);
+        } catch (err) {
+          // fail-closed: 確認できない間はマージ待ちに出さず in-progress のまま次ループで再試行する。
+          console.warn(`  [scan] issue #${issue.number}: agent-review-passed マーカー確認失敗（マーカー無しとして続行）: ${err.message}`);
+        }
       }
     }
   }
@@ -472,7 +719,7 @@ async function gatherTargetState(issue) {
   }
   comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-  return { target, pr, prState, prCompletionReady, comments };
+  return { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, prLookupFailed };
 }
 
 // -------------------------------------------------------
@@ -506,6 +753,10 @@ async function ensurePRRecorded(issue, target, pr) {
 // 次の状態遷移を決めて適用する（新方針 案B の中核）。
 // -------------------------------------------------------
 async function scanInProgressIssues() {
+  // GitHub 連携無効時は PR 監視（PR 検索・CI 判定・完了条件判定）を行わない。
+  // 純ローカルタスクの in-progress → waiting-merge → done は手動操作（CLI / commands.jsonl）で
+  // 進めるため、この scan を止めても一巡は成立する（gatherTargetState は GitHub を叩くのでスキップ）。
+  if (!GITHUB_INTEGRATION) return;
   let issues;
   try {
     issues = await github.fetchInProgressIssues();
@@ -521,12 +772,13 @@ async function scanInProgressIssues() {
 
     let state;
     try {
-      state = await gatherTargetState(issue);
+      // reviewGateReady を判定に使う唯一の scan なので、ここだけマーカーを解決する。
+      state = await gatherTargetState(issue, { resolveReviewGate: true });
     } catch (err) {
       console.warn(`  [scan-in-progress] issue #${issue.number}: 状態収集失敗: ${err.message}`);
       continue;
     }
-    const { target, pr, prState, prCompletionReady, comments } = state;
+    const { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments } = state;
 
     // PR URL 記録 + アイコン（冪等。状態遷移とは独立）
     if (pr && prState) {
@@ -535,14 +787,31 @@ async function scanInProgressIssues() {
 
     const action = decideInProgressAction({
       comments,
-      pr: prState ? { state: prState.state, merged: prState.merged } : null,
+      // draft も渡す: 修正対応中の Draft PR を「マージ待ち」にしないため（#213）。
+      pr: prState ? { state: prState.state, merged: prState.merged, draft: prState.draft } : null,
       prCompletionReady,
       // automerge 指定時は「完了済み PR に対するマージ判断依頼」の waiting-input で
       // 自動マージを止めない（司のマージ判断依頼コメントによる waiting-input 滞留を防ぐ）。
-      automerge: github.hasAutomergeLabel(issue),
+      automerge,
+      // automerge タスクの waiting-merge 遷移を tryAutoMerge のレビューゲートと揃える（#213）。
+      reviewGateReady,
     });
 
-    if (action.type === 'none') continue;
+    if (action.type === 'none') {
+      // 完了条件は満たしたのに waiting-merge へ進めなかったケースは、保留理由を毎ループ出す。
+      // ここを無音にすると「作業中」表示のまま誰も進めない終端状態（マーカー付与漏れ・
+      // マーカー付与後の push による SHA ずれ・draft の戻し忘れ）に人が気づけない。
+      // watchdog は PR がある issue には介入しない（pane-resume は has-pr で何もしない）ため、
+      // tryAutoMerge() の保留ログと対称にここが唯一の痕跡になる。
+      if (prCompletionReady && prState?.draft) {
+        console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが PR が Draft のため waiting-merge を保留`);
+      }
+      if (prCompletionReady && automerge && !reviewGateReady && !prState?.draft) {
+        console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが agent-review-passed マーカー（現 head SHA 一致）が無いため waiting-merge を保留`);
+      }
+      await handlePrLessParentDone(issue, state, action);
+      continue;
+    }
 
     if (action.type === 'waiting-input') {
       // 未応答の waiting-input を検知。指示待ちに倒す（確認内容は対象 issue/PR 側にある）。
@@ -582,9 +851,21 @@ async function scanInProgressIssues() {
       }
       try {
         await github.setStatus(issue.number, 'status:waiting-merge');
+        // 箇条書きは decideInProgressAction が実際に見た条件と 1 対 1 で対応させる（#213）。
+        // CodeRabbit 行は tryAutoMerge() と同じく isCoderabbitEnabled() で分岐する
+        // （無効リポでは prCompletionOptions() が静観 0 分にするため「30 分間なし」は嘘になる）。
+        const lines = [
+          '- CI 全通過',
+          isCoderabbitEnabled()
+            ? '- CodeRabbit の指摘が 30 分間なし'
+            : '- CodeRabbit 監視は無効（静観待機なし）',
+          '- PR は Draft ではない',
+        ];
+        // automerge タスクだけレビュー完了マーカーが遷移条件に含まれる。
+        if (automerge) lines.push('- レビュー完了マーカー（agent-review-passed）を現 head SHA に対して確認済み');
         await github.addComment(
           issue.number,
-          `🟢 マージ待ち\n\nPR: ${prUrl}\n\n- CI 全通過\n- CodeRabbit の指摘が 30 分間なし\n\nマージされたらこの issue は自動で close されます。`
+          `🟢 マージ待ち\n\nPR: ${prUrl}\n\n${lines.join('\n')}\n\nマージされたらこの issue は自動で close されます。`
         );
         console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件充足 → waiting-merge`);
       } catch (err) {
@@ -605,6 +886,8 @@ async function scanInProgressIssues() {
 // 固着するため（answered の設計目標を損なう）。
 // -------------------------------------------------------
 async function scanAnsweredRecovery() {
+  // 対象 issue/PR のコメントを収集して answered を判定するため GitHub 連携が前提。無効時はスキップ。
+  if (!GITHUB_INTEGRATION) return;
   let issues;
   try {
     issues = await github.fetchWaitingInputIssues();
@@ -643,6 +926,8 @@ async function scanAnsweredRecovery() {
 // （`Status: answered` による転送不要の復帰は scanAnsweredRecovery が健全性ゲート前で処理する。）
 // -------------------------------------------------------
 async function scanWaitingInputIssues() {
+  // 返信転送は対象 issue/PR のコメント収集（gatherTargetState）が前提のため GitHub 連携が必要。無効時はスキップ。
+  if (!GITHUB_INTEGRATION) return;
   let issues;
   try {
     issues = await github.fetchWaitingInputIssues();
@@ -700,7 +985,14 @@ async function scanWaitingInputIssues() {
 
     let forwardResult;
     try {
-      forwardResult = await submitToClaude(VK_PORT, saved.termId, reply.body);
+      // clearBeforeSend:false — この経路の転送先は「waiting-input＝Claude が y/n 確認や
+      // 権限承認のダイアログを出して止まっているペイン」であることが前提。生きた
+      // ダイアログへ Ctrl-A(\x01) + Ctrl-K(\x0b) を撃つと Claude Code 側がどう解釈するか
+      // （意図しない確定・キャンセル）はこちらから検証できないため、初回クリアは撃たない。
+      // #189 が守りたいのは新規ディスパッチ時のアイドルペインであって、この経路は対象外。
+      forwardResult = await submitToClaude(VK_PORT, saved.termId, reply.body, undefined, {
+        clearBeforeSend: false,
+      });
     } catch (err) {
       console.warn(`  [scan-waiting-input] issue #${issue.number}: 返信転送失敗（次ループ再試行）: ${err.message}`);
       continue;
@@ -783,7 +1075,9 @@ async function scanWatchdog() {
         issue,
         saved,
         {
-          findPRForIssue: github.findPRForIssue.bind(github),
+          // GitHub 連携無効時は PR が存在しえないため「PR なし」を返す fake を渡し、
+          // pane 消失時の自動再開／failed 化（いずれもローカル操作）へ進ませる。
+          findPRForIssue: GITHUB_INTEGRATION ? github.findPRForIssue.bind(github) : async () => null,
           resolveTarget,
           cleanupForIssue,
           formatCleanupSummary,
@@ -814,15 +1108,19 @@ async function scanWatchdog() {
 // 駆動するのでウォッチドッグでは触らない（誤って進行中タスクを殺さないための保険）。
 // cleanupWpPort が渡された場合（pane 消失時）は、残った wp-env コンテナ・worktree を掃除する。
 async function failIfNoPR(issue, reason, { cleanupWpPort = null } = {}) {
-  const target = resolveTarget(issue);
-  let pr = null;
-  try {
-    pr = await github.findPRForIssue(target.owner, target.repo, target.number);
-  } catch (err) {
-    console.warn(`  [watchdog] issue #${issue.number}: PR 確認失敗（今回は見送り）: ${err.message}`);
-    return;
+  // GitHub 連携有効時のみ PR の有無を確認する。無効時（純ローカル）は PR が存在しえないため
+  // 「PR なし」とみなしてそのまま failed 化する（cleanup / setStatus / addComment はローカル操作で完結する）。
+  if (GITHUB_INTEGRATION) {
+    const target = resolveTarget(issue);
+    let pr = null;
+    try {
+      pr = await github.findPRForIssue(target.owner, target.repo, target.number);
+    } catch (err) {
+      console.warn(`  [watchdog] issue #${issue.number}: PR 確認失敗（今回は見送り）: ${err.message}`);
+      return;
+    }
+    if (pr) return; // PR あり → 通常ルートに任せる
   }
-  if (pr) return; // PR あり → 通常ルートに任せる
 
   await markTaskFailed(issue, reason, { cleanupWpPort });
 }
@@ -888,19 +1186,45 @@ async function getOccupiedRepoKeys() {
 // 紐づくPRがマージされていたら status:done + close する
 // -------------------------------------------------------
 async function checkWaitingMergeIssues() {
-  let issues;
+  // GitHub 連携無効時はマージ検知・automerge を行わない（純ローカルタスクは手動で done にする）。
+  if (!GITHUB_INTEGRATION) return;
+  let waitingMergeIssues;
   try {
-    issues = await github.fetchWaitingMergeIssues();
+    waitingMergeIssues = await github.fetchWaitingMergeIssues();
   } catch (err) {
     console.warn(`[merge-watch] waiting-merge issue 取得失敗: ${err.message}`);
     return;
   }
 
-  if (issues.length === 0) return;
+  // 後付け automerge（#207）: automerge ラベルを PR 作成後に付けた場合、司の
+  // 「マージ判断をお願いします」で issue が status:waiting-input に落ちているため、
+  // waiting-merge しか見ない従来の判定に乗らず永久にマージされなかった。automerge ラベル
+  // 付きの waiting-input issue も automerge 候補に含める（本物の質問待ちは tryAutoMerge 内の
+  // 完了条件・レビューマーカーゲートで自然に保留される＝安全側）。
+  let waitingInputIssues = [];
+  try {
+    waitingInputIssues = await github.fetchWaitingInputIssues();
+  } catch (err) {
+    // waiting-input の取得失敗は後付け automerge を諦めるだけ。waiting-merge の検知は続行する。
+    console.warn(`[merge-watch] waiting-input issue 取得失敗（後付け automerge をスキップ）: ${err.message}`);
+  }
 
-  console.log(`[merge-watch] マージ待ち ${issues.length} 件をチェック`);
+  const candidates = selectAutomergeCandidates({
+    waitingMergeIssues,
+    waitingInputIssues,
+    hasAutomergeLabel: (issue) => github.hasAutomergeLabel(issue),
+  });
 
-  for (const issue of issues) {
+  if (candidates.length === 0) return;
+
+  const waitingInputCount = candidates.filter((c) => c.source === 'waiting-input').length;
+  console.log(
+    `[merge-watch] マージ待ち ${waitingMergeIssues.length} 件` +
+      (waitingInputCount > 0 ? ` + 後付け automerge の waiting-input ${waitingInputCount} 件` : '') +
+      ' をチェック'
+  );
+
+  for (const { issue, source } of candidates) {
     const prUrl = github.extractPRUrlFromIssueBody(issue.body);
     if (!prUrl) {
       console.warn(`  [merge-watch] issue #${issue.number}: 本文からPR URLを抽出できませんでした`);
@@ -926,17 +1250,28 @@ async function checkWaitingMergeIssues() {
       continue;
     }
 
-    if (prState.merged) {
+    // merged 判定を source 分岐より前に共通化する（#209）。
+    // prState.merged なら source（waiting-merge / waiting-input）を問わず完了ルートへ流す。
+    // これにより、automerge ラベル付きで waiting-input に滞留した issue の PR が GitHub UI 等で
+    // 外部から手動マージされても、close + done + cleanup 経路に確実に乗る。
+    const action = resolveWaitingMergeAction({
+      source,
+      prState,
+      hasAutomergeLabel: github.hasAutomergeLabel(issue),
+    });
+
+    if (action === 'complete-merge') {
+      // automerge・外部マージ（GitHub UI 等）いずれで merged になった場合も共通の完了ルート。
       console.log(`  [merge-watch] issue #${issue.number}: PR #${prRef.number} がマージ済み → 完了`);
       await notifyPaneMerged(issue.number, prUrl, '[merge-watch]');
       // 対象 issue が open のままなら部分対応マージの可能性があるため done へ進めず、
-      // waiting-merge ラベルを維持して次ループで再評価する。
+      // waiting ラベルを維持して次ループで再評価する。
       await closeSourceIssueBeforeGate(issue, '[merge-watch]');
       if (!(await canTransitionToDone(issue, '[merge-watch]'))) {
         continue;
       }
       // close を先に行い、成功した場合のみ status:done に切り替える。
-      // 途中で失敗してもラベルが waiting-merge のまま残り、次ループで再試行される。
+      // 途中で失敗してもラベルが waiting のまま残り、次ループで再試行される（冪等）。
       try {
         await github.addComment(issue.number, `✅ 完了\n\nPR: ${prUrl} がマージされました。`);
         await github.closeIssue(issue.number);
@@ -945,21 +1280,22 @@ async function checkWaitingMergeIssues() {
         console.warn(`  [merge-watch] issue #${issue.number}: 完了処理失敗（次ループで再試行）: ${err.message}`);
       }
 
-      // automerge・外部マージ（GitHub UI 等）いずれで merged になった場合も、
       // 残った wp-env コンテナ・worktree・マージ済みブランチをここで掃除する。
       await runPostMergeCleanup(issue, prRef, prState, '[merge-watch]');
-    } else {
-      // open / 未マージで closed のどちらも「待ち続ける」方針（手動で再open or 再マージされる可能性を考慮）
-      console.log(`  [merge-watch] issue #${issue.number}: PR #${prRef.number} は ${prState.state}${prState.merged ? '(merged)' : ''} のため待機継続`);
-
-      // automerge ラベル付き issue は条件を再検証して自動 squash merge する。
-      // - waiting-merge 到達後に CodeRabbit が新たにコメントしたケースを避けるため毎ループで再検証
-      // - 後から automerge ラベルを付けても拾われるよう、ここで毎回チェックする
-      // - 実 merge 後は次ループの merged 判定で通常の close + done ルートに乗る
-      if (prState.state === 'open' && github.hasAutomergeLabel(issue)) {
-        await tryAutoMerge(issue, prRef, prState, prUrl);
-      }
+      continue;
     }
+
+    if (action === 'try-automerge') {
+      // 未マージ・open。automerge 条件（Draft 除外・mergeable・CI + CodeRabbit 静観・
+      // agent-review-passed マーカー）は tryAutoMerge 内で再検証されるため、本物の質問待ちは保留のまま。
+      // 実 merge 後は次ループの complete-merge 判定で close + done ルートに乗る。
+      await tryAutoMerge(issue, prRef, prState, prUrl);
+      continue;
+    }
+
+    // action === 'skip': 未マージで closed、または automerge 対象外の open。
+    // どちらも「待ち続ける」方針（手動で再 open / 再マージ・後付け automerge ラベルを考慮）。
+    console.log(`  [merge-watch] issue #${issue.number}: PR #${prRef.number} は ${prState.state}${prState.merged ? '(merged)' : ''} のため待機継続`);
   }
 }
 
@@ -985,11 +1321,12 @@ async function tryAutoMerge(issue, prRef, prState, prUrl) {
     return;
   }
 
-  // CI + CodeRabbit 30 分静観を再検証する。
+  // CI + CodeRabbit 静観を再検証する。
   // waiting-merge 到達後に CodeRabbit が再コメントしたケースで誤マージを防ぐ。
+  // CodeRabbit 無効リポでは静観 0 分（即時）になる（prCompletionOptions）。
   let completion;
   try {
-    completion = await github.checkPRCompletion(prRef.owner, prRef.repo, prRef.number);
+    completion = await github.checkPRCompletion(prRef.owner, prRef.repo, prRef.number, prCompletionOptions());
   } catch (err) {
     console.warn(`  ${tag}: PR完了条件の再検証に失敗（次ループで再試行）: ${err.message}`);
     return;
@@ -1022,9 +1359,12 @@ async function tryAutoMerge(issue, prRef, prState, prUrl) {
       method: 'squash',
       sha: completion.headSha,
     });
+    const coderabbitLine = isCoderabbitEnabled()
+      ? '- CodeRabbitAI のコメントが 30 分間なし'
+      : '- CodeRabbit 監視は無効（静観待機なし）';
     await github.addComment(
       issue.number,
-      `🤖 automerge ラベルに基づき PR を自動マージしました: ${prUrl}\n\n- CI 全通過\n- CodeRabbitAI のコメントが 30 分間なし\n- mergeable=true`
+      `🤖 automerge ラベルに基づき PR を自動マージしました: ${prUrl}\n\n- CI 全通過\n${coderabbitLine}\n- mergeable=true`
     );
     console.log(`  ${tag}: PR #${prRef.number} を squash merge しました`);
   } catch (err) {
@@ -1130,6 +1470,8 @@ async function runPostMergeCleanup(issue, prRef, prState, tag) {
 // 既存の `no_pr_found_target_closed` ルート（「PRなし完了」）と同じ扱いで done にする。
 // -------------------------------------------------------
 async function recheckFailedIssues() {
+  // failed の事後復旧は対象 issue/PR の GitHub 状態照会が前提。無効時はスキップ。
+  if (!GITHUB_INTEGRATION) return;
   let issues;
   try {
     issues = await github.fetchFailedIssues();
@@ -1332,6 +1674,8 @@ async function recheckFailedIssues() {
 let isImportingTasks = false;
 
 async function importNewTasks() {
+  // GitHub 連携無効（トークン無しローカルモード）では作業対象リポジトリの取り込みは行わない。
+  if (!GITHUB_INTEGRATION) return;
   if (isImportingTasks) {
     console.log('[import] 前回の取り込み処理が継続中のためスキップ');
     return;
@@ -1428,7 +1772,13 @@ async function importNewTasks() {
 // -------------------------------------------------------
 // メインループ
 // -------------------------------------------------------
-async function loop() {
+async function loopBody() {
+  try {
+    writeAgentRulesHandoff();
+  } catch (err) {
+    console.warn(`[warn] agent rules handoff file の書き出しに失敗しました: ${err.message}`);
+  }
+
   // 1. 作業対象リポジトリから新規タスクを取り込む（VK Terminals 不要）
   //    assignee 未設定時は安全側として何も拾わず、"all" 明示時のみすべての作業対象リポジトリの Issue を取り込む。
   //    ログイン名指定時は「自分にアサインされた作業対象リポジトリの Issue だけ」を取り込み、
@@ -1439,42 +1789,56 @@ async function loop() {
   //    pickupEnabled=false の場合は fetch 系が空配列を返すため、取り込み・実行とも何もしない。
   await importNewTasks();
 
-  // 2. in-progress スキャン: 指示待ち検知 → waiting-input / PR 完了 → waiting-merge /
+  // 2. VK Terminals からのステータス変更コマンドを消化する（VK Terminals 不要）
+  const cmdSummary = await commandsFileProcessor.consumeOnce();
+  if (cmdSummary && cmdSummary.applied > 0) {
+    await refreshTasksSnapshots(github, { logger: console, viewer: ASSIGNEE_FILTER });
+  }
+
+  // 3. in-progress スキャン: 指示待ち検知 → waiting-input / PR 完了 → waiting-merge /
   //    PR マージ → done / PR 未マージ closed → failed（VK Terminals 不要。PR アイコンのみ任意）
   await scanInProgressIssues();
 
-  // 3. マージ待ち issue のマージ検知 + automerge（VK Terminals 不要）
+  // 4. マージ待ち issue のマージ検知 + automerge（VK Terminals 不要）
   await checkWaitingMergeIssues();
 
-  // 4. 失敗扱いになった issue の事後復旧チェック（VK Terminals 不要）
+  // 5. 失敗扱いになった issue の事後復旧チェック（VK Terminals 不要）
   await recheckFailedIssues();
 
-  // 5. answered 復帰スキャン: `Status: answered` の waiting-input を in-progress へ戻す。
+  // 6. answered 復帰スキャン: `Status: answered` の waiting-input を in-progress へ戻す。
   //    返信転送不要なので VK Terminals に依存せず、健全性ゲートより前で回す（VK Terminals 不要）。
   await scanAnsweredRecovery();
 
-  // 6. ここから先（返信転送・dispatch）は VK Terminals が必要
+  // 7. ここから先（返信転送・後始末・dispatch）は VK Terminals が必要
   const healthy = await checkHealth(VK_PORT);
   if (!healthy) {
-    console.log(`[warn] VK Terminals (port ${VK_PORT}) に接続できません。返信転送・起動をスキップします。`);
+    console.log(`[warn] VK Terminals (port ${VK_PORT}) に接続できません。返信転送・後始末・起動をスキップします。`);
     return;
   }
 
-  // 7. VK Terminals の再起動で消える注入メニューを、接続確立後に毎回冪等に再投稿する
+  // 8. VK Terminals の再起動で消える注入メニューを、接続確立後に毎回冪等に再投稿する
   await syncOrchestratorMenu();
 
-  // 8. 指示待ちスキャン: ユーザー返信を pane に転送して in-progress に戻す
+  // 9. 指示待ちスキャン: ユーザー返信を pane に転送して in-progress に戻す
   await scanWaitingInputIssues();
 
-  // 9. issue 連動ペインの入力待ちマーカーを push（waiting-input ラベルへの完全鏡写し）。
+  // 10. issue 連動ペインの入力待ちマーカーを push（waiting-input ラベルへの完全鏡写し）。
   //    VK Terminals states の生存ペインへ反映するため checkHealth 後ろ
   await scanWaitingMarkers();
 
-  // 10. ウォッチドッグ（安全網）: 無言で死んだ/ハングした in-progress タスクを failed に倒す
+  // 11. ウォッチドッグ（安全網）: 無言で死んだ/ハングした in-progress タスクを failed に倒す
   //    （VK Terminals states で pane の生死・無反応を見るため checkHealth 後ろ）
   await scanWatchdog();
 
-  // 11. ready をディスパッチ
+  // 12. 先回りクローズ済み + PR マージ済みの state 残骸を後始末
+  //     VK Terminals が到達不能な間は prMerged 通知を送れないため、
+  //     health 確認済みのループでのみ通知してから state を消し込む。
+  //     PR マージ検知が前提のため GitHub 連携無効時はスキップ。
+  if (GITHUB_INTEGRATION) {
+    await reconcileOrphanedMergedTasks();
+  }
+
+  // 13. ready をディスパッチ
   const issues = await github.fetchPendingIssues();
   if (issues.length === 0) {
     console.log('[poll] 実行待ちタスクなし');
@@ -1487,35 +1851,28 @@ async function loop() {
   // （in-memory のカウンタではなくラベル状態を真実の源にする）。
   const occupiedRepos = await getOccupiedRepoKeys();
 
-  for (const issue of issues) {
-    if (inFlightIssues.has(issue.number)) {
-      console.log(`[poll] issue #${issue.number} は起動処理中のためスキップ`);
-      continue;
-    }
+  await dispatchReadyIssues(
+    issues,
+    {
+      inFlightIssues,
+      occupiedRepos,
+      getTargetRepoKey,
+      isSequential: (issue) => github.isSequential(issue),
+      startTask,
+      getTask,
+      getStates,
+      setStatus: (issueNumber, label) => github.setStatus(issueNumber, label),
+      formatErrorSummary,
+    },
+    { port: VK_PORT, logger: console }
+  );
+}
 
-    const repoKey = getTargetRepoKey(issue);
-
-    // sequential ラベル付き issue は、同じ作業対象リポジトリのタスクが作業中なら
-    // 起動を見送り、次のポーリングで再評価する。別 repo・汎用・ラベル無しは即起動。
-    if (github.isSequential(issue) && repoKey && occupiedRepos.has(repoKey)) {
-      console.log(
-        `[poll] issue #${issue.number} (${repoKey}): 同じ作業対象リポジトリのタスクが作業中のため待機`
-      );
-      continue;
-    }
-
-    // 起動は撃ちっぱなし（ペイン作成＋送信＋state 記録で完了）。
-    // inFlightIssues は「status:in-progress 反映前に並行 loop が同じ ready を拾う」レース対策。
-    inFlightIssues.add(issue.number);
-    try {
-      const started = await startTask(issue);
-      // 同ティック内の後続 sequential タスクを待たせるため occupied に追加
-      if (started && repoKey) occupiedRepos.add(repoKey);
-    } catch (err) {
-      console.error(`[poll] issue #${issue.number} 起動エラー:`, err);
-    } finally {
-      inFlightIssues.delete(issue.number);
-    }
+async function loop() {
+  try {
+    await loopBody();
+  } finally {
+    await refreshTasksSnapshots(github, { logger: console, viewer: ASSIGNEE_FILTER });
   }
 }
 
@@ -1539,6 +1896,8 @@ async function main() {
     console.log(`=== task-queue orchestrator ===`);
     console.log(`  repo         : ${GITHUB_OWNER}/${GITHUB_REPO}`);
     console.log(`  source org   : ${SOURCE_ORG}`);
+    console.log(`  queue backend: ${queueBackend}`);
+    console.log(`  github 連携  : ${GITHUB_INTEGRATION ? '有効' : `無効（純ローカルタスク専用: ${disabledGitHubFeatures().join(' / ')} をスキップ）`}`);
     console.log(`  assignee     : ${formatAssigneeMode(github)}`);
     console.log(`  terminal     : http://127.0.0.1:${VK_PORT}`);
     console.log(`  interval     : ${POLL_INTERVAL / 1000}s`);
@@ -1566,11 +1925,23 @@ async function main() {
     // OS ごとの方法でシステムスリープを抑止する（run-once は短命なので不要）。
     // macOS は caffeinate、Windows は SetThreadExecutionState。未対応 OS は警告のみ。
     const keepAwake = startKeepAwake();
+    const commandsWatcher = startCommandsFileWatcher(commandsFileProcessor, {
+      logger: console,
+      afterConsume: async (summary) => {
+        if (summary && summary.applied > 0) {
+          await refreshTasksSnapshots(github, { logger: console, viewer: ASSIGNEE_FILTER });
+        }
+      },
+    });
     // graceful shutdown 時にスリープ抑止と起動ロックを即時解除する。
     // Ctrl-C / kill 時に待たず解放する。SIGINT / SIGTERM は解除後に自前で終了する。
-    process.on('exit', () => keepAwake.stop());
+    process.on('exit', () => {
+      commandsWatcher.close();
+      keepAwake.stop();
+    });
     for (const sig of ['SIGINT', 'SIGTERM']) {
       process.on(sig, () => {
+        commandsWatcher.close();
         keepAwake.stop();
         startLock.releaseSync();
         process.exit(0);
@@ -1579,7 +1950,7 @@ async function main() {
 
     // watch モード: 初回 loop を起動し、setInterval で定期実行する。
     // setInterval 経由の呼び出しは safe wrapper を通して unhandled rejection を防ぐ。
-    const runLoopSafely = () => loop().catch(err => console.error('[Loop]', err));
+    const runLoopSafely = () => loop().catch(err => console.error('[Loop]', formatErrorSummary(err)));
     runLoopSafely();
     setInterval(runLoopSafely, POLL_INTERVAL);
   } catch (err) {
@@ -1589,6 +1960,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error('[Fatal]', err);
+  console.error('[Fatal]', formatErrorSummary(err));
   process.exit(1);
 });
