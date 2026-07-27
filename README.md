@@ -298,8 +298,8 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | セクション.キー | 対応 env | 意味 | 既定 |
 |---|---|---|---|
 | `task.commandTemplate` | `TASK_COMMAND_TEMPLATE` | タスク着手時に各ペインへ投入するコマンド。`{issueUrl}` / `{wpPort}` は自動置換 | `/vk-kore {issueUrl} wp-env-port={wpPort} headless=1` |
-| `features.coderabbit` | — | エージェント側の CodeRabbit 監視を有効化（vk-agents 設定へ投影）。OFF で `/code-review` 等での確認に切替 | `true` |
-| `features.coderabbit_ignore` | — | `features.coderabbit` が ON のとき、`/vk-pr` の PR 本文に `@coderabbitai ignore` を記載して CodeRabbit レビューをスキップ | `false` |
+| `features.coderabbit` | — | エージェント側の CodeRabbit 監視を有効化（vk-agents 設定へ投影）。OFF で `/code-review` 等での確認に切替。OFF のときは自動マージの CodeRabbit 待機（下記）も省略 | `true` |
+| `features.coderabbit_ignore` | — | `features.coderabbit` が ON のとき、`/vk-pr` の PR 本文に `@coderabbitai ignore` を記載して CodeRabbit レビューをスキップ。レビューが来ないため自動マージの CodeRabbit 待機（下記）も省略 | `false` |
 | `org.review_assets_repo` | — | PR・テスト報告用の画像/GIF を保存するレビュー用アセットリポジトリ（`<owner>/<repo>`、例: `vektor-inc/review-assets`。形式が正しくない値は反映されません） | 空＝画像アップロードをスキップしてテキスト記述 |
 | `staff_wp_dev.engine` | — | staff-wp-dev（和田）の実行エンジン（`claude` / `codex`） | 空＝`claude` |
 | `multi_repo_task.default_engine` | — | vk-multi-repo-task を新規作成するときの既定エンジン（`claude` / `codex`） | 空＝`claude` |
@@ -307,4 +307,6 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `vkAgents.disabledSkills` | — | `npm run setup:agents` で展開しないスキル名（vk-agents config の `skills.disabled` へ投影） | `[]` |
 | `vkAgents.allowedOwners` | — | スキル実行を許可する GitHub owner（vk-agents config の `org.allowed_owners` へ投影） | `["vektor-inc"]` |
 
-`task.commandTemplate` は orchestrator 自身が消費します（`{issueUrl}` / `{wpPort}` を置換してペインへ投入）。`features.*` / `org.review_assets_repo` / `staff_wp_dev.*` / `multi_repo_task.*` は既存の vk-agents 投影ロジックが読むトップレベル設定を正とし、`vkAgents.*` は vk-agents の場所と setup 用の不足項目（無効化スキル・許可 owner）だけを持ちます。これらは `setup:agents`/`up`/`apply` 時に vk-agents の `config.json` と `~/.claude/vk-agents-settings.json` へ**投影**され、各ペインの Claude エージェントが読み取ります（orchestrator 自身の CodeRabbit 待機ゲートとは別物です）。連携ルールの在り処は設定ではなく、runtime handoff file（`~/.vk-agents/runtime/orchestrator-rules.path`）で渡されます。
+`task.commandTemplate` は orchestrator 自身が消費します（`{issueUrl}` / `{wpPort}` を置換してペインへ投入）。`features.*` / `org.review_assets_repo` / `staff_wp_dev.*` / `multi_repo_task.*` は既存の vk-agents 投影ロジックが読むトップレベル設定を正とし、`vkAgents.*` は vk-agents の場所と setup 用の不足項目（無効化スキル・許可 owner）だけを持ちます。これらは `setup:agents`/`up`/`apply` 時に vk-agents の `config.json` と `~/.claude/vk-agents-settings.json` へ**投影**され、各ペインの Claude エージェントが読み取ります。連携ルールの在り処は設定ではなく、runtime handoff file（`~/.vk-agents/runtime/orchestrator-rules.path`）で渡されます。
+
+`features.coderabbit` / `features.coderabbit_ignore` は、各ペインの Claude エージェントだけでなく orchestrator 自身の自動マージ判定も参照します。自動マージは通常「CodeRabbit の最終コメントから 30 分（コメントが 1 件も無ければ PR 作成から 30 分）新しいコメントが来ないこと」を待ちますが、上の 2 つのいずれかの設定でレビューが来ないと分かっている場合はこの待機を省略し、CI 通過などの条件が揃った時点でマージします。この 2 つは設定パネルが直接編集する vk-agents 正本（`~/.vk-agents/config.json`）を優先して読み、そこに無い場合だけ orchestrator の `config.json` へフォールバックします。
