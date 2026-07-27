@@ -413,6 +413,49 @@ export function gpuLaunchOptions(mode) {
   }
 }
 
+/** 実行面モードの取りうる値。 */
+export const TERMINALS_MODES = ['vk-terminals', 'tmux'];
+
+let warnedUnknownTerminalsMode = false;
+
+/**
+ * 実行面モードを解決する。優先順位: env VK_TERMINALS_MODE > config(terminals.mode) > 既定。
+ * 未知値は既定 'vk-terminals' へフォールバックし、一度だけ警告する（起動は止めない）。
+ * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @returns {'vk-terminals'|'tmux'}
+ */
+export function resolveTerminalsMode(cfg = loadUnifiedConfig()) {
+  const raw = String(process.env.VK_TERMINALS_MODE ?? cfg?.terminals?.mode ?? '').trim().toLowerCase();
+  if (TERMINALS_MODES.includes(raw)) return raw;
+  if (raw !== '' && !warnedUnknownTerminalsMode) {
+    warnedUnknownTerminalsMode = true;
+    console.warn(`[Config] 未知の実行面モード "${raw}" は無視し、既定 "vk-terminals" を使用します（有効値: ${TERMINALS_MODES.join(' / ')}）。`);
+  }
+  return 'vk-terminals';
+}
+
+/**
+ * tmux モードで使うセッション名。env VK_TMUX_SESSION > config(tmux.session) > 'vk-orch'。
+ * @param {object} [cfg]
+ * @returns {string}
+ */
+export function resolveTmuxSession(cfg = loadUnifiedConfig()) {
+  const raw = String(process.env.VK_TMUX_SESSION ?? cfg?.tmux?.session ?? '').trim();
+  return raw || 'vk-orch';
+}
+
+/**
+ * tmux モードで新規ペイン作成時に起動する Claude コマンド。
+ * env VK_TMUX_CLAUDE_CMD > config(tmux.claudeCommand) > 'claude'。
+ * bypass 運用は 'claude --dangerously-skip-permissions' 等をここで指定する（コードに埋めない）。
+ * @param {object} [cfg]
+ * @returns {string}
+ */
+export function resolveTmuxClaudeCommand(cfg = loadUnifiedConfig()) {
+  const raw = String(process.env.VK_TMUX_CLAUDE_CMD ?? cfg?.tmux?.claudeCommand ?? '').trim();
+  return raw || 'claude';
+}
+
 /**
  * 同梱している VK Terminals のインストールディレクトリを解決する。
  * (optionalDependencies として導入される package の実体パス)

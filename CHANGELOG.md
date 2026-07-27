@@ -1,5 +1,6 @@
 # Changelog
 
+- [ 機能追加 ] 実行面として tmux を選べる tmux モードを追加（`terminals.mode=tmux`。Electron/GUI 不要でコンテナ環境でも動作し、各タスクを tmux ペインに並べて表示）
 - [ 不具合修正 ] 設定パネルで CodeRabbit 監視を OFF にしても自動マージの 30 分待機が省略されない不具合を修正（OFF 運用の環境は、CI 通過などの条件が揃った時点で即時マージに挙動変更）
 - [ 不具合修正 ] CodeRabbit のレビュー抑止設定（features.coderabbit_ignore）が自動マージの判定に反映されず、レビューが来ない PR でも 30 分待たされてからマージされる不具合を修正
 
