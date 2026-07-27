@@ -6,20 +6,27 @@ import { tmpdir } from 'os';
 
 import { GitHubClient } from '../src/github/index.js';
 
-function makeClient(labels) {
+function makeClient(labels, { body = '' } = {}) {
   const calls = [];
   const client = new GitHubClient({ token: 'dummy', owner: 'vektor-inc', repo: 'task-queue' });
   client.octokit = {
     issues: {
       get: async (params) => {
         calls.push(['get', params]);
-        return { data: { labels } };
+        return { data: { labels, body } };
       },
       setLabels: async (params) => {
         calls.push(['setLabels', params]);
         return { data: {} };
       },
+      removeLabel: async (params) => {
+        calls.push(['removeLabel', params]);
+        return { data: {} };
+      },
     },
+  };
+  client.postSourceCompletionComment = async (...args) => {
+    calls.push(['postSourceCompletionComment', ...args]);
   };
   return { client, calls };
 }
@@ -40,6 +47,153 @@ async function withTmpConfig(config, fn) {
 }
 
 describe('GitHubClient label mutations', () => {
+  it('removeSourceWorkingLabel: 設定された作業中ラベルを対象 issue から外す', async () => {
+    await withTmpConfig({ labels: { workingInProgress: 'in-flight' } }, async () => {
+      const calls = [];
+      const client = new GitHubClient({
+        token: 'dummy',
+        owner: 'vektor-inc',
+        repo: 'task-queue',
+      });
+      client.octokit = {
+        issues: {
+          removeLabel: async (params) => {
+            calls.push(params);
+          },
+        },
+      };
+
+      await client.removeSourceWorkingLabel({
+        owner: 'vektor-inc',
+        repo: 'vk-terminals',
+        number: 95,
+      });
+
+      assert.deepEqual(calls, [{
+        owner: 'vektor-inc',
+        repo: 'vk-terminals',
+        issue_number: 95,
+        name: 'in-flight',
+      }]);
+    });
+  });
+
+  it('removeSourceWorkingLabel: 404 は削除済みとして握りつぶす', async () => {
+    const client = new GitHubClient({
+      token: 'dummy',
+      owner: 'vektor-inc',
+      repo: 'task-queue',
+    });
+    client.octokit = {
+      issues: {
+        removeLabel: async () => {
+          const err = new Error('Not Found');
+          err.status = 404;
+          throw err;
+        },
+      },
+    };
+
+    await assert.doesNotReject(() => client.removeSourceWorkingLabel({
+      owner: 'vektor-inc',
+      repo: 'vk-terminals',
+      number: 95,
+    }));
+  });
+
+  it('removeSourceWorkingLabel: 404 以外は呼び出し側へ伝播する', async () => {
+    const client = new GitHubClient({
+      token: 'dummy',
+      owner: 'vektor-inc',
+      repo: 'task-queue',
+    });
+    client.octokit = {
+      issues: {
+        removeLabel: async () => {
+          const err = new Error('rate limit');
+          err.status = 403;
+          throw err;
+        },
+      },
+    };
+
+    await assert.rejects(
+      () => client.removeSourceWorkingLabel({
+        owner: 'vektor-inc',
+        repo: 'vk-terminals',
+        number: 95,
+      }),
+      (err) => err.status === 403 && err.message === 'rate limit'
+    );
+  });
+
+  it('setStatus: status:done への遷移で source issue の作業中ラベルを外す', async () => {
+    const { client, calls } = makeClient(
+      [{ name: 'status:waiting-merge' }],
+      { body: 'https://github.com/vektor-inc/vk-terminals/issues/95' },
+    );
+
+    await client.setStatus(146, 'status:done');
+
+    assert.deepEqual(calls.find(call => call[0] === 'removeLabel'), [
+      'removeLabel',
+      {
+        owner: 'vektor-inc',
+        repo: 'vk-terminals',
+        issue_number: 95,
+        name: 'working',
+      },
+    ]);
+  });
+
+  it('setStatus: status:failed では source issue の作業中ラベルを外さない', async () => {
+    const { client, calls } = makeClient(
+      [{ name: 'status:in-progress' }],
+      { body: 'https://github.com/vektor-inc/vk-terminals/issues/95' },
+    );
+
+    await client.setStatus(146, 'status:failed');
+
+    assert.equal(calls.some(call => call[0] === 'removeLabel'), false);
+  });
+
+  it('setStatus: status:done の再設定でもラベルを外すが完了コメントは再投稿しない', async () => {
+    const { client, calls } = makeClient(
+      [{ name: 'status:done' }],
+      { body: 'https://github.com/vektor-inc/vk-terminals/issues/95' },
+    );
+
+    await client.setStatus(146, 'status:done');
+
+    assert.equal(calls.filter(call => call[0] === 'removeLabel').length, 1);
+    assert.equal(calls.some(call => call[0] === 'postSourceCompletionComment'), false);
+  });
+
+  it('setStatus: source issue URL が無ければ作業中ラベルを外さない', async () => {
+    const { client, calls } = makeClient(
+      [{ name: 'status:waiting-merge' }],
+      { body: 'source issue URL なし' },
+    );
+
+    await client.setStatus(146, 'status:done');
+
+    assert.equal(calls.some(call => call[0] === 'removeLabel'), false);
+  });
+
+  it('setStatus: 作業中ラベルの削除失敗は status 更新を失敗させない', async () => {
+    const { client } = makeClient(
+      [{ name: 'status:waiting-merge' }],
+      { body: 'https://github.com/vektor-inc/vk-terminals/issues/95' },
+    );
+    client.octokit.issues.removeLabel = async () => {
+      const err = new Error('secondary rate limit');
+      err.status = 403;
+      throw err;
+    };
+
+    await assert.doesNotReject(() => client.setStatus(146, 'status:done'));
+  });
+
   it('setPriority: priority:* だけを差し替え、他のラベルを温存する', async () => {
     const { client, calls } = makeClient([
       { name: 'status:ready' },

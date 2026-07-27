@@ -198,7 +198,9 @@ export class LocalQueueClient {
     let shouldNotify = false;
     await this.mutateTask(issueNumber, (task) => {
       shouldNotify = task.status !== nextStatus && (nextStatus === 'done' || nextStatus === 'failed');
-      sourceRef = shouldNotify ? extractSourceIssueRef(task.body) : null;
+      sourceRef = (shouldNotify || nextStatus === 'done')
+        ? extractSourceIssueRef(task.body)
+        : null;
       task.status = nextStatus;
       queueIssueUrl = `local://queue/${task.id}`;
     });
@@ -213,6 +215,16 @@ export class LocalQueueClient {
         await this.github.postSourceCompletionComment(sourceRef, queueIssueUrl, `status:${nextStatus}`);
       } catch (err) {
         console.warn(`  [LocalQueue] source 完了コメント投稿失敗 (${sourceRef.url}): ${err.message}`);
+      }
+    }
+
+    if (nextStatus === 'done' && sourceRef && this.github) {
+      // 非 404 の一過性失敗ではラベルが残り得るが、done の再設定時にも
+      // 冪等な削除を実行することで、後から自己修復できる余地を残す。
+      try {
+        await this.github.removeSourceWorkingLabel(sourceRef);
+      } catch (err) {
+        console.warn(`  [LocalQueue] source 作業中ラベル削除失敗 (${sourceRef.url}): ${err.message}`);
       }
     }
   }
@@ -427,5 +439,6 @@ export class LocalQueueClient {
   claimSourceIssueByLabelRemoval(...args) { return this.github.claimSourceIssueByLabelRemoval(...args); }
   restoreSourceTaskQueueLabel(...args) { return this.github.restoreSourceTaskQueueLabel(...args); }
   addSourceWorkingLabel(...args) { return this.github.addSourceWorkingLabel(...args); }
+  removeSourceWorkingLabel(...args) { return this.github.removeSourceWorkingLabel(...args); }
   searchSourceIssuesByLabel(...args) { return this.github.searchSourceIssuesByLabel(...args); }
 }

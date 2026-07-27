@@ -35,6 +35,7 @@ function fakeGitHubClient(extra = {}) {
     repo: 'task-queue',
     queueLabel: 'task-queue',
     postSourceCompletionComment: async () => {},
+    removeSourceWorkingLabel: async () => {},
     ...extra,
   };
 }
@@ -139,7 +140,21 @@ async function importNewTasksLikeEngine(client, sourceOrg, queueLabel) {
 
 runQueueClientContract({ label: 'LocalQueueClient', createClient: createLocalQueueClient });
 
-test('LocalQueueClient: setStatus は queue.json を更新し、done 遷移時だけ source 完了コメントを委譲する', async () => {
+test('LocalQueueClient: removeSourceWorkingLabel を GitHub client へ委譲する', async () => {
+  const calls = [];
+  const client = createLocalQueueClient([], {
+    githubClient: fakeGitHubClient({
+      removeSourceWorkingLabel: async (...args) => calls.push(args),
+    }),
+  });
+  const target = { owner: 'vektor-inc', repo: 'example', number: 55 };
+
+  await client.removeSourceWorkingLabel(target);
+
+  assert.deepEqual(calls, [[target]]);
+});
+
+test('LocalQueueClient: setStatus は done 再設定でも作業中ラベルを外し、完了コメントは遷移時だけ投稿する', async () => {
   const calls = [];
   const client = createLocalQueueClient([
     {
@@ -149,7 +164,12 @@ test('LocalQueueClient: setStatus は queue.json を更新し、done 遷移時�
     },
   ], {
     githubClient: fakeGitHubClient({
-      postSourceCompletionComment: async (...args) => calls.push(args),
+      postSourceCompletionComment: async (...args) => {
+        calls.push(['postSourceCompletionComment', ...args]);
+      },
+      removeSourceWorkingLabel: async (...args) => {
+        calls.push(['removeSourceWorkingLabel', ...args]);
+      },
     }),
   });
 
@@ -158,15 +178,26 @@ test('LocalQueueClient: setStatus は queue.json を更新し、done 遷移時�
 
   const queue = readQueue(client.queuePath);
   assert.equal(queue.tasks[0].status, 'done');
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0][0], {
+  assert.equal(calls.filter(call => call[0] === 'postSourceCompletionComment').length, 1);
+  assert.equal(calls.filter(call => call[0] === 'removeSourceWorkingLabel').length, 2);
+  assert.deepEqual(calls[0][1], {
     url: 'https://github.com/vektor-inc/example/issues/55',
     owner: 'vektor-inc',
     repo: 'example',
     number: 55,
   });
-  assert.equal(calls[0][1], 'local://queue/11');
-  assert.equal(calls[0][2], 'status:done');
+  assert.equal(calls[0][2], 'local://queue/11');
+  assert.equal(calls[0][3], 'status:done');
+  assert.deepEqual(calls[1], [
+    'removeSourceWorkingLabel',
+    {
+      url: 'https://github.com/vektor-inc/example/issues/55',
+      owner: 'vektor-inc',
+      repo: 'example',
+      number: 55,
+    },
+  ]);
+  assert.deepEqual(calls[2], calls[1]);
 });
 
 test('LocalQueueClient: closeIssue は物理削除せず一覧から除外する', async () => {
@@ -556,6 +587,9 @@ test('LocalQueueClient: automerge 条件充足時に mergePR と done-gate 経�
       postSourceCompletionComment: async (...args) => {
         calls.push(['postSourceCompletionComment', ...args]);
       },
+      removeSourceWorkingLabel: async (...args) => {
+        calls.push(['removeSourceWorkingLabel', ...args]);
+      },
     }),
   });
 
@@ -618,6 +652,7 @@ test('LocalQueueClient: automerge 条件充足時に mergePR と done-gate 経�
       'getIssueState',
       'listSubIssueStates',
       'postSourceCompletionComment',
+      'removeSourceWorkingLabel',
     ],
   );
   assert.deepEqual(calls.find(call => call[0] === 'mergePR'), [

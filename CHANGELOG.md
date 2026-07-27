@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 不具合修正 ] 作業完了後も対象 issue に作業中ラベルが残り続ける不具合を修正
+
 = 0.24.0 =
 
 - [ 機能追加 ] 実行面として tmux を選べる tmux モードを追加（`terminals.mode=tmux`。Electron/GUI 不要でコンテナ環境でも動作し、各タスクを tmux ペインに並べて表示）

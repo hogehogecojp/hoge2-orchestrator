@@ -246,9 +246,9 @@ export class GitHubClient {
   //
   // 副作用: status:done / status:failed への「遷移」を検知した場合、作業対象リポジトリ側 issue
   // （タスク登録リポジトリ側 issue 本文 1 行目に記録された外部リポジトリの issue URL）に
-  // 完了/失敗通知コメントを投稿する。同じ status を再設定するだけのケース（restart
-  // 復旧で同状態に上書きされた、recheck ループで再評価された等）では遷移ではないので
-  // コメントは投稿しない。コメント投稿失敗時はラベル更新の成功を損なわないよう warn のみ。
+  // 完了/失敗通知コメントを投稿する。status:done では遷移の有無にかかわらず作業中ラベルも
+  // 削除する。同じ status の再設定時は完了コメントを二重投稿せず、ラベル削除だけを再試行する。
+  // いずれの副作用も失敗時はラベル更新の成功を損なわないよう warn のみにする。
   async setStatus(issueNumber, newStatus) {
     const { data: issue } = await this.octokit.issues.get({
       owner: this.owner,
@@ -269,14 +269,29 @@ export class GitHubClient {
 
     console.log(`  [GitHub] issue #${issueNumber} → ${newStatus}`);
 
-    if (isTransition && (newStatus === 'status:done' || newStatus === 'status:failed')) {
+    const shouldNotify = isTransition
+      && (newStatus === 'status:done' || newStatus === 'status:failed');
+    const shouldRemoveWorkingLabel = newStatus === 'status:done';
+    if (shouldNotify || shouldRemoveWorkingLabel) {
       const sourceRef = extractSourceIssueRef(issue.body);
       if (sourceRef) {
-        const queueIssueUrl = `https://github.com/${this.owner}/${this.repo}/issues/${issueNumber}`;
-        try {
-          await this.postSourceCompletionComment(sourceRef, queueIssueUrl, newStatus);
-        } catch (err) {
-          console.warn(`  [GitHub] source 完了コメント投稿失敗 (${sourceRef.url}): ${err.message}`);
+        if (shouldNotify) {
+          const queueIssueUrl = `https://github.com/${this.owner}/${this.repo}/issues/${issueNumber}`;
+          try {
+            await this.postSourceCompletionComment(sourceRef, queueIssueUrl, newStatus);
+          } catch (err) {
+            console.warn(`  [GitHub] source 完了コメント投稿失敗 (${sourceRef.url}): ${err.message}`);
+          }
+        }
+
+        if (shouldRemoveWorkingLabel) {
+          // 非 404 の一過性失敗ではラベルが残り得るが、done の再設定時にも
+          // 冪等な削除を実行することで、後から自己修復できる余地を残す。
+          try {
+            await this.removeSourceWorkingLabel(sourceRef);
+          } catch (err) {
+            console.warn(`  [GitHub] source 作業中ラベル削除失敗 (${sourceRef.url}): ${err.message}`);
+          }
         }
       }
     }
@@ -1200,5 +1215,22 @@ export class GitHubClient {
       issue_number: sourceIssue.number,
       labels: [workingLabel],
     });
+  }
+
+  // 作業完了後、作業対象リポジトリの Issue から作業中ラベルを外す。
+  // ラベルが付いていない／定義されていない場合の 404 は完了済みとして扱う。
+  async removeSourceWorkingLabel({ owner, repo, number }) {
+    const workingLabel = getLabelsConfig().workingInProgress;
+    try {
+      await this.octokit.issues.removeLabel({
+        owner,
+        repo,
+        issue_number: number,
+        name: workingLabel,
+      });
+    } catch (err) {
+      if (err.status === 404) return;
+      throw err;
+    }
   }
 }
