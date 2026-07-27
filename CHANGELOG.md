@@ -1,5 +1,8 @@
 # Changelog
 
+= 0.23.2 =
+
+- [ 仕様変更 ] vk-terminals を 1.44.0 から 1.46.0 にアップデート
 - [ 不具合修正 ] automerge ラベルを PR 作成後に付与すると waiting-input で滞留した issue がマージ判定に乗らず永久に自動マージされない不具合を修正
 - [ 不具合修正 ] automerge ラベル付きで waiting-input に滞留した issue の PR を GitHub UI 等で外部から手動マージしても close されず waiting-input のまま残る不具合を修正
 - [ 不具合修正 ] ペインの入力欄に残留文字があるとタスク本文がその後ろに連結され、スラッシュコマンドが発火せずタスクが起動しない不具合を修正
