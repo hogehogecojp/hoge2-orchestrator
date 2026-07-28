@@ -73,7 +73,7 @@ doctor の結果で未充足のものだけを、この順で確認する。🔴
 | 2-6 | `workspace.search_paths`（作業リポジトリの置き場） | 🟡主要 | C | 作業対象リポジトリのローカルクローンを探す起点ディレクトリ（絶対パス・複数可・優先順）。**A の `orchestrator.taskCwd` は廃止済みのため使わない** |
 | 3-1 | `org.allowed_owners` に owner を含める | 🔴必須 | C | `github.owner` から自動プリフィル。跨ぐ組織があれば追加 |
 | 3-2 | `features.coderabbit` | 🟡主要 | C | CodeRabbit 未導入の社外・個人には OFF を提案（コード既定は true のまま） |
-| 3-3 | `staff_wp_dev.engine` / `staff_review.engine` / `multi_repo_task.default_engine` | 🟡主要 | C | 実装に使う AI エンジン（claude / codex） |
+| 3-3 | `agents.default_engine` / `agents.engine.vk-wp-developer` / `agents.engine.vk-ui-tester` / `multi_repo_task.default_engine` | 🟡主要 | C | 実装に使う AI エンジン（claude / codex）。メンバー個別指定が空なら `agents.default_engine`、それも空なら claude |
 | 3-4 | `org.review_assets_repo` | 🟢任意 | C | `owner/repo` 形式（descriptor の pattern で検証） |
 | 4-1 | `apiHost` | 🟢任意 | B | 別マシンの VK Terminals を使う構成のときのみ |
 
@@ -92,7 +92,7 @@ owner を 1 回入れれば「キューの見先」と「スキルの硬ゲー�
 ### 手順 3: 保存する
 
 - **A・B**: 上表の保存先に従い、既存 JSON を読み込んで対象キーをマージし書き戻す（descriptor のキー名・型に従う）。
-- **C**: C 対象の値（`workspace.search_paths` / `org.allowed_owners` / `features.*` / `staff_*.engine` / `multi_repo_task.default_engine` / `org.review_assets_repo`）を **いったん A の統合 config に入れてから**、次を実行して投影する:
+- **C**: C 対象の値（`workspace.search_paths` / `org.allowed_owners` / `features.*` / `agents.default_engine` / `agents.engine.*` / `multi_repo_task.default_engine` / `org.review_assets_repo`）を **いったん A の統合 config に入れてから**、次を実行して投影する:
 
   ```
   node bin/vk-orchestrator.js apply

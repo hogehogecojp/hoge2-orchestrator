@@ -39,8 +39,12 @@
   "org": {
     "review_assets_repo": ""
   },
-  "staff_wp_dev": {
-    "engine": ""
+  "agents": {
+    "default_engine": "",
+    "engine": {
+      "vk-wp-developer": "",
+      "vk-ui-tester": ""
+    }
   },
   "multi_repo_task": {
     "default_engine": ""

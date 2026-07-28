@@ -265,14 +265,157 @@ export function migrateLegacyOrchestratorConfig(options = {}) {
   return { migrated: true, sourcePath, targetPath };
 }
 
+// vk-agents#291 で、メンバーの実行エンジン設定キーが `<スキル名>.engine` から
+// `agents.engine.<エージェント定義名>` のマップ形式へ変わった（vk-agents 側は後方互換を持たない）。
+// 旧→新の対応は本リポジトリだけが受け持つため、対応表をここに単一ソース化して
+// 移行処理・退避対象キー一覧の両方から参照する。
+const LEGACY_ENGINE_KEY_MAP = Object.freeze({
+  'staff_wp_dev.engine': 'agents.engine.vk-wp-developer',
+  'staff_review.engine': 'agents.engine.vk-ui-tester',
+});
+
+/** エンジン設定として受理する値（これ以外は投影せず、正本に残っていれば未設定へ正規化する）。 */
+const ENGINE_SETTING_VALUES = Object.freeze(['claude', 'codex']);
+
+/** 受理値の表示ラベル（descriptor の options は必ずここから組む）。 */
+const ENGINE_VALUE_LABELS = Object.freeze({ claude: 'Claude', codex: 'Codex' });
+
+/** GUI 保存値を vk-agents 正本 config へ投影するエンジン系キー（受理条件は共通）。 */
+const ENGINE_SETTING_KEYS = Object.freeze([
+  'agents.default_engine',
+  'agents.engine.vk-wp-developer',
+  'agents.engine.vk-ui-tester',
+  'multi_repo_task.default_engine',
+]);
+
 const LEGACY_VK_AGENTS_GUI_KEYS = [
   'features.coderabbit',
   'features.coderabbit_ignore',
-  'staff_wp_dev.engine',
-  'staff_review.engine',
-  'multi_repo_task.default_engine',
+  // エンジン系キーは ENGINE_SETTING_KEYS から導出する（メンバーを増やすときの触り漏れを防ぐ）。
+  ...ENGINE_SETTING_KEYS,
+  // 旧エンジン設定キー（vk-agents#291 以前の形式）も退避対象に残す。旧 orchestrator config に
+  // 残っていると up/apply の投影で正本を汚すため、いったん canonical へ移してから
+  // migrateLegacyEngineKeys() で新キーへ変換し、旧キーは canonical にも残さない。
+  ...Object.keys(LEGACY_ENGINE_KEY_MAP),
   'org.review_assets_repo',
 ];
+
+/**
+ * エンジン select の選択肢を組む。
+ *
+ * 受理値の列挙をハードコードせず ENGINE_SETTING_VALUES から生成し、
+ * 「パネルに出るが投影されない」値のズレを構造的に防ぐ。
+ * @param {string} unsetLabel 空値（未設定）の表示ラベル
+ * @returns {{ value: string, label: string }[]}
+ */
+function engineSelectOptions(unsetLabel) {
+  return [
+    { value: '', label: unsetLabel },
+    ...ENGINE_SETTING_VALUES.map((value) => ({ value, label: ENGINE_VALUE_LABELS[value] ?? value })),
+  ];
+}
+
+/**
+ * エンジン設定として受理できる値か（`claude` / `codex` のみ）。
+ * @param {*} value
+ * @returns {boolean}
+ */
+function isAcceptedEngineValue(value) {
+  return ENGINE_SETTING_VALUES.includes(String(value ?? '').trim());
+}
+
+/**
+ * 旧エンジン設定キーを新しい `agents.engine.<定義名>` 形式へ移し、旧キーを削除する。
+ *
+ * 対象オブジェクトを in-place で書き換える。判定は「キーの存在」ではなく
+ * **新キーに受理できる値（`claude` / `codex`）が入っているか** で行う。
+ * 設定パネルは「未設定」を空文字として保存し、config.example.json も空文字の新キーを持つため、
+ * 存在だけで判定すると利用者が設定した旧キーの `codex` が黙って消える。
+ * 新キーに受理できる値が無ければ旧キーの受理できる値を移し、旧キーは常に削除する
+ * （旧キーの値が `claude` / `codex` 以外なら移さず捨てる）。
+ * @param {object} config vk-agents 正本 config 相当のオブジェクト
+ * @param {{ log?: (message: string) => void }} [options]
+ * @returns {{ changed: boolean, migratedPaths: string[] }} changed=旧キーを削除・変換したか（＝書き込みが必要か）
+ *   / migratedPaths=旧キーの値を引き継いだ新キーのパス
+ */
+function migrateLegacyEngineKeys(config, options = {}) {
+  const result = { changed: false, migratedPaths: [] };
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return result;
+  const details = [];
+  for (const [legacyPath, nextPath] of Object.entries(LEGACY_ENGINE_KEY_MAP)) {
+    if (!hasOwnPath(config, legacyPath)) continue;
+    const legacyValue = String(getByPath(config, legacyPath) ?? '').trim();
+    if (!isAcceptedEngineValue(getByPath(config, nextPath)) && isAcceptedEngineValue(legacyValue)) {
+      setByPath(config, nextPath, legacyValue);
+      result.migratedPaths.push(nextPath);
+      details.push(`${legacyPath} → ${nextPath}=${legacyValue}`);
+    } else {
+      details.push(`${legacyPath}（値を破棄）`);
+    }
+    deleteLeafAndPruneParents(config, legacyPath);
+  }
+  if (details.length === 0) return result;
+  options.log?.(`[Config] 旧エンジン設定キーを新形式へ移行しました: ${details.join(' / ')}`);
+  result.changed = true;
+  return result;
+}
+
+/**
+ * 値が blank のエンジン設定キーだけを「未設定」へ畳む。
+ *
+ * 設定パネル（VK Terminals）はこのグループを正本 config へ直接書き、select の「未設定」を
+ * キー削除ではなく空文字として保存するため、正本に `"vk-wp-developer": ""` が残り得る。
+ * vk-agents のエンジン解決（rules/agent-launch.md「起動エンジンの解決」）は
+ * 「キー未設定なら次の順へ」しか定義しておらず、空文字が共通既定へ進むのか即 Claude なのかが
+ * 決まっていない。blank をキーごと落として「未設定」と同義にし、設定パネルの説明どおりの
+ * フォールバックを保証する。設定パネル経由の値は cfg には現れないため、cfg の有無に関わらず
+ * 正本側を見る。
+ *
+ * **落とすのは blank（`''` / `null` / `undefined` / 空白のみ）だけ**で、`gemini` や `Codex` の
+ * ように受理できないが非空の値は保持する。ENGINE_SETTING_VALUES は vk-agents 側の知識の複製
+ * なので、受理できない値をすべて消すと「vk-agents が対応した新エンジンを利用者が手書きしたのに、
+ * vk-orchestrator が追随するまで `up` の度に黙って消える」「`Codex` の打ち間違いに気づけない」
+ * という後退になる。投影ループの「受理できない値は無視して既存値を保持」とも揃える。
+ *
+ * 対象は ENGINE_SETTING_KEYS の 4 キーだけで、利用者が手で書いた
+ * `agents.engine.vk-ux-designer` などには触らない。
+ * @param {object} config vk-agents 正本 config 相当のオブジェクト
+ * @returns {boolean} blank のキーを削除したか（＝書き込みが必要か）
+ */
+function normalizeEngineSettings(config) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return false;
+  let changed = false;
+  for (const key of ENGINE_SETTING_KEYS) {
+    if (!hasOwnPath(config, key)) continue;
+    if (!isBlankValue(getByPath(config, key))) continue;
+    deleteLeafAndPruneParents(config, key);
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * 「未設定」と同義とみなす blank な値か（`''` / `null` / `undefined` / 空白のみ）。
+ * @param {*} value
+ * @returns {boolean}
+ */
+function isBlankValue(value) {
+  return value === null || value === undefined || String(value).trim() === '';
+}
+
+/**
+ * leaf を削除し、空になった親オブジェクトを畳む。
+ *
+ * 正本 config は利用者が手で開くファイルなので、`agents: { engine: {} }` のような残骸を
+ * 残して「何か設定されている」と誤読させないための後片付けを 1 か所に集約する。
+ * 兄弟キーが残っている親は空でないため畳まれない。
+ * @param {object} config 対象オブジェクト（in-place で書き換える）
+ * @param {string} path ドット区切りのキーパス
+ */
+function deleteLeafAndPruneParents(config, path) {
+  deleteByPath(config, path);
+  pruneEmptyParents(config, path);
+}
 
 /**
  * 旧 orchestrator config に残った vk-agents GUI 設定を、vk-agents 正本 config へ初回移行する。
@@ -312,20 +455,32 @@ export function migrateLegacyVkAgentsGuiKeys(options = {}) {
   }
 
   let canonicalChanged = false;
+  const movedKeys = [];
   for (const path of legacyKeys) {
-    if (!hasOwnPath(canonicalConfig, path)) {
-      setByPath(canonicalConfig, path, getByPath(orchestratorConfig, path));
+    const value = getByPath(orchestratorConfig, path);
+    // blank（空文字・null）は「未設定」と同義なので正本へ書かない（正本に殻を増やさないため）。
+    if (!hasOwnPath(canonicalConfig, path) && !isBlankValue(value)) {
+      setByPath(canonicalConfig, path, value);
+      movedKeys.push(path);
       canonicalChanged = true;
     }
-    deleteByPath(orchestratorConfig, path);
-    pruneEmptyParents(orchestratorConfig, path);
+    deleteLeafAndPruneParents(orchestratorConfig, path);
   }
+
+  // 退避で旧エンジンキーが canonical へ入り得るため、書き込み前に新形式へ畳む。
+  if (migrateLegacyEngineKeys(canonicalConfig, { log }).changed) canonicalChanged = true;
 
   if (canonicalChanged) {
     writeJsonAtomic(targetPath, canonicalConfig);
   }
   writeJsonAtomic(sourcePath, orchestratorConfig);
-  log(`[Config] 旧 vk-agents GUI 設定を ${sourcePath} から削除し、未設定項目だけ ${targetPath} へ移行しました。`);
+  // 実際に移送した項目が無い（正本に既に値がある・値が blank だけ）ケースもあるため、
+  // 「移行しました」と言い切らず実態を出す。
+  log(
+    movedKeys.length > 0
+      ? `[Config] 旧 vk-agents GUI 設定を ${sourcePath} から削除し、正本が未設定だった ${movedKeys.join(' / ')} を ${targetPath} へ移行しました。`
+      : `[Config] 旧 vk-agents GUI 設定を ${sourcePath} から削除しました（${targetPath} へ移送した項目はありません）。`,
+  );
   return { migrated: true, sourcePath, targetPath };
 }
 
@@ -540,7 +695,33 @@ function hasOwnPath(obj, path) {
   return true;
 }
 
+/**
+ * プロトタイプ汚染につながるキーを含むパスかどうか。
+ *
+ * deepMerge / pruneEmpty と同じ多層防御を path 操作にも揃える。`agents.engine.<定義名>` の
+ * ように将来キーの一部が外部由来になりうるため、書き込み・削除の入口で弾く。
+ * @param {string} path ドット区切りのキーパス
+ * @returns {boolean}
+ */
+function hasUnsafePathKey(path) {
+  return path
+    .split('.')
+    .some((key) => key === '__proto__' || key === 'constructor' || key === 'prototype');
+}
+
+/**
+ * ドット区切りパスへ値を書き込む（中間オブジェクトは自動生成）。
+ *
+ * **危険キー（`__proto__` / `constructor` / `prototype`）を含むパスは黙って no-op する。**
+ * 将来 `agents.engine.<定義名>` のようにキーを動的生成する場合、この静かな失敗は
+ * 「設定パネルに項目は出るのに保存されない」という無言の不具合になるため、
+ * 呼び出し側でキー名を検証すること。
+ * @param {object} obj 対象オブジェクト（in-place で書き換える）
+ * @param {string} path ドット区切りのキーパス
+ * @param {*} value 書き込む値
+ */
 function setByPath(obj, path, value) {
+  if (hasUnsafePathKey(path)) return;
   const keys = path.split('.');
   let cur = obj;
   for (const key of keys.slice(0, -1)) {
@@ -552,7 +733,16 @@ function setByPath(obj, path, value) {
   cur[keys.at(-1)] = value;
 }
 
+/**
+ * ドット区切りパスの leaf を削除する。
+ *
+ * setByPath と同様、**危険キーを含むパスは黙って no-op する**（削除されないまま
+ * 「消したのに残る」という無言の不具合になりうるため、動的キーは呼び出し側で検証すること）。
+ * @param {object} obj 対象オブジェクト（in-place で書き換える）
+ * @param {string} path ドット区切りのキーパス
+ */
 function deleteByPath(obj, path) {
+  if (hasUnsafePathKey(path)) return;
   const keys = path.split('.');
   let cur = obj;
   for (const key of keys.slice(0, -1)) {
@@ -898,8 +1088,17 @@ function firstOwnedValue(obj, paths) {
 const OWNER_REPO_PATTERN = '^(?!\\.{1,2}/)[A-Za-z0-9._-]+/(?!\\.{1,2}$)[A-Za-z0-9._-]+$';
 const OWNER_REPO_RE = new RegExp(OWNER_REPO_PATTERN);
 
-function applyVkAgentsGuiSettings(vkAgentsConfig, cfg) {
+function applyVkAgentsGuiSettings(vkAgentsConfig, cfg, options = {}) {
+  const log = options.log ?? console.log;
   const out = deepMerge({}, vkAgentsConfig);
+
+  // 旧エンジンキーの読み替えは正本（canonical）の中だけで行う。cfg（orchestrator 統合 config）に
+  // 残った旧キーは読まない（stale な値で正本を蘇らせないため。CodeRabbit 設定と同じ方針）。
+  // 「移行 → 正規化 → 投影」の順で、cfg 由来の明示値が最後に勝つ。
+  // 戻り値の changed は使わない（writeVkAgentsSettings はここで得た out を常に書き出すため、
+  // 「変わったか」で書き込みを分岐する必要がない）。
+  const { migratedPaths } = migrateLegacyEngineKeys(out, { log });
+  normalizeEngineSettings(out);
 
   if (hasOwnPath(cfg, 'features')) {
     const rawFeatures = pruneEmpty(getByPath(cfg, 'features'));
@@ -941,41 +1140,37 @@ function applyVkAgentsGuiSettings(vkAgentsConfig, cfg) {
     setByPath(out, 'org.allowed_owners', allowedOwners);
   }
 
-  for (const key of ['org.review_assets_repo']) {
+  if (hasOwnPath(cfg, 'org.review_assets_repo')) {
+    const raw = String(getByPath(cfg, 'org.review_assets_repo') ?? '').trim();
+    if (raw === '') {
+      deleteLeafAndPruneParents(out, 'org.review_assets_repo');
+    } else if (OWNER_REPO_RE.test(raw)) {
+      // 受理条件は OWNER_REPO_PATTERN に単一ソース化済み（descriptor の pattern と同一）。
+      setByPath(out, 'org.review_assets_repo', raw);
+    }
+  }
+
+  // エンジン系キーは cfg 側の受理条件が共通（空文字＝正本の値を削除して既定へ戻す /
+  // claude・codex＝採用 / それ以外＝無視して正本の既存値をそのまま残す）なので 1 か所で扱う。
+  // 正本側に残っている blank は上の normalizeEngineSettings が畳んでいる。
+  for (const key of ENGINE_SETTING_KEYS) {
     if (!hasOwnPath(cfg, key)) continue;
     const raw = String(getByPath(cfg, key) ?? '').trim();
     if (raw === '') {
-      deleteByPath(out, key);
-    } else if (OWNER_REPO_RE.test(raw)) {
-      // 受理条件は OWNER_REPO_PATTERN に単一ソース化済み（descriptor の pattern と同一）。
+      // 空文字は「明示値」ではなく「意見なし」。設定パネルはこのグループを正本へ直接書くので、
+      // cfg 側の空文字は config.example.json の雛形が残っているだけのことが多い。
+      // 同じ実行の移行で旧キーから引き継いだ値を、その雛形で消してしまわないようにする。
+      //
+      // この例外は「移行が同じ実行で走ったとき」だけ効く。2 回目以降の呼び出しでは旧キーが
+      // 既に消えており migratedPaths が空になるため、cfg の空文字で削除される。
+      // 実運用ではこれに到達しない: bin/vk-orchestrator.js の起動時に
+      // migrateLegacyVkAgentsGuiKeys() が統合 config 側のエンジンキーを退避・削除するため、
+      // up/apply の時点で cfg にエンジンキーは残っていない。この前提が崩れると
+      // 2 回目の up で設定が消えるので、起動時退避を外すときはここも見直すこと。
+      if (migratedPaths.includes(key)) continue;
+      deleteLeafAndPruneParents(out, key);
+    } else if (ENGINE_SETTING_VALUES.includes(raw)) {
       setByPath(out, key, raw);
-    }
-  }
-
-  if (hasOwnPath(cfg, 'staff_wp_dev.engine')) {
-    const raw = String(getByPath(cfg, 'staff_wp_dev.engine') ?? '').trim();
-    if (raw === '') {
-      deleteByPath(out, 'staff_wp_dev.engine');
-    } else if (raw === 'claude' || raw === 'codex') {
-      setByPath(out, 'staff_wp_dev.engine', raw);
-    }
-  }
-
-  if (hasOwnPath(cfg, 'staff_review.engine')) {
-    const raw = String(getByPath(cfg, 'staff_review.engine') ?? '').trim();
-    if (raw === '') {
-      deleteByPath(out, 'staff_review.engine');
-    } else if (raw === 'claude' || raw === 'codex') {
-      setByPath(out, 'staff_review.engine', raw);
-    }
-  }
-
-  if (hasOwnPath(cfg, 'multi_repo_task.default_engine')) {
-    const raw = String(getByPath(cfg, 'multi_repo_task.default_engine') ?? '').trim();
-    if (raw === '') {
-      deleteByPath(out, 'multi_repo_task.default_engine');
-    } else if (raw === 'claude' || raw === 'codex') {
-      setByPath(out, 'multi_repo_task.default_engine', raw);
     }
   }
 
@@ -989,7 +1184,7 @@ function applyVkAgentsGuiSettings(vkAgentsConfig, cfg) {
  * そのうえで sync.sh --claude-global と同じく ~/.claude/vk-agents-settings.json へ同内容を
  * 派生ファイルとして書き出す（reader はこの派生ファイルを読むため）。
  * @param {object} cfg loadUnifiedConfig() の戻り値
- * @param {{ configPath?: string, globalSettingsPath?: string, force?: boolean }} [options]
+ * @param {{ configPath?: string, globalSettingsPath?: string, force?: boolean, log?: (message:string)=>void }} [options]
  * @returns {{ configPath: string, globalSettingsPath: string }|null}
  */
 export function writeVkAgentsSettings(cfg = {}, options = {}) {
@@ -1007,9 +1202,8 @@ export function writeVkAgentsSettings(cfg = {}, options = {}) {
     hasOwnPath(cfg, 'skills.disabled') ||
     hasOwnPath(cfg, 'org.allowed_owners') ||
     hasOwnPath(cfg, 'org.review_assets_repo') ||
-    hasOwnPath(cfg, 'staff_wp_dev.engine') ||
-    hasOwnPath(cfg, 'staff_review.engine') ||
-    hasOwnPath(cfg, 'multi_repo_task.default_engine');
+    // エンジン系キーは ENGINE_SETTING_KEYS から導出する（descriptor / 投影と単一ソースを共有）。
+    ENGINE_SETTING_KEYS.some((key) => hasOwnPath(cfg, key));
   if (!hasConfig && !hasGuiSettings && options.force !== true) return null;
 
   let vkAgentsConfig;
@@ -1020,7 +1214,7 @@ export function writeVkAgentsSettings(cfg = {}, options = {}) {
     return null;
   }
 
-  const next = applyVkAgentsGuiSettings(vkAgentsConfig, cfg);
+  const next = applyVkAgentsGuiSettings(vkAgentsConfig, cfg, { log: options.log });
   writeJsonAtomic(configPath, next);
 
   const globalSettingsPath = options.globalSettingsPath ?? vkAgentsGlobalSettingsPath();
@@ -1169,27 +1363,18 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
         fields: [
           { key: 'workspace.search_paths', label: '作業ディレクトリ（複数指定可・優先順）', type: 'lines', placeholder: '/Users/you/Documents/git\n/Users/you/ghq', help: '作業対象リポジトリのローカルクローンを探す起点ディレクトリを、1 行に 1 つ・絶対パスで指定します（上の行ほど優先）。\nこの設定は次の 2 つの場面で使われます。\n(1) issue を処理するスキルがクローンを探すとき\n(2) オーケストレーターがタスク着手時にタスクペインを開く場所を決めるとき\n上から順に走査し、origin が対象リポジトリと一致する既存クローンを最大 4 階層まで自動検出して、そのディレクトリでスキルの作業とペインを開始します。見つからない場合、スキルは 1 行目のディレクトリへクローンします。\nオーケストレーターのペインは、対象リポジトリを特定できないとき・この設定が未設定のとき・検出できないときは、専用ディレクトリ ~/vk-orchestrator-tasks（自動作成。ホームディレクトリや機密ディレクトリは起点にしません）で開きます。' },
           { key: 'org.review_assets_repo', label: 'レビュー用アセットリポジトリ', type: 'text', placeholder: 'owner/repo', pattern: OWNER_REPO_PATTERN, invalidMessage: 'owner/repo の形式で入力してください（例: vektor-inc/task-queue）', help: 'PR・テスト報告用の画像/GIF を保存するリポジトリを <owner>/<repo> 形式で指定します。\n例: vektor-inc/review-assets\n形式が正しくない値は反映されません。空欄時は画像アップロードをスキップし、テキスト記述にフォールバックします', emptyToNull: true },
-          { key: 'staff_wp_dev.engine', label: 'staff-wp-dev（和田）の実行エンジン', type: 'select',
-            options: [
-              { value: '',       label: '未設定（既定: Claude）' },
-              { value: 'claude', label: 'Claude' },
-              { value: 'codex',  label: 'Codex（単独作業のみ・push/PR は司が担当）' },
-            ],
-            help: 'staff-wp-dev（和田）を起動するときの実行エンジン。未設定時は Claude にフォールバックします' },
-          { key: 'staff_review.engine', label: 'staff-review（麗美）の実行エンジン', type: 'select',
-            options: [
-              { value: '',       label: '未設定（既定: Claude）' },
-              { value: 'claude', label: 'Claude' },
-              { value: 'codex',  label: 'Codex（テスト実行のみ・PR コメント/差し戻しは司が担当）' },
-            ],
-            help: 'staff-review（麗美）を起動するときの実行エンジン。未設定時は Claude にフォールバックします' },
-          { key: 'multi_repo_task.default_engine', label: 'vk-multi-repo-task の既定実行エンジン', type: 'select',
-            options: [
-              { value: '',       label: '未設定（既定: Claude）' },
-              { value: 'claude', label: 'Claude' },
-              { value: 'codex',  label: 'Codex' },
-            ],
-            help: 'マルチリポジトリタスク（vk-multi-repo-task）を新規作成するときの既定エンジン。未設定時は Claude にフォールバックします' },
+          { key: 'agents.default_engine', label: 'メンバー共通の既定実行エンジン', type: 'select',
+            options: engineSelectOptions('未設定（既定: Claude）'),
+            help: '実行エンジンを個別に指定していないメンバーに使う既定値。ここも未設定なら Claude で起動します。\n実行エンジンを切り替えられるメンバー（現在は下に個別項目がある和田・麗美）に適用されます。\n下の「マルチリポジトリタスクの既定実行エンジン」は別項目で、この設定の影響を受けません。\nCodex を選んだメンバーは単独で完結する作業までを担当し、メンバー間の連携は司が引き取ります' },
+          { key: 'agents.engine.vk-wp-developer', label: '和田（WordPress 実装担当）の実行エンジン', type: 'select',
+            options: engineSelectOptions('未設定（共通の既定に従う）'),
+            help: '和田を起動するときの実行エンジン。テーマ・プラグイン・ブロックなど WordPress の実装を担当します（設定キー: agents.engine.vk-wp-developer）\n「未設定」のときは上の「メンバー共通の既定実行エンジン」を使い、それも未設定なら Claude で起動します。\nCodex を選ぶと和田は実装とローカルコミットまでを担当し、push と PR 作成は司が引き取ります' },
+          { key: 'agents.engine.vk-ui-tester', label: '麗美（UI・e2e テスト担当）の実行エンジン', type: 'select',
+            options: engineSelectOptions('未設定（共通の既定に従う）'),
+            help: '麗美を起動するときの実行エンジン。PR のブラウザ動作確認・Playwright テストを担当します（設定キー: agents.engine.vk-ui-tester）\n「未設定」のときは上の「メンバー共通の既定実行エンジン」を使い、それも未設定なら Claude で起動します。\nCodex を選ぶと麗美はテスト実行と判定までを担当し、PR コメントの投稿と差し戻しは司が引き取ります' },
+          { key: 'multi_repo_task.default_engine', label: 'マルチリポジトリタスクの既定実行エンジン', type: 'select',
+            options: engineSelectOptions('未設定（既定: Claude）'),
+            help: 'マルチリポジトリタスク（vk-multi-repo-task）を新規作成するときの既定エンジン。未設定時は Claude にフォールバックします。\n上の「メンバー共通の既定実行エンジン」の影響は受けません' },
           { key: 'features.coderabbit', label: 'CodeRabbit 監視を有効化', type: 'boolean', default: true, help: 'OFF で PR 後の CodeRabbit 監視をスキップし、/code-review 等での確認を案内します。\nOFF のときは automerge ラベル付きタスクの自動マージでも「CodeRabbit のコメントを 30 分待つ」処理を省略し、CI 通過などの条件が揃った時点でマージします。\n社外・個人リポジトリなど CodeRabbit 未導入の環境では OFF 推奨です' },
           { key: 'features.coderabbit_ignore', label: 'CodeRabbit レビューをスキップ（PR 本文に @coderabbitai ignore を記載）', type: 'boolean', default: false, help: 'ON で /vk-pr が PR 本文に @coderabbitai ignore を記載し、CodeRabbit レビューを抑止します。\nレビューが来ないため、automerge ラベル付きタスクの自動マージでも「CodeRabbit のコメントを 30 分待つ」処理を省略し、CI 通過などの条件が揃った時点でマージします。\n上の「CodeRabbit 監視を有効化」（features.coderabbit）が OFF のときは @coderabbitai ignore の記載も 30 分待機も行われないため、この設定は効果がありません' },
         ],

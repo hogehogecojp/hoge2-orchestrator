@@ -595,11 +595,15 @@ test('migrateLegacyVkAgentsGuiKeys: 旧 GUI キーを canonical へ移送し orc
         allowed_owners: ['existing-owner'],
         review_assets_repo: 'vektor-inc/review-assets',
       },
-      staff_wp_dev: { engine: 'codex' },
-      staff_review: { engine: 'claude' },
+      agents: { engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' } },
       multi_repo_task: { default_engine: 'claude' },
     });
-    assert.equal(logs.length, 1);
+    // 退避の要約 1 行と、旧エンジンキー変換の 1 行（何を何へ移したかが分かること）。
+    assert.equal(logs.length, 2);
+    assert.match(
+      logs.find((message) => message.includes('旧エンジン設定キー')),
+      /staff_wp_dev\.engine → agents\.engine\.vk-wp-developer=codex/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -631,6 +635,44 @@ test('migrateLegacyVkAgentsGuiKeys: canonical に既存値がある場合は上�
     assert.deepEqual(JSON.parse(readFileSync(targetPath, 'utf8')), {
       features: { coderabbit: true },
       org: { review_assets_repo: 'vektor-inc/new-assets' },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('migrateLegacyVkAgentsGuiKeys: orchestrator config の旧エンジンキーは canonical では新キーになり旧キーは残らない', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-migrate-'));
+  try {
+    const sourcePath = join(dir, 'orchestrator.json');
+    const targetPath = join(dir, '.vk-agents', 'config.json');
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(sourcePath, JSON.stringify({
+      github: { owner: 'vektor-inc' },
+      staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
+      agents: { default_engine: 'claude' },
+    }));
+    writeFileSync(targetPath, JSON.stringify({ features: { task_queue: true } }));
+
+    const result = migrateLegacyVkAgentsGuiKeys({
+      orchestratorConfigPath: sourcePath,
+      canonicalConfigPath: targetPath,
+      log: () => {},
+    });
+
+    assert.equal(result.migrated, true);
+    // orchestrator config には旧キー・新キーのどちらも残らない。
+    assert.deepEqual(JSON.parse(readFileSync(sourcePath, 'utf8')), {
+      github: { owner: 'vektor-inc' },
+    });
+    // canonical では新形式に畳まれ、旧キーは残らない。
+    assert.deepEqual(JSON.parse(readFileSync(targetPath, 'utf8')), {
+      features: { task_queue: true },
+      agents: {
+        default_engine: 'claude',
+        engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' },
+      },
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -796,8 +838,10 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
     writeFileSync(configPath, JSON.stringify({
       org: { allowed_owners: ['vektor-inc'] },
       features: { task_queue: true },
-      staff_wp_dev: { engine: 'claude' },
-      staff_review: { engine: 'claude' },
+      agents: {
+        default_engine: 'claude',
+        engine: { 'vk-wp-developer': 'claude', 'vk-ui-tester': 'claude' },
+      },
       multi_repo_task: { default_engine: 'claude' },
     }));
 
@@ -807,8 +851,10 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
           review_assets_repo: 'vektor-inc/review-assets',
         },
         features: { coderabbit: false, coderabbit_ignore: true },
-        staff_wp_dev: { engine: 'codex' },
-        staff_review: { engine: 'codex' },
+        agents: {
+          default_engine: 'codex',
+          engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'codex' },
+        },
         multi_repo_task: { default_engine: 'codex' },
       },
       { configPath, globalSettingsPath },
@@ -822,8 +868,10 @@ test('writeVkAgentsSettings: GUI の vk-agents 共通設定だけを read-merge-
         review_assets_repo: 'vektor-inc/review-assets',
       },
       features: { task_queue: true, coderabbit: false, coderabbit_ignore: true },
-      staff_wp_dev: { engine: 'codex' },
-      staff_review: { engine: 'codex' },
+      agents: {
+        default_engine: 'codex',
+        engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'codex' },
+      },
       multi_repo_task: { default_engine: 'codex' },
     });
     assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
@@ -1101,8 +1149,139 @@ test('writeVkAgentsSettings: features.coderabbit_ignore の文字列 boolean を
   }
 });
 
-test('writeVkAgentsSettings: 和田エンジンの空値は vk-agents config から削除し既定へ戻せる', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
+test('writeVkAgentsSettings: canonical に残った旧エンジンキーを新しい agents.engine 形式へ移して旧キーを消す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
+      features: { coderabbit: true },
+    }));
+    const logs = [];
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: (m) => logs.push(m) });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, {
+      features: { coderabbit: true },
+      agents: { engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' } },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+    // 正本を書き替える移行なので、何を何へ移したかが分かる 1 行を残す。
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /staff_wp_dev\.engine → agents\.engine\.vk-wp-developer=codex/);
+    assert.match(logs[0], /staff_review\.engine → agents\.engine\.vk-ui-tester=claude/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 新キーに受理できる値があるときは新キーを保ち旧キーだけ消す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'codex' },
+      agents: { engine: { 'vk-wp-developer': 'claude', 'vk-ui-tester': 'claude' } },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, {
+      agents: { engine: { 'vk-wp-developer': 'claude', 'vk-ui-tester': 'claude' } },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 新キーが空文字なら旧キーの値を引き継ぐ（設定パネルの「未設定」で設定が消えない）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    // 設定パネルは「未設定」をキー削除ではなく空文字で保存するため、
+    // 新キーの存在だけで判定すると旧キーの codex が黙って消える。
+    writeFileSync(configPath, JSON.stringify({
+      staff_wp_dev: { engine: 'codex' },
+      staff_review: { engine: 'claude' },
+      agents: { default_engine: '', engine: { 'vk-wp-developer': '', 'vk-ui-tester': '' } },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, {
+      agents: { engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' } },
+    });
+    // 空文字だった agents.default_engine は正規化で消え、「未設定」と同義になる。
+    assert.equal(Object.prototype.hasOwnProperty.call(written.agents, 'default_engine'), false);
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: config.example.json 相当の空エンジン設定を統合 config から渡しても正本の旧キーの値は消えない', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      staff_wp_dev: { engine: 'codex' },
+      features: { coderabbit: true },
+    }));
+
+    // config.example.json をコピーしたままの統合 config（全キーが空文字）で apply しても、
+    // 正本の設定を空で潰さない。
+    writeVkAgentsSettings(
+      {
+        agents: { default_engine: '', engine: { 'vk-wp-developer': '', 'vk-ui-tester': '' } },
+        multi_repo_task: { default_engine: '' },
+      },
+      { configPath, globalSettingsPath, log: () => {} },
+    );
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.equal(written.agents.engine['vk-wp-developer'], 'codex');
+    assert.deepEqual(written, {
+      features: { coderabbit: true },
+      agents: { engine: { 'vk-wp-developer': 'codex' } },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 旧エンジンキーの値が claude / codex 以外なら新キーを作らず旧キーだけ消す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      staff_wp_dev: { engine: 'gemini' },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, { features: { coderabbit: true } });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 旧エンジンキーの親に兄弟キーが残る場合は親を畳まない', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-migrate-'));
   try {
     const configPath = join(dir, 'config.json');
     const globalSettingsPath = join(dir, 'settings.json');
@@ -1111,14 +1290,106 @@ test('writeVkAgentsSettings: 和田エンジンの空値は vk-agents config か
       features: { coderabbit: true },
     }));
 
-    writeVkAgentsSettings(
-      { staff_wp_dev: { engine: '' } },
-      { configPath, globalSettingsPath },
-    );
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    // 掃除しすぎの回帰検知: leaf だけ消し、GUI が扱わない兄弟キーは残す。
+    assert.deepEqual(written, {
+      staff_wp_dev: { other: true },
+      features: { coderabbit: true },
+      agents: { engine: { 'vk-wp-developer': 'codex' } },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 正本側の空文字・null のエンジン設定は cfg に無くても削除し親を畳む', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-normalize-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    // 設定パネルはこのグループを正本へ直接書き、「未設定」を空文字（実装差で null）で保存する。
+    // cfg には現れない経路なので、正本側を見て正規化しないと検知できない。
+    writeFileSync(configPath, JSON.stringify({
+      agents: { default_engine: null, engine: { 'vk-wp-developer': '', 'vk-ui-tester': '   ' } },
+      multi_repo_task: { default_engine: '' },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.deepEqual(written, { features: { coderabbit: true } });
+    assert.equal(Object.prototype.hasOwnProperty.call(written, 'agents'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(written, 'multi_repo_task'), false);
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 正本側の非空の未知値は削除せず保持する（手書きの新エンジン・打ち間違いを消さない）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-normalize-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    // ENGINE_SETTING_VALUES は vk-agents 側の知識の複製なので、受理できない値をすべて消すと
+    // (1) vk-agents が対応した新エンジンを手書きしても up の度に黙って消える
+    // (2) 'Codex'（大文字）のような打ち間違いに気づけない
+    // という後退になる。正規化するのは blank だけ。
+    writeFileSync(configPath, JSON.stringify({
+      agents: {
+        default_engine: 'gemini',
+        engine: { 'vk-wp-developer': 'Codex', 'vk-ui-tester': '' },
+      },
+      multi_repo_task: { default_engine: 'gemini' },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
 
     const written = JSON.parse(readFileSync(configPath, 'utf8'));
     assert.deepEqual(written, {
-      staff_wp_dev: { other: true },
+      agents: {
+        default_engine: 'gemini',
+        engine: { 'vk-wp-developer': 'Codex' },
+      },
+      multi_repo_task: { default_engine: 'gemini' },
+      features: { coderabbit: true },
+    });
+    // blank だった vk-ui-tester だけが畳まれる。
+    assert.equal(Object.prototype.hasOwnProperty.call(written.agents.engine, 'vk-ui-tester'), false);
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 正本側の正規化は GUI 非管理の兄弟キーと正しい値に触らない', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-engine-normalize-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      agents: {
+        default_engine: 'codex',
+        engine: { 'vk-wp-developer': '', 'vk-ui-tester': 'claude', 'vk-ux-designer': '' },
+      },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings({}, { configPath, globalSettingsPath, log: () => {} });
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    // 正規化の対象は ENGINE_SETTING_KEYS の 4 キーだけ。
+    // 手書きの vk-ux-designer や受理できる値（codex / claude）はそのまま残す。
+    assert.deepEqual(written, {
+      agents: {
+        default_engine: 'codex',
+        engine: { 'vk-ui-tester': 'claude', 'vk-ux-designer': '' },
+      },
       features: { coderabbit: true },
     });
     assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
@@ -1127,24 +1398,114 @@ test('writeVkAgentsSettings: 和田エンジンの空値は vk-agents config か
   }
 });
 
-test('writeVkAgentsSettings: 麗美エンジンの空値は vk-agents config から削除し既定へ戻せる', () => {
+test('writeVkAgentsSettings: 正本 config / cfg の __proto__・constructor キーで Object.prototype を汚染しない', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-proto-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    // オブジェクトリテラルの __proto__ は自身のプロパティにならないため、生 JSON で仕込む。
+    writeFileSync(
+      configPath,
+      '{"features":{"coderabbit":true},"__proto__":{"polluted":"from-canonical"},'
+        + '"agents":{"engine":{"__proto__":{"polluted":"from-canonical"},"vk-wp-developer":"codex"}}}',
+    );
+    const cfg = JSON.parse(
+      '{"org":{"review_assets_repo":"vektor-inc/review-assets"},'
+        + '"agents":{"engine":{"__proto__":{"polluted":"from-cfg"},"vk-ui-tester":"claude"}},'
+        + '"constructor":{"prototype":{"polluted":"from-cfg"}}}',
+    );
+
+    writeVkAgentsSettings(cfg, { configPath, globalSettingsPath, log: () => {} });
+
+    assert.equal({}.polluted, undefined);
+    assert.equal(Object.prototype.polluted, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted'), false);
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    // トップレベルの危険キーは deepMerge が落とすため正本へ持ち込まれない。
+    assert.equal(Object.prototype.hasOwnProperty.call(written, '__proto__'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(written, 'constructor'), false);
+    // GUI が扱うキーの投影は通常どおり動く。
+    assert.equal(written.org.review_assets_repo, 'vektor-inc/review-assets');
+    assert.equal(written.agents.engine['vk-wp-developer'], 'codex');
+    assert.equal(written.agents.engine['vk-ui-tester'], 'claude');
+    assert.equal(written.features.coderabbit, true);
+    // 正本にもとからあった入れ子の "__proto__" は JSON の自前プロパティとして素通りするが、
+    // プロトタイプには一切反映されない（データとして無害に残るだけ）。
+    assert.equal({}.polluted, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: 和田・麗美・共通既定エンジンの空値は vk-agents config から削除し既定へ戻せる', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
   try {
     const configPath = join(dir, 'config.json');
     const globalSettingsPath = join(dir, 'settings.json');
     writeFileSync(configPath, JSON.stringify({
-      staff_review: { engine: 'codex', other: true },
+      agents: {
+        default_engine: 'codex',
+        engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'codex' },
+      },
+      multi_repo_task: { default_engine: 'codex' },
       features: { coderabbit: true },
     }));
 
     writeVkAgentsSettings(
-      { staff_review: { engine: '' } },
+      {
+        agents: {
+          default_engine: '',
+          engine: { 'vk-wp-developer': '', 'vk-ui-tester': '' },
+        },
+        multi_repo_task: { default_engine: '' },
+      },
       { configPath, globalSettingsPath },
     );
 
     const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    // 正本 config は利用者が手で開くファイルなので、空になった親（agents.engine / agents /
+    // multi_repo_task）まで畳み、「何か設定されている」と誤読させる残骸を残さない。
+    assert.deepEqual(written, { features: { coderabbit: true } });
+    assert.equal(Object.prototype.hasOwnProperty.call(written, 'agents'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(written, 'multi_repo_task'), false);
+    assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeVkAgentsSettings: エンジンの空値で親を畳むときも GUI が扱わない兄弟キーは残す', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vko-vkagents-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    const globalSettingsPath = join(dir, 'settings.json');
+    writeFileSync(configPath, JSON.stringify({
+      agents: {
+        default_engine: 'codex',
+        engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'codex', 'vk-ux-designer': 'codex' },
+        other: true,
+      },
+      features: { coderabbit: true },
+    }));
+
+    writeVkAgentsSettings(
+      {
+        agents: {
+          default_engine: '',
+          engine: { 'vk-wp-developer': '', 'vk-ui-tester': '' },
+        },
+      },
+      { configPath, globalSettingsPath },
+    );
+
+    const written = JSON.parse(readFileSync(configPath, 'utf8'));
+    // 掃除しすぎの回帰検知: 兄弟キーが残る親（agents.engine / agents）は畳まない。
     assert.deepEqual(written, {
-      staff_review: { other: true },
+      agents: {
+        engine: { 'vk-ux-designer': 'codex' },
+        other: true,
+      },
       features: { coderabbit: true },
     });
     assert.deepEqual(JSON.parse(readFileSync(globalSettingsPath, 'utf8')), written);
@@ -1192,8 +1553,10 @@ test('writeVkAgentsSettings: setup:agents 用に features/skills/org/engine を 
           disabledSkills: ['vk-pr', '', '  vk-sync-skills  '],
           allowedOwners: ['vektor-inc', '  kurudrive  '],
         },
-        staff_wp_dev: { engine: 'codex' },
-        staff_review: { engine: 'claude' },
+        agents: {
+          default_engine: 'claude',
+          engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' },
+        },
         multi_repo_task: { default_engine: 'claude' },
       },
       { configPath, globalSettingsPath, force: true },
@@ -1204,8 +1567,10 @@ test('writeVkAgentsSettings: setup:agents 用に features/skills/org/engine を 
       features: { coderabbit: false, task_queue: true },
       skills: { disabled: ['vk-pr', 'vk-sync-skills'] },
       org: { allowed_owners: ['vektor-inc', 'kurudrive'] },
-      staff_wp_dev: { engine: 'codex' },
-      staff_review: { engine: 'claude' },
+      agents: {
+        default_engine: 'claude',
+        engine: { 'vk-wp-developer': 'codex', 'vk-ui-tester': 'claude' },
+      },
       multi_repo_task: { default_engine: 'claude' },
     };
     assert.deepEqual(JSON.parse(readFileSync(configPath, 'utf8')), expected);
@@ -1308,7 +1673,7 @@ test('writeVkAgentsSettings: vk-agents config.json が不正 JSON なら warn �
     console.warn = (msg) => warnings.push(msg);
 
     const result = writeVkAgentsSettings(
-      { features: { coderabbit: false }, staff_wp_dev: { engine: 'codex' } },
+      { features: { coderabbit: false }, agents: { engine: { 'vk-wp-developer': 'codex' } } },
       { configPath, globalSettingsPath },
     );
 
@@ -2067,37 +2432,62 @@ test('buildSettingsDescriptor: vk-agents 共通設定グループを含む', () 
   assert.match(coderabbitIgnoreField.help, /この設定は効果がありません/);
   assert.match(coderabbitIgnoreField.help, /CodeRabbit 監視を有効化/);
 
-  const engineField = group.fields.find((f) => f.key === 'staff_wp_dev.engine');
-  assert.ok(engineField);
-  assert.equal(engineField.label, 'staff-wp-dev（和田）の実行エンジン');
-  assert.equal(engineField.type, 'select');
-  assert.deepEqual(
-    engineField.options.map((o) => o.value),
-    ['', 'claude', 'codex'],
-  );
-  assert.match(engineField.options.find((o) => o.value === 'codex').label, /push\/PR/);
+  // エンジン系 4 項目は同じ 3 値を持つ select。同一パネル内で様式を揃えるため、
+  // Codex の option ラベルは 4 項目すべて 'Codex' に統一し、分担の違いは help に書く。
+  const engineFieldKeys = [
+    'agents.default_engine',
+    'agents.engine.vk-wp-developer',
+    'agents.engine.vk-ui-tester',
+    'multi_repo_task.default_engine',
+  ];
+  for (const key of engineFieldKeys) {
+    const field = group.fields.find((f) => f.key === key);
+    assert.ok(field, `${key} が見つかりません`);
+    assert.equal(field.type, 'select');
+    assert.deepEqual(field.options.map((o) => o.value), ['', 'claude', 'codex']);
+    assert.equal(field.options.find((o) => o.value === 'claude').label, 'Claude');
+    assert.equal(field.options.find((o) => o.value === 'codex').label, 'Codex');
+  }
 
-  const reviewEngineField = group.fields.find((f) => f.key === 'staff_review.engine');
-  assert.ok(reviewEngineField);
-  assert.equal(reviewEngineField.label, 'staff-review（麗美）の実行エンジン');
-  assert.equal(reviewEngineField.type, 'select');
-  assert.deepEqual(
-    reviewEngineField.options.map((o) => o.value),
-    ['', 'claude', 'codex'],
-  );
-  assert.match(reviewEngineField.options.find((o) => o.value === 'codex').label, /司が担当/);
+  const defaultEngineField = group.fields.find((f) => f.key === 'agents.default_engine');
+  assert.equal(defaultEngineField.label, 'メンバー共通の既定実行エンジン');
+  // 共通既定は「未設定なら Claude」が真なので、空オプションのラベルもそのまま。
+  assert.equal(defaultEngineField.options.find((o) => o.value === '').label, '未設定（既定: Claude）');
+  assert.match(defaultEngineField.help, /実行エンジンを個別に指定していないメンバーに使う既定値/);
+  assert.match(defaultEngineField.help, /ここも未設定なら Claude で起動します/);
+  // 実装より広く読めないこと: 効く範囲はエンジンを切り替えられるメンバーだけで、
+  // マルチリポジトリタスクの既定エンジンはこの設定に従わない。
+  assert.match(defaultEngineField.help, /実行エンジンを切り替えられるメンバー/);
+  assert.match(defaultEngineField.help, /「マルチリポジトリタスクの既定実行エンジン」は別項目で、この設定の影響を受けません/);
+  assert.match(defaultEngineField.help, /Codex を選んだメンバーは単独で完結する作業までを担当し、メンバー間の連携は司が引き取ります/);
+
+  const engineField = group.fields.find((f) => f.key === 'agents.engine.vk-wp-developer');
+  // ラベルは「人名（役割）」。内部定義名は help へ置く（正本 config・README との対応用）。
+  assert.equal(engineField.label, '和田（WordPress 実装担当）の実行エンジン');
+  // 共通既定が Codex のときに「既定: Claude」と出ると help と矛盾するため、空ラベルは共通既定を指す。
+  assert.equal(engineField.options.find((o) => o.value === '').label, '未設定（共通の既定に従う）');
+  assert.match(engineField.help, /^和田を起動するときの実行エンジン。/);
+  // キー名は同パネルの作法どおり括弧で添える。
+  assert.match(engineField.help, /（設定キー: agents\.engine\.vk-wp-developer）/);
+  // フォールバック先は画面の実ラベルを「」で引く（同パネルの CodeRabbit help と同じ作法）。
+  assert.match(engineField.help, /「未設定」のときは上の「メンバー共通の既定実行エンジン」を使い、それも未設定なら Claude で起動します/);
+  assert.match(engineField.help, /Codex を選ぶと和田は実装とローカルコミットまでを担当し、push と PR 作成は司が引き取ります/);
+
+  const reviewEngineField = group.fields.find((f) => f.key === 'agents.engine.vk-ui-tester');
+  assert.equal(reviewEngineField.label, '麗美（UI・e2e テスト担当）の実行エンジン');
+  assert.equal(reviewEngineField.options.find((o) => o.value === '').label, '未設定（共通の既定に従う）');
+  assert.match(reviewEngineField.help, /^麗美を起動するときの実行エンジン。/);
+  assert.match(reviewEngineField.help, /（設定キー: agents\.engine\.vk-ui-tester）/);
+  assert.match(reviewEngineField.help, /PR のブラウザ動作確認・Playwright テスト/);
+  assert.match(reviewEngineField.help, /「未設定」のときは上の「メンバー共通の既定実行エンジン」を使い、それも未設定なら Claude で起動します/);
+  assert.match(reviewEngineField.help, /Codex を選ぶと麗美はテスト実行と判定までを担当し、PR コメントの投稿と差し戻しは司が引き取ります/);
 
   const multiRepoEngineField = group.fields.find((f) => f.key === 'multi_repo_task.default_engine');
-  assert.ok(multiRepoEngineField);
-  assert.equal(multiRepoEngineField.label, 'vk-multi-repo-task の既定実行エンジン');
-  assert.equal(multiRepoEngineField.type, 'select');
-  assert.deepEqual(
-    multiRepoEngineField.options.map((o) => o.value),
-    ['', 'claude', 'codex'],
-  );
-  assert.equal(multiRepoEngineField.options.find((o) => o.value === 'codex').label, 'Codex');
+  assert.equal(multiRepoEngineField.label, 'マルチリポジトリタスクの既定実行エンジン');
+  assert.equal(multiRepoEngineField.options.find((o) => o.value === '').label, '未設定（既定: Claude）');
   assert.match(multiRepoEngineField.help, /vk-multi-repo-task/);
   assert.match(multiRepoEngineField.help, /Claude/);
+  assert.match(multiRepoEngineField.help, /「メンバー共通の既定実行エンジン」の影響は受けません/);
 });
 
 test('buildSettingsDescriptor: Agents グループは workspace.search_paths（lines）を先頭に、CodeRabbit 2項目を末尾に持つ', () => {
@@ -2126,8 +2516,9 @@ test('buildSettingsDescriptor: Agents グループは workspace.search_paths（l
   assert.deepEqual(keys, [
     'workspace.search_paths',
     'org.review_assets_repo',
-    'staff_wp_dev.engine',
-    'staff_review.engine',
+    'agents.default_engine',
+    'agents.engine.vk-wp-developer',
+    'agents.engine.vk-ui-tester',
     'multi_repo_task.default_engine',
     'features.coderabbit',
     'features.coderabbit_ignore',

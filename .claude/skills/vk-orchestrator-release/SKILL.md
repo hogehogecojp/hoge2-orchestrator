@@ -56,6 +56,8 @@ npm run release:preflight
 | 1 | 古かったので最新化した。未コミット差分あり（**正常系**） | 出力に出た新バージョン（vk-terminals タグ / vk-agents タグ）を控えて Phase 2 へ。差分はリリースコミットに含める |
 | 2 | エラー（vk-agents リポ未解決・bump/export 失敗） | **止まる**。出力を添えてユーザーへエスカレーション。推測で先へ進まない |
 
+**設定キーの追随を確認する**：本体（`src/config.js`）が vk-agents の設定キーを変更している場合、同梱 `vendor/vk-agents-public` のスキルが**新しいキーを読む版に更新されているか**を確認する。追随前の同梱物をリリースすると、同梱スキル利用環境では設定パネルの値が読まれず無言で効かなくなる（例: エンジン設定キー `agents.engine.<定義名>` / `agents.default_engine`）。未追随なら vk-agents 側のリリースを待ち、Phase 1 を再実行する。
+
 exit 1 のときにスクリプトが報告した版数（例: `vk-terminals ピン → 1.43.0`、`vk-agents 同梱 → v0.13.0`）と、**更新前の版数**を控える。更新前の vk-terminals ピンは次で取れる：
 ```
 git show HEAD:package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).optionalDependencies['vk-terminals'].match(/#(.+)$/)[1]))"
