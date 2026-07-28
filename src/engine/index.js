@@ -1,6 +1,7 @@
 import { config } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 
 // orchestrator/ の一つ上（task-queue/）の .env を読む
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,12 +34,28 @@ import {
   submitToClaude,
   waitForClaudeReady,
 } from '../terminals/index.js';
-import { recordTaskStart, updateTask, removeTask, getTask, getAllTasks } from './state.js';
+import {
+  ensureTaskRecord,
+  recordTaskStart,
+  updateTask,
+  removeTask,
+  getTask,
+  getAllTasks,
+} from './state.js';
 import { cleanupForIssue, formatCleanupSummary, inspectWorktreeByPort } from './cleanup.js';
 import { canTransitionToDone as canTransitionToDoneImpl } from './done-gate.js';
 import { closeSourceIssueBeforeGate as closeSourceIssueBeforeGateImpl } from './source-close.js';
 import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from './pane-resume.js';
 import { decideInProgressAction, needsReviewGate } from './in-progress-decision.js';
+import {
+  DEFAULT_CONFLICT_HANDBACK_MAX,
+  DEFAULT_CONFLICT_HANDBACK_SEND_FAILURE_MAX,
+  buildResolvedConflictHandbackState,
+  buildConflictHandbackPrompt,
+  decideConflictHandback,
+  isPRConflicted,
+  normalizeConflictHandbackMax,
+} from './conflict-handback.js';
 import { selectAutomergeCandidates } from './automerge-candidates.js';
 import { resolveWaitingMergeAction } from './waiting-merge-action.js';
 import { coderabbitGateLine, prCompletionOptions } from './coderabbit-gate.js';
@@ -94,6 +111,11 @@ const PANE_MISSING_TICKS = 2;
 // させる。素の Number() のままだと "abc" → NaN で上限判定が常に false になり、
 // 無限リトライ防止が沈黙のうちに無効化されるため必ず健全化を通す。
 const PANE_RESUME_MAX    = normalizeResumeMax(process.env.PANE_RESUME_MAX ?? 3);
+// automerge 付き PR 同士が競合すると解消 push のたびに差し戻しが行き来しうるため、
+// 通算上限を設ける。不正値は純関数側で健全化し、0 は差し戻し無効化として扱う。
+const CONFLICT_HANDBACK_MAX = normalizeConflictHandbackMax(
+  process.env.CONFLICT_HANDBACK_MAX ?? DEFAULT_CONFLICT_HANDBACK_MAX
+);
 // Claude Code の TUI 起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。
 // コールドスタート・高負荷時は起動バナーの描画（churn）が長引き、旧既定 15 秒では
 // 静止を確認できず描画中の窓へ本文を送って取りこぼす（#172）。既定 45 秒に広げる。
@@ -396,6 +418,58 @@ async function syncOrchestratorMenu() {
   }
 }
 
+/**
+ * Claude を起動する新規ペインを作り、タイトル設定と入力待ち確認まで行う。
+ *
+ * タイトル URL を受け付けない実行面では URL 無しで一度だけ再送し、タイトル設定や
+ * readiness 確認に失敗しても従来どおり本文送信は試みる。通常起動とコンフリクト差し戻しで
+ * この一連の仕様を共有し、片方だけリトライ条件が変わるのを防ぐ。
+ *
+ * @param {object} input
+ * @param {object} input.issue メタ issue
+ * @param {string} input.cwd ペインの作業ディレクトリ
+ * @param {object|null} [input.resolvedTarget] タイトル表示用の元 issue
+ * @param {string} input.createdLogTag ペイン作成直後のログ本文
+ * @param {string} input.titleLogTag タイトル設定ログ接頭辞
+ * @param {string} input.readyLogTag 起動待ちログ接頭辞
+ * @returns {Promise<string|number>} termId
+ */
+async function createInitializedTaskPane({
+  issue,
+  cwd,
+  resolvedTarget = null,
+  createdLogTag,
+  titleLogTag,
+  readyLogTag,
+}) {
+  const termId = await createNewPane(VK_PORT, cwd);
+  console.log(`  ${createdLogTag} (termId: ${termId})`);
+  const { titleText, url: titleUrl } = buildPaneTitle(issue, resolvedTarget);
+  try {
+    await setTerminalTitle(VK_PORT, termId, titleText, titleUrl);
+  } catch (err) {
+    if (typeof titleUrl === 'string') {
+      try {
+        await setTerminalTitle(VK_PORT, termId, titleText);
+      } catch (retryErr) {
+        console.warn(`  ${titleLogTag} タイトル送信失敗（処理は継続）: ${retryErr.message}`);
+      }
+    } else {
+      console.warn(`  ${titleLogTag} タイトル送信失敗（処理は継続）: ${err.message}`);
+    }
+  }
+
+  const ready = await waitForClaudeReady(
+    VK_PORT,
+    termId,
+    { readyTimeoutMs: CLAUDE_READY_TIMEOUT_MS }
+  );
+  if (!ready) {
+    console.warn(`  ${readyLogTag} Claude 起動完了を確認できませんでした。送信を試みます (termId=${termId})`);
+  }
+  return termId;
+}
+
 // -------------------------------------------------------
 // タスク起動（撃ちっぱなし）
 //
@@ -409,15 +483,6 @@ async function startTask(issue) {
   console.log(`\n[Task #${number}] "${title}" を起動`);
   const resolved = resolveTarget(issue);
   const taskPaneCwd = resolveTaskPaneCwd(issue, resolved);
-
-  let termId;
-  try {
-    termId = await createNewPane(VK_PORT, taskPaneCwd);
-    console.log(`  → 新規ペイン作成 (termId: ${termId})`);
-  } catch (err) {
-    console.error(`  新規ペイン作成失敗: ${err.message}`);
-    return false;
-  }
 
   // ペイン上部にタスクタイトルを表示（失敗しても続行）。
   // task-queue のメタ issue 本文に元の作業対象 issue の URL が含まれていれば、
@@ -440,19 +505,19 @@ async function startTask(issue) {
       console.warn(`  [set-title] 元 issue 情報の取得失敗（メタ issue 表示にフォールバック）: ${err.message}`);
     }
   }
-  const { titleText, url: titleUrl } = buildPaneTitle(issue, resolvedTarget);
+  let termId;
   try {
-    await setTerminalTitle(VK_PORT, termId, titleText, titleUrl);
+    termId = await createInitializedTaskPane({
+      issue,
+      cwd: taskPaneCwd,
+      resolvedTarget,
+      createdLogTag: '→ 新規ペイン作成',
+      titleLogTag: '[set-title]',
+      readyLogTag: '[ready]',
+    });
   } catch (err) {
-    if (typeof titleUrl === 'string') {
-      try {
-        await setTerminalTitle(VK_PORT, termId, titleText);
-      } catch (retryErr) {
-        console.warn(`  [set-title] タイトル送信失敗（処理は継続）: ${retryErr.message}`);
-      }
-    } else {
-      console.warn(`  [set-title] タイトル送信失敗（処理は継続）: ${err.message}`);
-    }
+    console.error(`  新規ペイン作成失敗: ${err.message}`);
+    return false;
   }
 
   // wp-env 連携の ON/OFF を解決する（設定で明示があればそれ、無ければ対象リポの
@@ -504,14 +569,6 @@ async function startTask(issue) {
 
   // status:in-progress に遷移してからプロンプトを送る（スキャナが拾えるように）。
   await github.setStatus(number, 'status:in-progress');
-
-  // Claude Code の TUI 起動完了を待ってから送信する。コールドスタートや高負荷時に
-  // 入力欄が現れる前に本文を送ると取りこぼす可能性があるため（#127 の残存リスク対策）。
-  // タイムアウトしても従来どおり送信は試みる（waitForClaudeReady の戻り値で警告のみ出す）。
-  const ready = await waitForClaudeReady(VK_PORT, termId, { readyTimeoutMs: CLAUDE_READY_TIMEOUT_MS });
-  if (!ready) {
-    console.warn(`  [ready] Claude 起動完了を確認できませんでした。送信を試みます (termId=${termId})`);
-  }
 
   console.log(`  → terminal #${termId} に送信`);
   const sent = await submitToClaude(
@@ -661,6 +718,7 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   let prState = null;
   let prCompletionReady = false;
   let reviewGateReady = false;
+  let prConflicted = false;
   let prLookupFailed = false;
   // CodeRabbit 設定は「この issue の判定 1 回」につき 1 度だけ解決し、完了判定に使った値を
   // そのまま呼び出し側へ返す。マージ待ちコメントの文言が、マージを許した判定と別時点の
@@ -675,6 +733,7 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   if (pr) {
     try {
       prState = await github.getPRState(target.owner, target.repo, pr.number);
+      prConflicted = isPRConflicted(prState);
     } catch (err) {
       console.warn(`  [scan] issue #${issue.number}: PR 状態取得失敗: ${err.message}`);
     }
@@ -694,7 +753,12 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
       // 1 つだけ置き、ここで書き下さない（判定とガードが将来ズレるのを防ぐ）。
       // 照合は checkPRCompletion が返した headSha で行う
       // （検証後の push を弾く＝TOCTOU 対策。tryAutoMerge と同じ思想）。
-      if (resolveReviewGate && needsReviewGate({ automerge, prCompletionReady, draft: prState.draft })) {
+      if (resolveReviewGate && needsReviewGate({
+        automerge,
+        prCompletionReady,
+        draft: prState.draft,
+        prConflicted,
+      })) {
         try {
           reviewGateReady = await github.hasReviewGateMarker(target.owner, target.repo, pr.number, completion.headSha);
         } catch (err) {
@@ -720,7 +784,18 @@ async function gatherTargetState(issue, { resolveReviewGate = false } = {}) {
   }
   comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-  return { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, prLookupFailed, coderabbitCfg };
+  return {
+    target,
+    pr,
+    prState,
+    prCompletionReady,
+    reviewGateReady,
+    prConflicted,
+    automerge,
+    comments,
+    prLookupFailed,
+    coderabbitCfg,
+  };
 }
 
 // -------------------------------------------------------
@@ -779,7 +854,17 @@ async function scanInProgressIssues() {
       console.warn(`  [scan-in-progress] issue #${issue.number}: 状態収集失敗: ${err.message}`);
       continue;
     }
-    const { target, pr, prState, prCompletionReady, reviewGateReady, automerge, comments, coderabbitCfg } = state;
+    const {
+      target,
+      pr,
+      prState,
+      prCompletionReady,
+      reviewGateReady,
+      prConflicted,
+      automerge,
+      comments,
+      coderabbitCfg,
+    } = state;
 
     // PR URL 記録 + アイコン（冪等。状態遷移とは独立）
     if (pr && prState) {
@@ -796,6 +881,8 @@ async function scanInProgressIssues() {
       automerge,
       // automerge タスクの waiting-merge 遷移を tryAutoMerge のレビューゲートと揃える（#213）。
       reviewGateReady,
+      // コンフリクト差し戻し直後に waiting-merge へ戻して作業依頼を打ち消さない。
+      prConflicted,
     });
 
     if (action.type === 'none') {
@@ -806,6 +893,12 @@ async function scanInProgressIssues() {
       // tryAutoMerge() の保留ログと対称にここが唯一の痕跡になる。
       if (prCompletionReady && prState?.draft) {
         console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが PR が Draft のため waiting-merge を保留`);
+      }
+      if (prCompletionReady && prConflicted) {
+        const conflictWait = automerge
+          ? 'コンフリクト解消の差し戻し待ち'
+          : 'コンフリクト解消（手動）待ち';
+        console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが PR がコンフリクトしているため waiting-merge を保留（${conflictWait}）`);
       }
       if (prCompletionReady && automerge && !reviewGateReady && !prState?.draft) {
         console.log(`  [scan-in-progress] issue #${issue.number}: 完了条件は充足したが agent-review-passed マーカー（現 head SHA 一致）が無いため waiting-merge を保留`);
@@ -1289,7 +1382,7 @@ async function checkWaitingMergeIssues() {
       // 未マージ・open。automerge 条件（Draft 除外・mergeable・CI + CodeRabbit 静観・
       // agent-review-passed マーカー）は tryAutoMerge 内で再検証されるため、本物の質問待ちは保留のまま。
       // 実 merge 後は次ループの complete-merge 判定で close + done ルートに乗る。
-      await tryAutoMerge(issue, prRef, prState, prUrl);
+      await tryAutoMerge(issue, prRef, prState, prUrl, source);
       continue;
     }
 
@@ -1302,7 +1395,291 @@ async function checkWaitingMergeIssues() {
 // -------------------------------------------------------
 // automerge ラベル付き issue について PR の自動マージを試みる
 // -------------------------------------------------------
-async function tryAutoMerge(issue, prRef, prState, prUrl) {
+
+async function notifyConflictHandbackExhausted({
+  issue,
+  prUrl,
+  saved,
+  decision,
+  tag,
+}) {
+  if (decision.notifyExhausted) {
+    const lead = decision.type === 'skip-send-failed'
+      ? `⚠️ 担当エージェントのターミナル（ペイン）へコンフリクト解消依頼を送れない状態が ${decision.sendFailures} 回続いたため、自動差し戻しを打ち切りました。VK Terminals が起動していない、または対象ターミナルが閉じられている可能性があります。送信失敗の上限 ${DEFAULT_CONFLICT_HANDBACK_SEND_FAILURE_MAX} 回は固定値で、設定からは変更できません。`
+      : `⚠️ コンフリクト解消の差し戻しが上限（${CONFLICT_HANDBACK_MAX} 回）に達したため、自動差し戻しを打ち切りました。`;
+    const maxAttemptsGuide = decision.type === 'skip-exhausted'
+      ? [
+          `自動差し戻しの上限回数は、設定パネルの「コンフリクト差し戻し上限 (回)」（\`orchestrator.conflictHandbackMax\`）で変更できます。`,
+        ]
+      : [];
+    try {
+      await github.addComment(
+        issue.number,
+        [
+          lead,
+          '',
+          `PR: ${prUrl}`,
+          '',
+          'メタ issue のステータスラベルは変更していないため、`status:waiting-merge`（マージ待ち）のままです。ただし、オーケストレーターは以降このタスクを自動では進めません。タスクカード上は「マージ待ち」に見えますが、手動対応なしに自動マージが再開することはありません。次の手順で手動対応してください。',
+          '',
+          '1. コンフリクトを手動で解消して push する',
+          '2. push 後の内容をレビューし直す',
+          '3. 現在の head SHA（PR ブランチの最新コミット ID）で `agent-review-passed-sha: <SHA>` コメント（レビュー完了マーカー）を PR に付け直す',
+          '',
+          'レビュー完了マーカーが現 head SHA と一致すれば、自動マージが再開します。',
+          ...maxAttemptsGuide,
+        ].join('\n')
+      );
+      const previous = saved.conflictHandback ?? {};
+      await updateTask(issue.number, {
+        conflictHandback: {
+          headSha: previous.headSha,
+          attempts: previous.attempts ?? 0,
+          sendFailures: previous.sendFailures ?? 0,
+          delivered: previous.delivered === true,
+          exhaustedNotified: true,
+        },
+      });
+    } catch (err) {
+      console.warn(`  ${tag}: コンフリクト差し戻し打ち切り通知の記録に失敗（次ループで再試行）: ${err.message}`);
+    }
+  }
+  const reason = decision.type === 'skip-send-failed'
+    ? `送信失敗 ${decision.sendFailures} 回`
+    : `通算上限 ${CONFLICT_HANDBACK_MAX} 回`;
+  console.log(`  ${tag}: コンフリクト差し戻しの${reason}に到達 → 自動差し戻しを打ち切り`);
+}
+
+async function ensureConflictHandbackPane(issue, saved, tag) {
+  if (saved.termId != null) {
+    let states;
+    try {
+      states = await getStates(VK_PORT);
+    } catch (err) {
+      console.warn(`  ${tag}: 既存ペインを生存確認できないため今回は見送り: ${err.message}`);
+      return null;
+    }
+    const term = Object.values(states?.terminals ?? {}).find(
+      (t) => String(t.termId) === String(saved.termId)
+    );
+    if (term) return saved.termId;
+  }
+
+  let cwd;
+  if (saved.worktreePath && existsSync(saved.worktreePath)) {
+    cwd = saved.worktreePath;
+  } else {
+    if (saved.worktreePath) {
+      console.log(`  ${tag}: 記録済み worktree が存在しないため通常の作業ディレクトリへフォールバック: ${saved.worktreePath}`);
+    }
+    cwd = resolveTaskPaneCwd(issue, resolveTarget(issue));
+  }
+
+  try {
+    const termId = await createInitializedTaskPane({
+      issue,
+      cwd,
+      createdLogTag: `${tag}: 差し戻しペインを作成`,
+      titleLogTag: `${tag}: 差し戻しペインの`,
+      readyLogTag: `${tag}: 差し戻しペインの`,
+    });
+    await updateTask(issue.number, { termId, paneMissingTicks: 0 });
+    return termId;
+  } catch (err) {
+    console.warn(`  ${tag}: コンフリクト差し戻し用ペインを確保できないため見送り: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * コンフリクト解消時に配達状態をリセットし、通算差し戻し回数は保持する。
+ *
+ * headSha=null にすることで、次回のコンフリクトは現 head SHA と必ず不一致になり、
+ * decideConflictHandback() の head 変化経路で attempts + 1 として数えられる。
+ * exhaustedNotified も戻し、次に通算上限へ達した際は改めて打ち切りを通知する。
+ */
+async function resetResolvedConflictHandbackState(issueNumber) {
+  try {
+    const saved = await getTask(issueNumber);
+    if (saved?.conflictHandback) {
+      const reset = buildResolvedConflictHandbackState(saved);
+      const previous = saved.conflictHandback;
+      if (
+        previous.headSha !== reset.headSha ||
+        previous.attempts !== reset.attempts ||
+        previous.sendFailures !== reset.sendFailures ||
+        previous.delivered !== reset.delivered ||
+        previous.exhaustedNotified !== reset.exhaustedNotified
+      ) {
+        await updateTask(issueNumber, { conflictHandback: reset });
+      }
+    }
+  } catch (err) {
+    console.warn(`  [automerge] issue #${issueNumber}: 解消済みコンフリクト差し戻し状態のリセットに失敗（処理は継続）: ${err.message}`);
+  }
+}
+
+/**
+ * コンフリクトした automerge タスクを、担当エージェントのペインへ差し戻す。
+ *
+ * VK Terminals の疎通確認後に state レコードを upsert し、送信前は未達として失敗回数を
+ * 記録、本文到達確認後に配達済みへ更新する。各副作用の失敗はマージ監視へ伝播させず、
+ * 未達レコードを使って次ループの有限リトライへ委ねる。
+ */
+async function handbackConflictedPR(issue, prRef, prState, prUrl, tag) {
+  let healthy = false;
+  try {
+    healthy = await checkHealth(VK_PORT);
+  } catch (err) {
+    console.warn(`  ${tag}: VK Terminals の疎通確認に失敗: ${err.message}`);
+  }
+  if (!healthy) {
+    console.log(`  ${tag}: VK Terminals へ接続できないため差し戻しを次ループへ見送り（試行は消費しない）`);
+    return;
+  }
+
+  let saved;
+  try {
+    await ensureTaskRecord(issue.number);
+    saved = await getTask(issue.number);
+    if (!saved) throw new Error('upsert 後のタスクレコードを読み直せませんでした');
+  } catch (err) {
+    console.warn(`  ${tag}: state のタスクレコードを確保できないため差し戻しを見送り: ${err.message}`);
+    return;
+  }
+
+  const decision = decideConflictHandback({
+    headSha: prState.headSha,
+    saved,
+    maxAttempts: CONFLICT_HANDBACK_MAX,
+  });
+  if (decision.type === 'skip-unknown-head') {
+    console.warn(`  ${tag}: head SHA を取得できず冪等判定ができないため差し戻しを見送り（次ループで再判定）`);
+    return;
+  }
+  if (decision.type === 'disabled') {
+    console.log(`  ${tag}: コンフリクト差し戻しは設定で無効（CONFLICT_HANDBACK_MAX=0）`);
+    return;
+  }
+  if (decision.type === 'skip-duplicate') {
+    console.log(`  ${tag}: 同じ head SHA への差し戻しは配達済み（解消 push 待ち）`);
+    return;
+  }
+  if (decision.type === 'skip-exhausted' || decision.type === 'skip-send-failed') {
+    await notifyConflictHandbackExhausted({ issue, prUrl, saved, decision, tag });
+    return;
+  }
+
+  try {
+    await updateTask(issue.number, {
+      conflictHandback: {
+        headSha: prState.headSha,
+        attempts: decision.attempt,
+        sendFailures: decision.sendFailures,
+        delivered: false,
+        exhaustedNotified: false,
+      },
+    });
+    const recorded = await getTask(issue.number);
+    if (
+      recorded?.conflictHandback?.headSha !== prState.headSha ||
+      recorded?.conflictHandback?.attempts !== decision.attempt ||
+      recorded?.conflictHandback?.sendFailures !== decision.sendFailures ||
+      recorded?.conflictHandback?.delivered !== false
+    ) {
+      throw new Error('送信前レコードを確認できませんでした');
+    }
+  } catch (err) {
+    console.warn(`  ${tag}: コンフリクト差し戻しの送信前記録に失敗したため見送り: ${err.message}`);
+    return;
+  }
+
+  const termId = await ensureConflictHandbackPane(issue, saved, tag);
+  if (termId == null) return;
+
+  const prompt = buildConflictHandbackPrompt({
+    prRef,
+    prUrl,
+    headRefName: prState.headRefName,
+    attempt: decision.attempt,
+    maxAttempts: CONFLICT_HANDBACK_MAX,
+  });
+  try {
+    const sent = await submitToClaude(
+      VK_PORT,
+      termId,
+      prompt,
+      CLAUDE_SUBMIT_DELAY_MS,
+      { maxRetries: CLAUDE_SUBMIT_MAX_RETRIES }
+    );
+    if (
+      sent?.bodyConfirmed === false &&
+      !(await reconfirmBodyEcho(VK_PORT, termId, prompt))
+    ) {
+      console.warn(`  ${tag}: コンフリクト解消依頼の本文到達を再確認できないため in-progress 遷移を見送り`);
+      return;
+    }
+  } catch (err) {
+    console.warn(`  ${tag}: コンフリクト解消依頼のペイン送信に失敗: ${err.message}`);
+    return;
+  }
+
+  try {
+    await updateTask(issue.number, {
+      conflictHandback: {
+        headSha: prState.headSha,
+        attempts: decision.attempt,
+        sendFailures: 0,
+        delivered: true,
+        exhaustedNotified: false,
+      },
+    });
+    const delivered = await getTask(issue.number);
+    if (
+      delivered?.conflictHandback?.headSha !== prState.headSha ||
+      delivered?.conflictHandback?.attempts !== decision.attempt ||
+      delivered?.conflictHandback?.sendFailures !== 0 ||
+      delivered?.conflictHandback?.delivered !== true
+    ) {
+      throw new Error('配達済みレコードを確認できませんでした');
+    }
+  } catch (err) {
+    console.warn(`  ${tag}: 配達済み記録に失敗したため状態遷移を見送り: ${err.message}`);
+    return;
+  }
+
+  try {
+    await github.setStatus(issue.number, 'status:in-progress');
+  } catch (err) {
+    console.warn(`  ${tag}: コンフリクト差し戻し後の in-progress 遷移に失敗: ${err.message}`);
+    return;
+  }
+  try {
+    await github.addComment(
+      issue.number,
+      [
+        `🔁 コンフリクト差し戻し（${decision.attempt}/${CONFLICT_HANDBACK_MAX} 回目）`,
+        '',
+        `PR: ${prUrl}`,
+        '',
+        'この PR が他の変更と衝突してマージできなくなったため、メタ issue を `status:waiting-merge` から `status:in-progress`（作業中）へ戻し、担当エージェントへ次の対応を依頼しました。',
+        '',
+        '1. コンフリクトを解消する',
+        '2. 解消内容を push し、CI の通過を確認する',
+        '3. 新しい head SHA（PR ブランチの最新コミット ID）の内容を再レビューする',
+        '4. 現 head SHA で `agent-review-passed-sha: <SHA>` コメント（レビュー完了マーカー）を付け直す',
+        '',
+        '運用者側の操作は不要です。レビュー完了マーカーが現 head SHA と一致すると、自動マージが再開します。',
+        `自動差し戻しはタスク 1 件あたり通算 ${CONFLICT_HANDBACK_MAX} 回まで行い、上限に達した場合は改めてこの issue へ通知します。`,
+      ].join('\n')
+    );
+  } catch (err) {
+    console.warn(`  ${tag}: コンフリクト差し戻しコメントの投稿失敗（処理は継続）: ${err.message}`);
+  }
+  console.log(`  ${tag}: PR #${prRef.number} を担当ペインへ差し戻し（${decision.attempt}/${CONFLICT_HANDBACK_MAX} 回目、termId=${termId}）`);
+}
+
+async function tryAutoMerge(issue, prRef, prState, prUrl, source) {
   const tag = `[automerge] issue #${issue.number}`;
 
   if (prState.draft) {
@@ -1316,10 +1693,23 @@ async function tryAutoMerge(issue, prRef, prState, prUrl) {
     console.log(`  ${tag}: PR #${prRef.number} の mergeable 判定が計算中（null）→ 次ループで再判定`);
     return;
   }
-  if (prState.mergeable === false || prState.mergeableState === 'dirty') {
+  if (isPRConflicted(prState)) {
     console.log(`  ${tag}: PR #${prRef.number} はコンフリクト等で mergeable=false（state=${prState.mergeableState}）→ スキップ`);
+    if (source === 'waiting-input') {
+      console.log(`  ${tag}: waiting-input は質問待ちの可能性があるためコンフリクト差し戻しを見送り`);
+      return;
+    }
+    try {
+      await handbackConflictedPR(issue, prRef, prState, prUrl, tag);
+    } catch (err) {
+      console.warn(`  ${tag}: コンフリクト差し戻し処理に失敗（自動マージ監視は継続）: ${err.message}`);
+    }
     return;
   }
+
+  // コンフリクトが解消された PR では配達状態だけをリセットし、通算試行回数は保持する
+  // （記録が無ければ何もしない）。
+  await resetResolvedConflictHandbackState(issue.number);
 
   // CI + CodeRabbit のコメント待ちを再検証する。
   // waiting-merge 到達後に CodeRabbit が再コメントしたケースで誤マージを防ぐ。
@@ -1906,6 +2296,7 @@ async function main() {
     console.log(`  interval     : ${POLL_INTERVAL / 1000}s`);
     console.log(`  watchdog idle: ${WATCHDOG_IDLE / 60000}min`);
     console.log(`  pane resume  : 最大 ${PANE_RESUME_MAX} 回（pane 消失・PR 未生成時の自動再開）`);
+    console.log(`  conflict戻し: 最大 ${CONFLICT_HANDBACK_MAX} 回（automerge PR のコンフリクト差し戻し）`);
     console.log(`  mode         : ${RUN_ONCE ? 'run-once' : 'watch'}`);
     console.log('');
 

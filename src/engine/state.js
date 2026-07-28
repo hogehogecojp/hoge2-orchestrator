@@ -49,13 +49,34 @@ export function recordTaskStart({ issueNumber, termId, wpPort, repo }) {
     // pane 消失による自動再開の回数（resumeCount）は再ディスパッチをまたいで
     // 引き継ぐ（無限リトライ防止の上限判定に使うため、起動で 0 に戻してはいけない）。
     const prevResumeCount = state.issues[key]?.resumeCount;
+    // コンフリクト差し戻しの通算試行回数も再ディスパッチでリセットすると上限判定を
+    // すり抜けるため、resumeCount と同様にレコード置換をまたいで引き継ぐ。
+    const prevConflictHandback = state.issues[key]?.conflictHandback;
     state.issues[key] = {
       termId,
       wpPort,
       repo,                       // "owner/repo" 形式（task-queue が把握できる範囲）
       startedAt: new Date().toISOString(),
       ...(prevResumeCount != null ? { resumeCount: prevResumeCount } : {}),
+      ...(prevConflictHandback != null ? { conflictHandback: prevConflictHandback } : {}),
     };
+  });
+}
+
+// レコードが無い issue にも最小レコードを作る（updateTask は既存レコードにしか書かないため、
+// state を失ったタスクでも冪等な記録が必要な処理が no-op で沈黙するのを防ぐ）。
+export function ensureTaskRecord(issueNumber, seed = {}) {
+  return updateState(state => {
+    const key = String(issueNumber);
+    if (!state.issues[key]) {
+      state.issues[key] = {
+        termId: null,
+        wpPort: null,
+        repo: null,
+        startedAt: new Date().toISOString(),
+        ...seed,
+      };
+    }
   });
 }
 

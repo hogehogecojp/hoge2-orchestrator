@@ -193,6 +193,29 @@ describe('decideInProgressAction', () => {
       assert.equal(r.type, 'waiting-merge');
     });
 
+    it('automerge + 完了条件充足 + マーカーありでもコンフリクト中は none', () => {
+      const r = decideInProgressAction({
+        comments: [],
+        pr: { state: 'open', merged: false, draft: false },
+        prCompletionReady: true,
+        automerge: true,
+        reviewGateReady: true,
+        prConflicted: true,
+      });
+      assert.equal(r.type, 'none');
+    });
+
+    it('automerge でないタスクもコンフリクト中は waiting-merge にしない', () => {
+      const r = decideInProgressAction({
+        comments: [],
+        pr: { state: 'open', merged: false, draft: false },
+        prCompletionReady: true,
+        automerge: false,
+        prConflicted: true,
+      });
+      assert.equal(r.type, 'none');
+    });
+
     it('Draft PR は完了条件を満たしても waiting-merge にしない（none）', () => {
       const r = decideInProgressAction({
         comments: [],
@@ -283,6 +306,14 @@ describe('needsReviewGate', () => {
     assert.equal(needsReviewGate({ automerge: true, prCompletionReady: true, draft: true }), false);
   });
 
+  it('コンフリクト中なら false（waiting-merge にならないためマーカー取得不要）', () => {
+    assert.equal(needsReviewGate({
+      automerge: true,
+      prCompletionReady: true,
+      prConflicted: true,
+    }), false);
+  });
+
   it('引数なしでも安全に false', () => {
     assert.equal(needsReviewGate(), false);
   });
@@ -293,9 +324,14 @@ describe('needsReviewGate', () => {
       { pr: { state: 'open', merged: false }, prCompletionReady: true, automerge: false },
       { pr: { state: 'open', merged: false }, prCompletionReady: false, automerge: true },
       { pr: { state: 'open', merged: false, draft: true }, prCompletionReady: true, automerge: true },
+      { pr: { state: 'open', merged: false }, prCompletionReady: true, automerge: true, prConflicted: true },
     ];
     for (const base of cases) {
-      assert.equal(needsReviewGate({ ...base, draft: base.pr.draft }), false);
+      assert.equal(needsReviewGate({
+        ...base,
+        draft: base.pr.draft,
+        prConflicted: base.prConflicted,
+      }), false);
       const withGate = decideInProgressAction({ comments: [], ...base, reviewGateReady: true });
       const withoutGate = decideInProgressAction({ comments: [], ...base, reviewGateReady: false });
       assert.equal(withGate.type, withoutGate.type);

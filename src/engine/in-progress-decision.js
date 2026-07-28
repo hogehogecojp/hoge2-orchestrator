@@ -51,6 +51,10 @@
  *     `agent-review-passed` マーカー（現 head SHA 一致）無しではマージしない
  *     （`tryAutoMerge()` のレビューゲート）。マージしないと分かっている PR を
  *     「マージ待ち」と表示しないよう、遷移条件を orchestrator のマージゲートと揃える。
+ *   - `prConflicted !== true` — コンフリクトした PR は担当エージェントへ差し戻すため、
+ *     解消されるまで「マージ待ち」ではない。差し戻し直後は CI とレビュー完了マーカーが
+ *     以前の head に対して有効なままなので、このガードが無いと次ティックで即座に
+ *     waiting-merge へ戻され、エージェントが着手する前に差し戻し表示が打ち消される。
  *
  * automerge でないタスクにマーカーを要求しないのは、`agent-review-passed` マーカーが
  * automerge ルートの運用でしか付与されないため。マーカー必須にすると automerge ラベルの
@@ -86,10 +90,19 @@ import { hasPendingWaitingInput } from './decision-record.js';
  * @param {boolean} [input.automerge]  対象メタ issue に automerge ラベルが付いているか
  * @param {boolean} [input.prCompletionReady]  PR が完了条件を満たすか
  * @param {boolean} [input.draft]  対象 PR が Draft か（未指定は Draft でない扱い）
+ * @param {boolean} [input.prConflicted]  対象 PR がコンフリクト中か
  * @returns {boolean}
  */
-export function needsReviewGate({ automerge = false, prCompletionReady = false, draft = false } = {}) {
-  return automerge === true && prCompletionReady === true && draft !== true;
+export function needsReviewGate({
+  automerge = false,
+  prCompletionReady = false,
+  draft = false,
+  prConflicted = false,
+} = {}) {
+  return automerge === true &&
+    prCompletionReady === true &&
+    draft !== true &&
+    prConflicted !== true;
 }
 
 /**
@@ -99,6 +112,7 @@ export function needsReviewGate({ automerge = false, prCompletionReady = false, 
  * @param {boolean} [input.prCompletionReady]  PR が完了条件を満たすか（pr が null のときは無視）
  * @param {boolean} [input.automerge]  対象メタ issue に automerge ラベルが付いているか
  * @param {boolean} [input.reviewGateReady]  agent-review-passed マーカーが現 head SHA に対して存在するか（automerge ルートのマージゲート）
+ * @param {boolean} [input.prConflicted]  対象 PR がコンフリクト中か
  * @returns {{ type: 'waiting-input'|'merged'|'pr-closed-unmerged'|'waiting-merge'|'none' }}
  */
 export function decideInProgressAction({
@@ -107,6 +121,7 @@ export function decideInProgressAction({
   prCompletionReady = false,
   automerge = false,
   reviewGateReady = false,
+  prConflicted = false,
 } = {}) {
   // 「いま誰かがマージできる open PR か」の単一述語。waiting-merge 遷移と
   // automerge の waiting-input override の両方がこれを使う（判定を二重に持たない）。
@@ -117,6 +132,7 @@ export function decideInProgressAction({
     !pr.merged &&
     prCompletionReady &&
     pr.draft !== true &&
+    !prConflicted &&
     (!automerge || reviewGateReady);
 
   // automerge 指定時、PR の客観状態が「実装完了＝マージ可能」を示しているなら、未応答の

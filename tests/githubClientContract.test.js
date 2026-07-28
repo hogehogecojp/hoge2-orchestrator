@@ -58,3 +58,29 @@ test('GitHubClient.listAllQueueIssues: paginate が無い octokit では単発 l
 
   assert.deepEqual(await client.listAllQueueIssues(), seed);
 });
+
+test('GitHubClient.getPRState: コンフリクト差し戻しの冪等判定用に headSha を返す', async () => {
+  const client = new GitHubClient({ token: 't', owner: 'vektor-inc', repo: 'task-queue' });
+  client.octokit = {
+    pulls: {
+      get: async () => ({
+        data: {
+          state: 'open',
+          merged: false,
+          merged_at: null,
+          html_url: 'https://github.com/vektor-inc/example/pull/12',
+          head: { ref: 'feature/example', sha: 'abc123' },
+          draft: false,
+          mergeable: false,
+          mergeable_state: 'dirty',
+        },
+      }),
+    },
+  };
+
+  const state = await client.getPRState('vektor-inc', 'example', 12);
+  assert.equal(state.headSha, 'abc123');
+  assert.equal(state.headRefName, 'feature/example');
+  assert.equal(state.mergeable, false);
+  assert.equal(state.mergeableState, 'dirty');
+});

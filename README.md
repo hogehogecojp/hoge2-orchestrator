@@ -54,6 +54,16 @@ SHA は現在の head に固定して照合するため、マーカー付与後�
 
 このマーカーは **`status:in-progress` から `status:waiting-merge` への自動遷移にも効きます**。automerge タスクではマーカーが現 head SHA に対して揃うまでメタ issue は `status:in-progress` のままで、タスクカードは「マージ待ち」になりません（マージしないと分かっている段階で「マージ待ち」と表示しないため、遷移条件を automerge のマージゲートと揃えています）。automerge ラベルの無いタスクにはマーカーが付かないため、従来どおり完了条件の充足だけで `status:waiting-merge` へ進みます。あわせて **Draft PR も（automerge かどうかに関わらず）この自動遷移では `status:waiting-merge` になりません**。保留された場合は理由が orchestrator のログに毎ループ出力されます。
 
+#### コンフリクト時の自動差し戻し
+
+automerge 対象 PR のコンフリクト差し戻しは、次のように動作します。
+
+- 通常時は、メタ issue を `status:in-progress` へ戻し、既存の担当ペイン（消失済みなら新規ペイン）へコンフリクト解消・push・CI 確認・再レビューを依頼します。
+- 同じ head SHA に対しては、依頼本文がペインに届いたことを確認できていれば再送しません。
+- 送信に失敗した場合は通算差し戻し回数を消費せず再試行します。同一 head SHA で 3 回（固定値）失敗すると、メタ issue へ通知して自動差し戻しを打ち切ります。この場合もラベルは変更しないため、タスクカードは「マージ待ち」のまま残りますが、自動では進まず手動対応が必要です。
+- 通算上限はタスク 1 件の生涯を通して数え、一度コンフリクトが解消してもリセットしません。`orchestrator.conflictHandbackMax` / `CONFLICT_HANDBACK_MAX`（既定 `2`）で変更でき、`0` を指定すると自動差し戻しを行わず、すべて手動対応になります。上限到達時はメタ issue へ通知し、ラベルを変更せず自動差し戻しを打ち切ります。その結果、タスクカードは「マージ待ち」のまま残りますが、自動では進まないため手動対応が必要です。
+- 解消後は CI が通過し、エージェントが現 head SHA（PR ブランチの最新コミット ID）を再レビューして `agent-review-passed-sha:` コメント（レビュー完了マーカー）を付け直すと、自動マージが再開します。
+
 なお上記は in-progress からの自動遷移のスコープです。`status:failed` からの事後復旧（`recheckFailedIssues()`：対象 issue に open PR が見つかったケース）や、CLI / `commands.jsonl` 経由の手動ステータス変更は、Draft・マーカーの有無を見ずに `status:waiting-merge` を付けます。
 
 ## クイックスタート（対話セットアップ）
@@ -261,6 +271,7 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `orchestrator.pollIntervalMs` | `POLL_INTERVAL_MS` | ポーリング間隔 | `60000` |
 | `orchestrator.watchdogIdleMs` | `WATCHDOG_IDLE_MS` | ウォッチドッグ閾値 | `10800000` |
 | `orchestrator.paneResumeMax` | `PANE_RESUME_MAX` | ペイン消失時・本文未達時（PR 未生成）の自動再開上限回数（両者で合算） | `3` |
+| `orchestrator.conflictHandbackMax` | `CONFLICT_HANDBACK_MAX` | コンフリクト差し戻しの通算上限（詳細は上記「コンフリクト時の自動差し戻し」） | `2` |
 | なし | `CLAUDE_READY_TIMEOUT_MS` | Claude Code の起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。コールドスタートの起動バナー churn を跨げるよう設定 | `45000` |
 | なし | `CLAUDE_SUBMIT_DELAY_MS` | 本文送信後の基準待機時間（linear backoff の 1 単位）。再送のたびに待機が伸びる | `1000` |
 | なし | `CLAUDE_SUBMIT_MAX_RETRIES` | 本文・Enter それぞれの最大再送回数（初回と合わせて最大 +1 回まで送信） | `3` |

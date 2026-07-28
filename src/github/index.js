@@ -1036,6 +1036,7 @@ export class GitHubClient {
       mergedAt: pr.merged_at,
       htmlUrl: pr.html_url,
       headRefName: pr.head?.ref ?? null,   // マージ後クリーンアップで削除するブランチ名
+      headSha: pr.head?.sha ?? null,        // コンフリクト差し戻しの冪等判定に使う先端コミット
       draft: pr.draft === true,
       mergeable: pr.mergeable,             // true | false | null（GitHub計算中はnull）
       mergeableState: pr.mergeable_state,  // 'clean' | 'dirty' | 'blocked' | 'unstable' | 'behind' | 'unknown' | ...

@@ -12,6 +12,7 @@
     "pollIntervalMs": 60000,
     "watchdogIdleMs": 10800000,
     "paneResumeMax": 3,
+    "conflictHandbackMax": 2,
     "assigneeFilter": null
   },
   "vkTerminals": {
