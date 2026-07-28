@@ -130,6 +130,63 @@ test('buildTasksWidget: priority none はバッジ化しない、parallel/manual
   ]);
 });
 
+test('buildTasksWidget: waiting-merge の blocked バッジを先頭に出し attention を付ける', () => {
+  const widget = buildTasksWidget(viewFrom([
+    {
+      number: 10,
+      title: 'conflicted',
+      labels: [
+        { name: 'status:waiting-merge' },
+        { name: 'blocked:conflict' },
+        { name: 'priority:high' },
+      ],
+      assignees: [],
+    },
+  ]));
+  const item = findGroup(widget, 'waiting-merge').items[0];
+  assert.equal(item.emphasis, 'attention');
+  assert.deepEqual(item.badges, [
+    { label: '要対応: コンフリクト', tone: 'danger' },
+    { label: '高', tone: 'danger' },
+    { label: '並列', tone: 'neutral' },
+    { label: '手動マージ', tone: 'neutral' },
+  ]);
+});
+
+test('buildTasksWidget: stale blocked ラベルは待機系以外でバッジも emphasis も出さない', () => {
+  const widget = buildTasksWidget(viewFrom([
+    {
+      number: 11,
+      title: 'stale blocked',
+      labels: [{ name: 'status:ready' }, { name: 'blocked:conflict' }],
+      assignees: [],
+    },
+  ]));
+  const item = findGroup(widget, 'ready').items[0];
+  assert.equal(Object.hasOwn(item, 'emphasis'), false);
+  assert.deepEqual(item.badges, [
+    { label: '並列', tone: 'neutral' },
+    { label: '手動マージ', tone: 'neutral' },
+  ]);
+});
+
+test('buildTasksWidget: 未知の blocked reason は待機系でもバッジに出さない', () => {
+  const widget = buildTasksWidget(viewFrom([
+    {
+      number: 12,
+      title: 'unknown blocked reason',
+      labels: [{ name: 'status:waiting-merge' }, { name: 'blocked:dependency' }],
+      assignees: [],
+    },
+  ]));
+  const item = findGroup(widget, 'waiting-merge').items[0];
+  assert.equal(item.emphasis, undefined);
+  assert.deepEqual(item.badges, [
+    { label: '並列', tone: 'neutral' },
+    { label: '手動マージ', tone: 'neutral' },
+  ]);
+});
+
 test('buildTasksWidget: local:// のキュー URL は queue リンクにしない', () => {
   const widget = buildTasksWidget(viewFrom([
     { number: 1, title: 'local', labels: [{ name: 'status:ready' }], assignees: [], html_url: 'local://1' },

@@ -8,6 +8,7 @@ import {
   buildTasksView,
   fetchAllTaskQueueIssues,
   normalizeTaskIssue,
+  refreshTasksSnapshots,
   refreshTasksViewSnapshot,
   writeTasksViewFile,
 } from '../src/engine/tasks-view.js';
@@ -44,6 +45,7 @@ test('normalizeTaskIssue: status/担当者/対象 issue URL/PR URL を正規化�
     title: 'tasks-view snapshot',
     status: 'waiting-merge',
     statusLabel: 'status:waiting-merge',
+    blockedReason: null,
     priority: 'high',
     sequential: true,
     automerge: true,
@@ -54,6 +56,16 @@ test('normalizeTaskIssue: status/担当者/対象 issue URL/PR URL を正規化�
     queueIssueUrl: 'https://github.com/vektor-inc/task-queue/issues/139',
     updatedAt: '2026-07-17T01:02:03Z',
   });
+});
+
+test('normalizeTaskIssue: blocked ラベルを設定値から正規化する', () => {
+  const task = normalizeTaskIssue({
+    number: 142,
+    labels: [{ name: 'status:waiting-merge' }, { name: 'manual-conflict' }],
+  }, {
+    labelsConfig: { blocked: { conflict: 'manual-conflict' } },
+  });
+  assert.equal(task.blockedReason, 'conflict');
 });
 
 test('normalizeTaskIssue: priority ラベルが無ければ null、sequential/automerge が無ければ false を返す', () => {
@@ -146,4 +158,30 @@ test('refreshTasksViewSnapshot: 書き出し失敗は warn のみで握りつぶ
   assert.equal(result, null);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /tasks-view\.json 書き出し失敗/);
+});
+
+test('refreshTasksSnapshots: 掃除スイープへ再利用できる取得済み issues を返す', async () => {
+  await withTmpDir(async (dir) => {
+    const issues = [{
+      number: 224,
+      title: 'blocked conflict',
+      labels: ['status:ready', 'blocked:conflict'],
+      assignees: [],
+    }];
+    let listCalls = 0;
+    const result = await refreshTasksSnapshots({
+      listAllQueueIssues: async () => {
+        listCalls += 1;
+        return issues;
+      },
+    }, {
+      now: new Date('2026-07-28T00:00:00Z'),
+      tasksViewPath: join(dir, 'tasks-view.json'),
+      tasksWidgetPath: join(dir, 'tasks-widget.json'),
+    });
+
+    assert.equal(listCalls, 1);
+    assert.equal(result.issues, issues);
+    assert.equal(result.view.tasks[0].blockedReason, 'conflict');
+  });
 });

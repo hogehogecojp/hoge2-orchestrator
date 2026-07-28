@@ -50,10 +50,10 @@ waiting-merge → failed → done`）。既知ステータスをこの順に並�
 | `id` | string | タスク ID（issue 番号の文字列）。 |
 | `title` | string | タスクタイトル。 |
 | `links` | array | 外部リンク。`{ rel: "queue" \| "pr" \| "target", url, label }`。`url` は `^https?://` のみ許可（`javascript:`/`data:` 等は生成側で除外）。無ければ空配列。 |
-| `badges` | array | バッジ。`{ label, tone }`（優先度・直列/並列）。 |
+| `badges` | array | バッジ。`{ label, tone }`（ブロック理由・優先度・直列/並列・マージ方式）。 |
 | `updatedAt` | string \| null | タスクの最終更新時刻。 |
 | `editable` | boolean | 操作可否。`done` は `false`。 |
-| `emphasis` | string (任意) | 意味的強調。`waiting-input` は `"attention"`（現行のパルス相当を色ではなく意味で表す）。該当時のみ存在。 |
+| `emphasis` | string (任意) | 意味的強調。`waiting-input` または人手対応が必要なブロック中は `"attention"`（現行のパルス相当を色ではなく意味で表す）。該当時のみ存在。 |
 | `assignee` | string (任意) | 担当者ログイン名。存在時のみ。 |
 | `controls` | array | 操作コントロール（下記）。`editable=false` のときは空配列。 |
 
@@ -62,6 +62,9 @@ waiting-merge → failed → done`）。既知ステータスをこの順に並�
 
 ### バッジ（`badges[]`）
 
+- ブロック理由: `status` が `waiting-merge` / `waiting-input` のときだけ先頭に表示する。
+  コンフリクトで人手対応が必要な場合は「要対応: コンフリクト」・tone `danger`。
+  取り残された `blocked:*` ラベルが待機系以外のステータスに存在しても表示しない。
 - 優先度: `high` / `medium` / `low` のみバッジ化する（`none` はバッジにしない＝選択肢集合とバッジ集合は別）。
   tone は `high=danger` / `medium=warning` / `low=success`。
 - 直列/並列: 常に表示。tone は `sequential=info` / `parallel=neutral`。
@@ -169,7 +172,7 @@ waiting-input → waiting-merge → done → failed`）で、グループ表示�
 | `info` | ready / waiting-merge / 直列(sequential) |
 | `progress` | in-progress |
 | `success` | 優先度 low / 自動マージ(automerge) |
-| `danger` | failed / 優先度 high |
+| `danger` | failed / 優先度 high / 要対応のブロック理由 |
 | `neutral` | done / 並列(parallel) / 手動マージ(manual) / 未知値フォールバック |
 | `attention` | awaiting-approval（および emphasis の値としても使用） |
 

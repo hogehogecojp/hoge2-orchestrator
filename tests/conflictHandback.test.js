@@ -8,6 +8,7 @@ import {
   decideConflictHandback,
   isPRConflicted,
   normalizeConflictHandbackMax,
+  requiresBlockedLabelForHandbackDecision,
 } from '../src/engine/conflict-handback.js';
 
 describe('isPRConflicted', () => {
@@ -289,6 +290,39 @@ describe('decideConflictHandback', () => {
       decideConflictHandback({ headSha: null, saved: {}, maxAttempts: 2 }),
       { type: 'skip-unknown-head', attempt: 0, sendFailures: 0, notifyExhausted: false }
     );
+  });
+});
+
+describe('requiresBlockedLabelForHandbackDecision', () => {
+  it('打ち切り状態なら notifyExhausted の値に関係なくラベルを主張する', () => {
+    assert.equal(requiresBlockedLabelForHandbackDecision({
+      type: 'skip-exhausted',
+      notifyExhausted: true,
+    }), true);
+    assert.equal(requiresBlockedLabelForHandbackDecision({
+      type: 'skip-exhausted',
+      notifyExhausted: false,
+    }), true);
+    assert.equal(requiresBlockedLabelForHandbackDecision({
+      type: 'skip-send-failed',
+      notifyExhausted: true,
+    }), true);
+    assert.equal(requiresBlockedLabelForHandbackDecision({
+      type: 'skip-send-failed',
+      notifyExhausted: false,
+    }), true);
+  });
+
+  it('打ち切り以外の判断や引数なしではラベルを主張しない', () => {
+    for (const type of [
+      'skip-unknown-head',
+      'disabled',
+      'skip-duplicate',
+      'handback',
+    ]) {
+      assert.equal(requiresBlockedLabelForHandbackDecision({ type }), false, type);
+    }
+    assert.equal(requiresBlockedLabelForHandbackDecision(), false);
   });
 });
 

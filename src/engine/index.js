@@ -13,6 +13,8 @@ import {
   GITHUB_TOKEN_RESOLUTION_HELP,
   ensureGitHubToken,
   getQueueBackend,
+  DEFAULT_LABELS,
+  getLabelsConfig,
   getTaskConfig,
   getTaskCwd,
   loadCoderabbitFeatureConfig,
@@ -55,6 +57,7 @@ import {
   decideConflictHandback,
   isPRConflicted,
   normalizeConflictHandbackMax,
+  requiresBlockedLabelForHandbackDecision,
 } from './conflict-handback.js';
 import { selectAutomergeCandidates } from './automerge-candidates.js';
 import { resolveWaitingMergeAction } from './waiting-merge-action.js';
@@ -76,6 +79,12 @@ import { refreshTasksSnapshots } from './tasks-view.js';
 import { resolveRepoCwd } from './resolve-repo-cwd.js';
 import { isLocalMachineHost } from './local-machine-host.js';
 import { hasGitHubIntegration, disabledGitHubFeatures } from './github-capability.js';
+import {
+  BLOCKED_REASON_CONFLICT,
+  createStaleBlockedLabelReconciler,
+  decideBlockedLabelForConflict,
+  requiresConflictBlockedLabel,
+} from './blocked-reason.js';
 // コマンド組み立て・ポート割り当て・テンプレート展開は副作用の無い純粋関数として
 // build-command.js に分離してある（テストから安全に import するため）。ここでは
 // 内部利用のために import しつつ、後段で再 export して index.js からも参照可能にする。
@@ -173,6 +182,36 @@ const github = new QueueClient({
 // GitHub 連携 capability。クライアント自身が宣言した値を単一の真実の源にする。
 // トークン無しローカルモードのときだけ false になり、GitHub 依存処理を早期 return でスキップする。
 const GITHUB_INTEGRATION = hasGitHubIntegration(github);
+const reconcileStaleBlockedLabels = createStaleBlockedLabelReconciler({
+  removeBlockedLabel: github.removeBlockedLabel.bind(github),
+  getLabelsConfig,
+  logger: console,
+});
+
+function issueHasLabel(issue, expected) {
+  return (issue?.labels ?? []).some(
+    (label) => (typeof label === 'string' ? label : label?.name) === expected
+  );
+}
+
+async function syncConflictBlockedLabel(issue, prState, humanActionRequired, tag) {
+  const blockedConflictLabel = getLabelsConfig().blocked?.conflict ??
+    DEFAULT_LABELS.blocked.conflict;
+  const decision = decideBlockedLabelForConflict({
+    prState,
+    hasBlockedLabel: issueHasLabel(issue, blockedConflictLabel),
+    humanActionRequired,
+  });
+  try {
+    if (decision.action === 'add') {
+      await github.addBlockedReasonLabel(issue.number, BLOCKED_REASON_CONFLICT);
+    } else if (decision.action === 'remove') {
+      await github.removeBlockedReasonLabel(issue.number, BLOCKED_REASON_CONFLICT);
+    }
+  } catch (err) {
+    console.warn(`  ${tag}: ${blockedConflictLabel} の${decision.action === 'add' ? '付与' : '除去'}失敗（次ループで再試行）: ${err.message}`);
+  }
+}
 
 function formatAssigneeMode(client) {
   if (!client.pickupEnabled) return '(なし・拾わない)';
@@ -1343,6 +1382,18 @@ async function checkWaitingMergeIssues() {
       continue;
     }
 
+    const hasAutomergeLabel = github.hasAutomergeLabel(issue);
+    const humanActionRequired = requiresConflictBlockedLabel({
+      prState,
+      hasAutomergeLabel,
+    });
+    await syncConflictBlockedLabel(
+      issue,
+      prState,
+      humanActionRequired,
+      `[merge-watch] issue #${issue.number}`
+    );
+
     // merged 判定を source 分岐より前に共通化する（#209）。
     // prState.merged なら source（waiting-merge / waiting-input）を問わず完了ルートへ流す。
     // これにより、automerge ラベル付きで waiting-input に滞留した issue の PR が GitHub UI 等で
@@ -1350,7 +1401,7 @@ async function checkWaitingMergeIssues() {
     const action = resolveWaitingMergeAction({
       source,
       prState,
-      hasAutomergeLabel: github.hasAutomergeLabel(issue),
+      hasAutomergeLabel,
     });
 
     if (action === 'complete-merge') {
@@ -1398,6 +1449,7 @@ async function checkWaitingMergeIssues() {
 
 async function notifyConflictHandbackExhausted({
   issue,
+  prState,
   prUrl,
   saved,
   decision,
@@ -1413,6 +1465,8 @@ async function notifyConflictHandbackExhausted({
         ]
       : [];
     try {
+      const blockedConflictLabel = getLabelsConfig().blocked?.conflict ??
+        DEFAULT_LABELS.blocked.conflict;
       await github.addComment(
         issue.number,
         [
@@ -1420,13 +1474,13 @@ async function notifyConflictHandbackExhausted({
           '',
           `PR: ${prUrl}`,
           '',
-          'メタ issue のステータスラベルは変更していないため、`status:waiting-merge`（マージ待ち）のままです。ただし、オーケストレーターは以降このタスクを自動では進めません。タスクカード上は「マージ待ち」に見えますが、手動対応なしに自動マージが再開することはありません。次の手順で手動対応してください。',
+          `メタ issue は \`status:waiting-merge\`（マージ待ち）のままですが、\`${blockedConflictLabel}\`（要対応: コンフリクト）を付けました。オーケストレーターは以降このタスクを自動では進めないため、次の手順で手動対応してください。`,
           '',
           '1. コンフリクトを手動で解消して push する',
           '2. push 後の内容をレビューし直す',
           '3. 現在の head SHA（PR ブランチの最新コミット ID）で `agent-review-passed-sha: <SHA>` コメント（レビュー完了マーカー）を PR に付け直す',
           '',
-          'レビュー完了マーカーが現 head SHA と一致すれば、自動マージが再開します。',
+          'コンフリクトを push した時点でタスクカードのバッジは消えますが、レビュー完了マーカーが現 head SHA と一致するまで自動マージは再開しません。',
           ...maxAttemptsGuide,
         ].join('\n')
       );
@@ -1444,6 +1498,12 @@ async function notifyConflictHandbackExhausted({
       console.warn(`  ${tag}: コンフリクト差し戻し打ち切り通知の記録に失敗（次ループで再試行）: ${err.message}`);
     }
   }
+  await syncConflictBlockedLabel(
+    issue,
+    prState,
+    requiresBlockedLabelForHandbackDecision(decision),
+    tag
+  );
   const reason = decision.type === 'skip-send-failed'
     ? `送信失敗 ${decision.sendFailures} 回`
     : `通算上限 ${CONFLICT_HANDBACK_MAX} 回`;
@@ -1527,6 +1587,12 @@ async function resetResolvedConflictHandbackState(issueNumber) {
  * 未達レコードを使って次ループの有限リトライへ委ねる。
  */
 async function handbackConflictedPR(issue, prRef, prState, prUrl, tag) {
+  if (!(CONFLICT_HANDBACK_MAX > 0)) {
+    await syncConflictBlockedLabel(issue, prState, true, tag);
+    console.log(`  ${tag}: コンフリクト差し戻しは設定で無効（CONFLICT_HANDBACK_MAX=0）`);
+    return;
+  }
+
   let healthy = false;
   try {
     healthy = await checkHealth(VK_PORT);
@@ -1557,16 +1623,12 @@ async function handbackConflictedPR(issue, prRef, prState, prUrl, tag) {
     console.warn(`  ${tag}: head SHA を取得できず冪等判定ができないため差し戻しを見送り（次ループで再判定）`);
     return;
   }
-  if (decision.type === 'disabled') {
-    console.log(`  ${tag}: コンフリクト差し戻しは設定で無効（CONFLICT_HANDBACK_MAX=0）`);
-    return;
-  }
   if (decision.type === 'skip-duplicate') {
     console.log(`  ${tag}: 同じ head SHA への差し戻しは配達済み（解消 push 待ち）`);
     return;
   }
   if (decision.type === 'skip-exhausted' || decision.type === 'skip-send-failed') {
-    await notifyConflictHandbackExhausted({ issue, prUrl, saved, decision, tag });
+    await notifyConflictHandbackExhausted({ issue, prState, prUrl, saved, decision, tag });
     return;
   }
 
@@ -2265,7 +2327,13 @@ async function loop() {
   try {
     await loopBody();
   } finally {
-    await refreshTasksSnapshots(github, { logger: console, viewer: ASSIGNEE_FILTER });
+    const snapshots = await refreshTasksSnapshots(github, {
+      logger: console,
+      viewer: ASSIGNEE_FILTER,
+    });
+    if (snapshots?.issues) {
+      await reconcileStaleBlockedLabels(snapshots.issues);
+    }
   }
 }
 

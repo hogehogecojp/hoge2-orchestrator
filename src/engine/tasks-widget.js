@@ -10,6 +10,7 @@
 
 import { resolveTasksWidgetPath, writeJsonAtomic } from '../config.js';
 import { TASK_DOMAIN } from './task-domain.js';
+import { shouldDisplayBlockedReason } from './blocked-reason.js';
 
 // 宣言のスキーマバージョン。互換を壊す変更のたびに増やす（ビューアは値で分岐可能）。
 export const TASKS_WIDGET_SCHEMA_VERSION = 1;
@@ -48,6 +49,12 @@ function buildLinks(task) {
 // 直列/並列と自動マージは常に表示。
 function buildBadges(task, domain) {
   const badges = [];
+  if (shouldDisplayBlockedReason(task)) {
+    badges.push({
+      label: domain.blockedReasonDisplayLabel(task.blockedReason),
+      tone: domain.blockedReasonTone(task.blockedReason),
+    });
+  }
   const priority = task.priority;
   if (domain.priorityBadgeValues.has(priority)) {
     badges.push({ label: domain.priorityLabel(priority), tone: domain.priorityTones[priority] });
@@ -178,7 +185,11 @@ function buildItem(task, domain) {
       : [],
   };
   // emphasis は意味属性（色ではない）。該当ステータスのときだけ付与する。
-  const emphasis = domain.emphasis[task.status];
+  const blockedEmphasis = shouldDisplayBlockedReason(task)
+    ? domain.blockedReasonEmphasis[task.blockedReason]
+    : null;
+  // ステータス側へ attention より弱い値を追加する場合、blocked の強調を隠さないよう優先順も再検討する。
+  const emphasis = domain.emphasis[task.status] ?? blockedEmphasis;
   if (emphasis) item.emphasis = emphasis;
   if (task.assignee) item.assignee = task.assignee;
   return item;

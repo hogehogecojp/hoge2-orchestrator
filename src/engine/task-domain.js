@@ -115,6 +115,18 @@ export const STATUS_EMPHASIS = Object.freeze({
   'waiting-input': 'attention',
 });
 
+export const BLOCKED_REASON_DISPLAY_LABELS = Object.freeze({
+  conflict: '要対応: コンフリクト',
+});
+
+export const BLOCKED_REASON_TONES = Object.freeze({
+  conflict: 'danger',
+});
+
+export const BLOCKED_REASON_EMPHASIS = Object.freeze({
+  conflict: 'attention',
+});
+
 // 操作可能（編集 UI を出す）ステータス集合。done は操作不可（false）。
 export const EDITABLE_STATUSES = new Set([
   'awaiting-approval',
@@ -197,6 +209,16 @@ export function statusDisplayLabel(status) {
  */
 export function statusTone(status) {
   return STATUS_TONES[status] ?? DEFAULT_TONE;
+}
+
+/** blocked reason の表示ラベルを返す。未知値は bare 名をそのまま返す。 */
+export function blockedReasonDisplayLabel(reason) {
+  return BLOCKED_REASON_DISPLAY_LABELS[reason] ?? String(reason ?? '');
+}
+
+/** blocked reason の tone を返す。未知値は neutral にフォールバックする。 */
+export function blockedReasonTone(reason) {
+  return BLOCKED_REASON_TONES[reason] ?? DEFAULT_TONE;
 }
 
 /**
@@ -299,6 +321,9 @@ export const TASK_DOMAIN = Object.freeze({
   displayLabels: STATUS_DISPLAY_LABELS,
   tones: STATUS_TONES,
   emphasis: STATUS_EMPHASIS,
+  blockedReasonDisplayLabels: BLOCKED_REASON_DISPLAY_LABELS,
+  blockedReasonTones: BLOCKED_REASON_TONES,
+  blockedReasonEmphasis: BLOCKED_REASON_EMPHASIS,
   editableStatuses: EDITABLE_STATUSES,
   priorityOptions: PRIORITY_OPTIONS,
   priorityBadgeValues: PRIORITY_BADGE_VALUES,
@@ -314,6 +339,8 @@ export const TASK_DOMAIN = Object.freeze({
   isAllowedTransition,
   statusDisplayLabel,
   statusTone,
+  blockedReasonDisplayLabel,
+  blockedReasonTone,
   priorityLabel,
   sequentialLabel,
   automergeLabel,

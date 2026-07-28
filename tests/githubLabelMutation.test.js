@@ -19,6 +19,10 @@ function makeClient(labels, { body = '' } = {}) {
         calls.push(['setLabels', params]);
         return { data: {} };
       },
+      addLabels: async (params) => {
+        calls.push(['addLabels', params]);
+        return { data: {} };
+      },
       removeLabel: async (params) => {
         calls.push(['removeLabel', params]);
         return { data: {} };
@@ -47,6 +51,35 @@ async function withTmpConfig(config, fn) {
 }
 
 describe('GitHubClient label mutations', () => {
+  it('addBlockedReasonLabel: 設定ラベルを addLabels で加算する', async () => {
+    await withTmpConfig({ labels: { blocked: { conflict: 'needs-fix' } } }, async () => {
+      const { client, calls } = makeClient([]);
+      await client.addBlockedReasonLabel(224, 'conflict');
+      assert.deepEqual(calls, [['addLabels', {
+        owner: 'vektor-inc',
+        repo: 'task-queue',
+        issue_number: 224,
+        labels: ['needs-fix'],
+      }]]);
+    });
+  });
+
+  it('removeBlockedReasonLabel: removeLabel を使い 404 は成功扱いにする', async () => {
+    const { client, calls } = makeClient([]);
+    await client.removeBlockedReasonLabel(224, 'conflict');
+    assert.deepEqual(calls, [['removeLabel', {
+      owner: 'vektor-inc',
+      repo: 'task-queue',
+      issue_number: 224,
+      name: 'blocked:conflict',
+    }]]);
+    client.octokit.issues.removeLabel = async () => {
+      const err = new Error('missing');
+      err.status = 404;
+      throw err;
+    };
+    await assert.doesNotReject(() => client.removeBlockedReasonLabel(224, 'conflict'));
+  });
   it('removeSourceWorkingLabel: 設定された作業中ラベルを対象 issue から外す', async () => {
     await withTmpConfig({ labels: { workingInProgress: 'in-flight' } }, async () => {
       const calls = [];

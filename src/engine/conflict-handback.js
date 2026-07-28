@@ -179,6 +179,15 @@ export function decideConflictHandback({
 }
 
 /**
+ * 差し戻しを打ち切った判断が、人手対応を示す blocked ラベルを必要とするか判定する。
+ * 通知済みかどうかはコメントの重複防止だけに使い、ラベルの自己修復には影響させない。
+ */
+export function requiresBlockedLabelForHandbackDecision(decision) {
+  return decision?.type === 'skip-exhausted' ||
+    decision?.type === 'skip-send-failed';
+}
+
+/**
  * コンフリクト解消を担当エージェントへ依頼する本文を組み立てる。
  *
  * @param {object} input

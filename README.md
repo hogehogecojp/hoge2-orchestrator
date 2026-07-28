@@ -60,9 +60,11 @@ automerge 対象 PR のコンフリクト差し戻しは、次のように動作
 
 - 通常時は、メタ issue を `status:in-progress` へ戻し、既存の担当ペイン（消失済みなら新規ペイン）へコンフリクト解消・push・CI 確認・再レビューを依頼します。
 - 同じ head SHA に対しては、依頼本文がペインに届いたことを確認できていれば再送しません。
-- 送信に失敗した場合は通算差し戻し回数を消費せず再試行します。同一 head SHA で 3 回（固定値）失敗すると、メタ issue へ通知して自動差し戻しを打ち切ります。この場合もラベルは変更しないため、タスクカードは「マージ待ち」のまま残りますが、自動では進まず手動対応が必要です。
-- 通算上限はタスク 1 件の生涯を通して数え、一度コンフリクトが解消してもリセットしません。`orchestrator.conflictHandbackMax` / `CONFLICT_HANDBACK_MAX`（既定 `2`）で変更でき、`0` を指定すると自動差し戻しを行わず、すべて手動対応になります。上限到達時はメタ issue へ通知し、ラベルを変更せず自動差し戻しを打ち切ります。その結果、タスクカードは「マージ待ち」のまま残りますが、自動では進まないため手動対応が必要です。
+- 送信に失敗した場合は通算差し戻し回数を消費せず再試行します。同一 head SHA で 3 回（固定値）失敗すると、メタ issue へ通知して自動差し戻しを打ち切り、`blocked:conflict` ラベルを付けます。タスクカードには赤い「要対応: コンフリクト」バッジと点滅が出て、手動対応が必要だと分かります。
+- 通算上限はタスク 1 件の生涯を通して数え、一度コンフリクトが解消してもリセットしません。`orchestrator.conflictHandbackMax` / `CONFLICT_HANDBACK_MAX`（既定 `2`）で変更でき、`0` を指定すると自動差し戻しを行わず、すべて手動対応になります。上限到達時も `blocked:conflict` を付けて自動差し戻しを打ち切ります。`waiting-merge` の automerge 対象外コンフリクトも同じ表示になります。
 - 解消後は CI が通過し、エージェントが現 head SHA（PR ブランチの最新コミット ID）を再レビューして `agent-review-passed-sha:` コメント（レビュー完了マーカー）を付け直すと、自動マージが再開します。
+- `blocked:conflict` は PR の状態から毎ループ再同期されるため、手で外してもコンフリクトが解消するまで戻ります。
+- PR のコンフリクト解消、マージ、close を確認すると `blocked:conflict` は自動で外れます。ステータスが `waiting-merge` 以外へ移った際の取り残しも毎ループ掃除し、表示側でも `waiting-merge` 以外にはブロック表示を出しません。
 
 なお上記は in-progress からの自動遷移のスコープです。`status:failed` からの事後復旧（`recheckFailedIssues()`：対象 issue に open PR が見つかったケース）や、CLI / `commands.jsonl` 経由の手動ステータス変更は、Draft・マーカーの有無を見ずに `status:waiting-merge` を付けます。
 
@@ -191,10 +193,10 @@ node src/engine/ensure-task-queue-label.mjs repo1 repo2   # 指定リポジト�
 node src/engine/ensure-task-queue-label.mjs --list        # 対象リポジトリ一覧の表示だけ
 ```
 
-**2. 運用ラベル一式（`status:*` / `priority:*` / `sequential` / `parallel` / `automerge`）をタスク登録リポジトリへ** — orchestrator が自動付与する `status:*` は未作成でも API 側で自動生成されますが、色がランダムになります。また `status:ready`（承認）・`priority:*`・`sequential`・`automerge` は**人間が手で付ける**ため、真っさらなタスク登録リポジトリでは事前登録しておかないと候補に出ません。タスク登録リポジトリのセットアップ時に流してください（色・説明は既定運用の定義に揃えて作成、既存はスキップ）。
+**2. 運用ラベル一式（`status:*` / `priority:*` / `blocked:*` / `sequential` / `parallel` / `automerge`）をタスク登録リポジトリへ** — orchestrator が自動付与する `status:*` / `blocked:*` は未作成でも API 側で自動生成されますが、色がランダムになります。また `status:ready`（承認）・`priority:*`・`sequential`・`automerge` は**人間が手で付ける**ため、真っさらなタスク登録リポジトリでは事前登録しておかないと候補に出ません。タスク登録リポジトリのセットアップ時に流してください（色・説明は既定運用の定義に揃えて作成、既存はスキップ）。
 
 ```bash
-npm run setup:queue-labels               # タスク登録リポジトリに status:* / priority:* など一式を ensure
+npm run setup:queue-labels               # タスク登録リポジトリに status:* / priority:* / blocked:* など一式を ensure
 node src/engine/ensure-task-queue-label.mjs --status --list   # 登録するラベル一覧の表示だけ
 ```
 

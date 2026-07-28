@@ -1,5 +1,6 @@
 import { DEFAULT_LABELS, getLabelsConfig, resolveTasksViewPath, writeJsonAtomic } from '../config.js';
 import { buildTasksWidget, writeTasksWidgetFile } from './tasks-widget.js';
+import { blockedReasonFromLabels } from './blocked-reason.js';
 
 const ISSUE_URL_RE = /https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/issues\/\d+/;
 const PR_URL_RE = /\*\*PR:\*\*\s*(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/g;
@@ -45,6 +46,7 @@ export function normalizeTaskIssue(issue, options = {}) {
     title: issue.title ?? '',
     status: statusLabel ? statusLabel.slice('status:'.length) : null,
     statusLabel,
+    blockedReason: blockedReasonFromLabels(labels, { labelsConfig }),
     priority: PRIORITY_VALUES.has(priority) ? priority : null,
     sequential: labels.includes('sequential'),
     automerge: labels.includes(automergeLabel),
@@ -147,13 +149,14 @@ export async function writeTasksSnapshots(github, options = {}) {
  * 失敗は warn で記録してポーリング処理を止めない。
  * @param {object} github キュークライアント
  * @param {object} [options] writeTasksSnapshots と同じ options（logger を追加で受ける）
- * @returns {Promise<{ view: object|null, widget: object|null }|null>}
+ * @returns {Promise<{ issues: Array<object>, view: object|null, widget: object|null }|null>}
  */
 export async function refreshTasksSnapshots(github, options = {}) {
   const logger = options.logger ?? console;
+  let issues;
   let view = null;
   try {
-    const issues = options.issues ?? await fetchAllTaskQueueIssues(github);
+    issues = options.issues ?? await fetchAllTaskQueueIssues(github);
     view = buildTasksView(issues, { now: options.now, viewer: options.viewer });
   } catch (err) {
     logger.warn?.(`[tasks-view] タスク一覧の取得に失敗（処理は継続）: ${err.message}`);
@@ -181,5 +184,5 @@ export async function refreshTasksSnapshots(github, options = {}) {
     logger.warn?.(`[tasks-view] tasks-widget.json 書き出し失敗（処理は継続）: ${err.message}`);
   }
 
-  return { view, widget };
+  return { issues, view, widget };
 }

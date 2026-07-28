@@ -235,6 +235,18 @@ test('LocalQueueClient: setPriority / setSequential / setAutomerge は issue 互
   assert.equal(updated.labels.includes('automerge'), false);
 });
 
+test('LocalQueueClient: blocked reason の付け外しを issue 互換 labels に反映する', async () => {
+  const client = createLocalQueueClient([{ number: 33, title: 'blocked task' }]);
+
+  await client.addBlockedReasonLabel(33, 'conflict');
+  let [issue] = await client.listAllQueueIssues();
+  assert.ok(issue.labels.includes('blocked:conflict'));
+
+  await client.removeBlockedReasonLabel(33, 'conflict');
+  [issue] = await client.listAllQueueIssues();
+  assert.equal(issue.labels.includes('blocked:conflict'), false);
+});
+
 test('LocalQueueClient: hasAutomergeLabel は設定変更後のラベル名で判定する', async () => {
   await withTmpConfig({ labels: { automerge: 'auto-merge-ok' } }, async () => {
     const client = createLocalQueueClient([{ number: 34, title: 'renamed automerge', automerge: true }]);

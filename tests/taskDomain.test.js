@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { DEFAULT_LABELS } from '../src/config.js';
 import {
   ALLOWED_TRANSITIONS,
   isAllowedTransition,
@@ -8,6 +9,9 @@ import {
   STATUS_SELECT_ORDER,
   STATUS_TONES,
   STATUS_EMPHASIS,
+  BLOCKED_REASON_DISPLAY_LABELS,
+  BLOCKED_REASON_TONES,
+  BLOCKED_REASON_EMPHASIS,
   EDITABLE_STATUSES,
   PRIORITY_OPTIONS,
   PRIORITY_BADGE_VALUES,
@@ -18,6 +22,8 @@ import {
   AUTOMERGE_BADGE_LABELS,
   statusDisplayLabel,
   statusTone,
+  blockedReasonDisplayLabel,
+  blockedReasonTone,
   priorityLabel,
   sequentialLabel,
   automergeLabel,
@@ -80,6 +86,22 @@ test('tone: 7 種すべてに意味語彙が割り当てられ、生 HEX を含�
 test('emphasis: waiting-input のみ attention（パルス相当を意味属性で表す）', () => {
   assert.equal(STATUS_EMPHASIS['waiting-input'], 'attention');
   assert.equal(STATUS_EMPHASIS['in-progress'], undefined);
+});
+
+test('blocked reason: conflict は要対応ラベル・danger・attention', () => {
+  assert.equal(BLOCKED_REASON_DISPLAY_LABELS.conflict, '要対応: コンフリクト');
+  assert.equal(BLOCKED_REASON_TONES.conflict, 'danger');
+  assert.equal(BLOCKED_REASON_EMPHASIS.conflict, 'attention');
+  assert.equal(blockedReasonDisplayLabel('mystery'), 'mystery');
+  assert.equal(blockedReasonTone('mystery'), DEFAULT_TONE);
+});
+
+test('blocked reason: 設定済み reason はすべての表示語彙へ登録されている', () => {
+  for (const reason of Object.keys(DEFAULT_LABELS.blocked)) {
+    assert.ok(Object.hasOwn(BLOCKED_REASON_DISPLAY_LABELS, reason), `${reason}: display label`);
+    assert.ok(Object.hasOwn(BLOCKED_REASON_TONES, reason), `${reason}: tone`);
+    assert.ok(Object.hasOwn(BLOCKED_REASON_EMPHASIS, reason), `${reason}: emphasis`);
+  }
 });
 
 test('EDITABLE_STATUSES: done 以外の 6 種が操作可、done は不可', () => {

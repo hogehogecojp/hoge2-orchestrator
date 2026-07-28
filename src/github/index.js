@@ -328,6 +328,49 @@ export class GitHubClient {
     console.log(`  [GitHub] issue #${issueNumber} priority → ${newPriority}`);
   }
 
+  // メタ issue に停止理由ラベルを加算する。ラベル集合の全置換を避け、
+  // 他マシンや GUI の同時変更を read-modify-write で踏み潰さない。
+  async addBlockedReasonLabel(issueNumber, reason) {
+    const blockedLabel = getLabelsConfig().blocked?.[reason];
+    if (!blockedLabel) throw new Error(`不明な停止理由です: ${reason}`);
+    await this.octokit.issues.addLabels({
+      owner: this.owner,
+      repo: this.repo,
+      issue_number: issueNumber,
+      labels: [blockedLabel],
+    });
+    console.log(`  [GitHub] issue #${issueNumber} blocked → ${reason}`);
+  }
+
+  // メタ issue から指定の停止理由ラベルを除去する。404 は既に無い状態なので成功扱い。
+  async removeBlockedLabel(issueNumber, blockedLabel) {
+    const configuredLabels = Object.values(getLabelsConfig().blocked ?? {});
+    if (
+      typeof blockedLabel !== 'string' ||
+      (!blockedLabel.startsWith('blocked:') && !configuredLabels.includes(blockedLabel))
+    ) {
+      throw new Error(`不明な停止理由ラベルです: ${blockedLabel}`);
+    }
+    try {
+      await this.octokit.issues.removeLabel({
+        owner: this.owner,
+        repo: this.repo,
+        issue_number: issueNumber,
+        name: blockedLabel,
+      });
+    } catch (err) {
+      if (err.status === 404) return;
+      throw err;
+    }
+    console.log(`  [GitHub] issue #${issueNumber} blocked label removed: ${blockedLabel}`);
+  }
+
+  async removeBlockedReasonLabel(issueNumber, reason) {
+    const blockedLabel = getLabelsConfig().blocked?.[reason];
+    if (!blockedLabel) throw new Error(`不明な停止理由です: ${reason}`);
+    await this.removeBlockedLabel(issueNumber, blockedLabel);
+  }
+
   // issue の直列実行ラベルを更新する。
   // sequential 以外のラベルは維持し、parallel の場合も parallel ラベルは付けない。
   async setSequential(issueNumber, mode) {

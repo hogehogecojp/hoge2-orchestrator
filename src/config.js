@@ -101,6 +101,9 @@ export const DEFAULT_LABELS = {
     medium: 'priority:medium',
     low: 'priority:low',
   },
+  blocked: {
+    conflict: 'blocked:conflict',
+  },
   automerge: 'automerge',
   sequential: 'sequential',
   parallel: 'parallel',

@@ -1780,6 +1780,7 @@ test('getLabelsConfig: 空配列/空文字の config 値は既定にフォール
   assert.equal(l.status.ready, 'status:ready');       // 空配列 [] で潰れない
   assert.equal(l.status.inProgress, 'status:in-progress');
   assert.equal(l.priority.high, 'priority:high');
+  assert.equal(l.blocked.conflict, 'blocked:conflict');
   assert.equal(l.automerge, 'automerge');             // 空文字 "" で潰れない
   assert.equal(l.sequential, 'sequential');
   assert.equal(l.parallel, 'parallel');
@@ -1811,6 +1812,7 @@ test('getLabelsConfig: 既定値を返す', () => {
   assert.equal(l.status.inProgress, 'status:in-progress');
   assert.equal(l.status.awaitingApproval, 'status:awaiting-approval');
   assert.equal(l.priority.high, 'priority:high');
+  assert.equal(l.blocked.conflict, 'blocked:conflict');
   assert.equal(l.automerge, 'automerge');
   assert.equal(l.sequential, 'sequential');
   assert.equal(l.parallel, 'parallel');
@@ -1833,6 +1835,12 @@ test('getLabelsConfig: config.json の部分上書きが効き、未指定キー
   assert.equal(l.status.done, 'x');            // 上書きされる
   assert.equal(l.status.inProgress, 'status:in-progress'); // 未指定は既定のまま
   assert.equal(l.automerge, 'automerge');      // 他セクションも既定のまま
+});
+
+test('getLabelsConfig: blocked reason ラベルを個別にリネームできる', () => {
+  const l = getLabelsConfig({ labels: { blocked: { conflict: 'needs-conflict-fix' } } });
+  assert.equal(l.blocked.conflict, 'needs-conflict-fix');
+  assert.equal(l.status.waitingMerge, 'status:waiting-merge');
 });
 
 test('getProtocolConfig: statusTokens の部分上書き（ディープマージ）', () => {

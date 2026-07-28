@@ -78,6 +78,7 @@ const QUEUE_REPO_LABELS = [
   { name: 'priority:high',           color: 'b60205', description: '優先度：高' },
   { name: 'priority:medium',         color: 'fbca04', description: '優先度：中' },
   { name: 'priority:low',            color: 'd4c5f9', description: '優先度：低' },
+  { name: 'blocked:conflict',         color: 'b60205', description: '人手によるコンフリクト解消が必要' },
   { name: 'sequential',              color: 'c5def5', description: '順番に実行（デフォルト）' },
   { name: 'parallel',                color: 'bfd4f2', description: '並列実行可能' },
   { name: 'automerge',               color: '6d1e95', description: 'マージ手順を事前承認（orchestrator が自動マージ）' },

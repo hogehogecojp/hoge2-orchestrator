@@ -30,6 +30,7 @@ function labelsForTask(task, labelsConfig = getLabelsConfig()) {
   return [
     statusLabelFor(task.status, labelsConfig),
     priorityLabelFor(task.priority, labelsConfig),
+    ...(task.blockedReasons ?? []).map(reason => labelsConfig.blocked?.[reason] ?? `blocked:${reason}`),
     task.sequential ? labelsConfig.sequential ?? DEFAULT_LABELS.sequential : null,
     task.automerge ? labelsConfig.automerge ?? DEFAULT_LABELS.automerge : null,
   ].filter(Boolean);
@@ -268,6 +269,39 @@ export class LocalQueueClient {
     console.log(`  [LocalQueue] task #${issueNumber} automerge → ${mode}`);
   }
 
+  async addBlockedReasonLabel(issueNumber, reason) {
+    const blockedLabel = getLabelsConfig().blocked?.[reason];
+    if (!blockedLabel) throw new Error(`不明な停止理由です: ${reason}`);
+    await this.mutateTask(issueNumber, (task) => {
+      const reasons = new Set(task.blockedReasons ?? []);
+      reasons.add(reason);
+      task.blockedReasons = [...reasons];
+    });
+    console.log(`  [LocalQueue] task #${issueNumber} blocked → ${reason}`);
+  }
+
+  async removeBlockedLabel(issueNumber, blockedLabel) {
+    if (typeof blockedLabel !== 'string') {
+      throw new Error(`不明な停止理由ラベルです: ${blockedLabel}`);
+    }
+    const labelsConfig = getLabelsConfig();
+    const configuredReason = Object.entries(labelsConfig.blocked ?? {})
+      .find(([, label]) => label === blockedLabel)?.[0];
+    const reason = configuredReason ??
+      (blockedLabel.startsWith('blocked:') ? blockedLabel.slice('blocked:'.length) : null);
+    if (!reason) throw new Error(`不明な停止理由ラベルです: ${blockedLabel}`);
+    await this.mutateTask(issueNumber, (task) => {
+      task.blockedReasons = (task.blockedReasons ?? []).filter(item => item !== reason);
+    });
+    console.log(`  [LocalQueue] task #${issueNumber} blocked label removed: ${blockedLabel}`);
+  }
+
+  async removeBlockedReasonLabel(issueNumber, reason) {
+    const blockedLabel = getLabelsConfig().blocked?.[reason];
+    if (!blockedLabel) throw new Error(`不明な停止理由です: ${reason}`);
+    await this.removeBlockedLabel(issueNumber, blockedLabel);
+  }
+
   async addComment(issueNumber, body) {
     await this.mutateTask(issueNumber, (task, _queue, now) => {
       const comments = Array.isArray(task.comments) ? task.comments : [];
@@ -325,6 +359,7 @@ export class LocalQueueClient {
         priority: String(priority ?? 'none'),
         sequential: sequential === true,
         automerge: false,
+        blockedReasons: [],
         cwd,
         prUrl: null,
         comments: [],
@@ -352,6 +387,7 @@ export class LocalQueueClient {
         priority: 'none',
         sequential: false,
         automerge: false,
+        blockedReasons: [],
         cwd: null,
         prUrl: null,
         comments: [],
