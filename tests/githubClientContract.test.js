@@ -84,3 +84,25 @@ test('GitHubClient.getPRState: コンフリクト差し戻しの冪等判定用�
   assert.equal(state.mergeable, false);
   assert.equal(state.mergeableState, 'dirty');
 });
+
+test('GitHubClient.addSourceComment: 対象側の owner/repo/number へコメントする', async () => {
+  let captured;
+  const client = new GitHubClient({ token: 't', owner: 'vektor-inc', repo: 'task-queue' });
+  client.octokit = {
+    issues: {
+      createComment: async (params) => {
+        captured = params;
+      },
+    },
+  };
+  const target = { owner: 'vektor-inc', repo: 'vk-blocks-pro', number: 1234, isSelf: false };
+
+  await client.addSourceComment(target, 'retry exhausted');
+
+  assert.deepEqual(captured, {
+    owner: 'vektor-inc',
+    repo: 'vk-blocks-pro',
+    issue_number: 1234,
+    body: 'retry exhausted',
+  });
+});

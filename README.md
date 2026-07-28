@@ -274,6 +274,7 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `orchestrator.watchdogIdleMs` | `WATCHDOG_IDLE_MS` | ウォッチドッグ閾値 | `10800000` |
 | `orchestrator.paneResumeMax` | `PANE_RESUME_MAX` | ペイン消失時・本文未達時（PR 未生成）の自動再開上限回数（両者で合算） | `3` |
 | `orchestrator.conflictHandbackMax` | `CONFLICT_HANDBACK_MAX` | コンフリクト差し戻しの通算上限（詳細は上記「コンフリクト時の自動差し戻し」） | `2` |
+| `orchestrator.replyForwardRetryMax` | `REPLY_FORWARD_RETRY_MAX` | issue の返信が作業ペインへ届かなかった場合の再送上限回数（初回送信を除く） | `2` |
 | なし | `CLAUDE_READY_TIMEOUT_MS` | Claude Code の起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。コールドスタートの起動バナー churn を跨げるよう設定 | `45000` |
 | なし | `CLAUDE_SUBMIT_DELAY_MS` | 本文送信後の基準待機時間（linear backoff の 1 単位）。再送のたびに待機が伸びる | `1000` |
 | なし | `CLAUDE_SUBMIT_MAX_RETRIES` | 本文・Enter それぞれの最大再送回数（初回と合わせて最大 +1 回まで送信） | `3` |

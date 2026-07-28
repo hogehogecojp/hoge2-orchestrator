@@ -13,6 +13,7 @@
     "watchdogIdleMs": 10800000,
     "paneResumeMax": 3,
     "conflictHandbackMax": 2,
+    "replyForwardRetryMax": null,
     "assigneeFilter": null
   },
   "vkTerminals": {

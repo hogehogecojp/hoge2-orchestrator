@@ -69,6 +69,11 @@ import { findReplyAfterWaitingInput, hasAgentAnsweredAfterWaitingInput } from '.
 import { startKeepAwake } from '../power/keep-awake.js';
 import { createNotifyPaneMerged } from './notify-pane-merged.js';
 import { createWaitingMarkerScanner } from './waiting-marker-scanner.js';
+import {
+  DEFAULT_REPLY_FORWARD_RETRY_MAX,
+  createReplyForwardScanner,
+  normalizeReplyForwardRetryMax,
+} from './reply-forward.js';
 import { createCommandsFileProcessor, startCommandsFileWatcher } from './commands-file.js';
 import { installPersistentConsoleLogger } from './persistent-logger.js';
 import { createStartLock } from './start-lock.js';
@@ -124,6 +129,11 @@ const PANE_RESUME_MAX    = normalizeResumeMax(process.env.PANE_RESUME_MAX ?? 3);
 // 通算上限を設ける。不正値は純関数側で健全化し、0 は差し戻し無効化として扱う。
 const CONFLICT_HANDBACK_MAX = normalizeConflictHandbackMax(
   process.env.CONFLICT_HANDBACK_MAX ?? DEFAULT_CONFLICT_HANDBACK_MAX
+);
+// 返信転送は初回送信に加えて設定回数だけ再送する。不正値は既定 2 に戻し、
+// 0 は「再試行なし」（初回送信だけ）として扱う。
+const REPLY_FORWARD_MAX_ATTEMPTS = 1 + normalizeReplyForwardRetryMax(
+  process.env.REPLY_FORWARD_RETRY_MAX ?? DEFAULT_REPLY_FORWARD_RETRY_MAX
 );
 // Claude Code の TUI 起動完了（入力待ち）を待つ readiness ゲートの全体タイムアウト。
 // コールドスタート・高負荷時は起動バナーの描画（churn）が長引き、旧既定 15 秒では
@@ -441,6 +451,23 @@ const scanWaitingMarkers = createWaitingMarkerScanner({
   getTask,
   setExternalWaiting,
   port: VK_PORT,
+  logger: console,
+});
+
+const scanWaitingInputIssues = createReplyForwardScanner({
+  githubIntegration: GITHUB_INTEGRATION,
+  fetchWaitingInputIssues: () => github.fetchWaitingInputIssues(),
+  getTask,
+  gatherTargetState,
+  ensurePRRecorded,
+  findReplyAfterWaitingInput,
+  submitToClaude,
+  reconfirmBodyEcho,
+  updateTask,
+  setStatus: (...args) => github.setStatus(...args),
+  addTargetComment: (...args) => github.addSourceComment(...args),
+  port: VK_PORT,
+  maxAttempts: REPLY_FORWARD_MAX_ATTEMPTS,
   logger: console,
 });
 
@@ -1046,105 +1073,6 @@ async function scanAnsweredRecovery() {
     } catch (err) {
       // 失敗時は次ループで再試行（waiting-input のまま据え置き）。
       console.warn(`  [answered-recovery] issue #${issue.number}: in-progress 復帰失敗（次ループ再試行）: ${err.message}`);
-    }
-  }
-}
-
-// -------------------------------------------------------
-// 指示待ちスキャン: 対象 issue/PR に付いたユーザー返信（= 単独 Status: 行を
-// 持たない、直近 waiting-input より後のコメント）を pane に転送して in-progress に戻す。
-// bot 投稿（CodeRabbit 等）は返信扱いせず転送しない（#141）。返信内容の意味解釈はせず、
-// Status: 行の有無と投稿者種別だけで機械的に判定する（中身は vk-kore が判断し、必要なら再度 waiting-input を出す）。
-// （`Status: answered` による転送不要の復帰は scanAnsweredRecovery が健全性ゲート前で処理する。）
-// -------------------------------------------------------
-async function scanWaitingInputIssues() {
-  // 返信転送は対象 issue/PR のコメント収集（gatherTargetState）が前提のため GitHub 連携が必要。無効時はスキップ。
-  if (!GITHUB_INTEGRATION) return;
-  let issues;
-  try {
-    issues = await github.fetchWaitingInputIssues();
-  } catch (err) {
-    console.warn(`[scan-waiting-input] waiting-input issue 取得失敗: ${err.message}`);
-    return;
-  }
-  if (issues.length === 0) return;
-
-  for (const issue of issues) {
-    let saved = null;
-    try {
-      saved = await getTask(issue.number);
-    } catch { /* state 取得失敗 */ }
-
-    let state;
-    try {
-      state = await gatherTargetState(issue);
-    } catch (err) {
-      console.warn(`  [scan-waiting-input] issue #${issue.number}: 状態収集失敗: ${err.message}`);
-      continue;
-    }
-
-    // 指示待ち中に PR ができたケースの URL/アイコン補完（確認中も PR に飛べるように）。
-    if (state.pr && state.prState) {
-      await ensurePRRecorded(issue, state.target, state.pr);
-    }
-
-    // `Status: answered`（ペイン経由で解決済み＝転送不要）の復帰は scanAnsweredRecovery が
-    // 健全性ゲートより前で処理済み。ここに来る waiting-input issue は返信転送が必要なケース。
-    if (!saved || saved.termId == null) {
-      // termId が分からないと返信を pane に転送できない（再起動等で state 喪失）。
-      console.warn(`  [scan-waiting-input] issue #${issue.number}: termId 不明のため返信転送をスキップ`);
-      continue;
-    }
-
-    const reply = findReplyAfterWaitingInput(state.comments);
-    if (!reply) continue;
-    // 二重転送ガード（毎ティック走るため、転送済み返信は再送しない）。
-    // ただし「転送は成功したが直後の setStatus('status:in-progress') が失敗した」場合、
-    // この issue は waiting-input のまま残り、次ティック以降は毎回ここで continue するため
-    // setStatus が二度と再試行されず永久に固着する（#154）。
-    // 転送（submitToClaude）はスキップしつつ、in-progress 復帰だけを再試行する。
-    // scanWaitingInputIssues は waiting-input の issue しか走査しないので、復帰成功後は
-    // 自然に対象から外れる（冪等）。
-    if (saved.lastForwardedCommentId === reply.id) {
-      try {
-        await github.setStatus(issue.number, 'status:in-progress');
-        console.log(`  [scan-waiting-input] issue #${issue.number}: 転送済み・in-progress 復帰のみ再試行 → in-progress`);
-      } catch (err) {
-        console.warn(`  [scan-waiting-input] issue #${issue.number}: in-progress 復帰再試行失敗（次ループ再試行）: ${err.message}`);
-      }
-      continue;
-    }
-
-    let forwardResult;
-    try {
-      // clearBeforeSend:false — この経路の転送先は「waiting-input＝Claude が y/n 確認や
-      // 権限承認のダイアログを出して止まっているペイン」であることが前提。生きた
-      // ダイアログへ Ctrl-A(\x01) + Ctrl-K(\x0b) を撃つと Claude Code 側がどう解釈するか
-      // （意図しない確定・キャンセル）はこちらから検証できないため、初回クリアは撃たない。
-      // #189 が守りたいのは新規ディスパッチ時のアイドルペインであって、この経路は対象外。
-      forwardResult = await submitToClaude(VK_PORT, saved.termId, reply.body, undefined, {
-        clearBeforeSend: false,
-      });
-    } catch (err) {
-      console.warn(`  [scan-waiting-input] issue #${issue.number}: 返信転送失敗（次ループ再試行）: ${err.message}`);
-      continue;
-    }
-    if (forwardResult?.bodyConfirmed === false) {
-      // 返信本文が入力欄に届いていない可能性がある。転送自体は成功扱いで先へ進む
-      // （握りつぶさないよう警告だけ残す）。
-      console.warn(
-        `  [scan-waiting-input] issue #${issue.number}: 返信本文が入力欄に届いていない可能性があります (termId=${saved.termId})`
-      );
-    }
-    // 転送成功直後にカーソルを記録（setStatus 失敗時でも二重転送を防ぐ）。
-    try {
-      await updateTask(issue.number, { lastForwardedCommentId: reply.id });
-    } catch { /* カーソル記録失敗は致命的でない */ }
-    try {
-      await github.setStatus(issue.number, 'status:in-progress');
-      console.log(`  [scan-waiting-input] issue #${issue.number}: 返信(id:${reply.id})を転送 → in-progress`);
-    } catch (err) {
-      console.warn(`  [scan-waiting-input] issue #${issue.number}: in-progress 復帰失敗（次ループ再試行）: ${err.message}`);
     }
   }
 }

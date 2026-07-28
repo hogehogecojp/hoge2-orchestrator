@@ -469,6 +469,7 @@ export class LocalQueueClient {
   closeSourceIssue(...args) { return this.github.closeSourceIssue(...args); }
   appendQueueIssueRefToPR(...args) { return this.github.appendQueueIssueRefToPR(...args); }
   listIssueComments(...args) { return this.github.listIssueComments(...args); }
+  addSourceComment(...args) { return this.github.addSourceComment(...args); }
   postSourceImportComment(...args) { return this.github.postSourceImportComment(...args); }
   postSourceCompletionComment(...args) { return this.github.postSourceCompletionComment(...args); }
   parseSourceRepo(...args) { return this.github.parseSourceRepo(...args); }

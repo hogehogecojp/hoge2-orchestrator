@@ -221,6 +221,7 @@ export function applyConfigToEnv(cfg = {}) {
   set('WATCHDOG_IDLE_MS', o.watchdogIdleMs);
   set('PANE_RESUME_MAX', o.paneResumeMax);
   set('CONFLICT_HANDBACK_MAX', o.conflictHandbackMax);
+  set('REPLY_FORWARD_RETRY_MAX', o.replyForwardRetryMax);
   set('ASSIGNEE_FILTER', o.assigneeFilter);
 
   const vk = cfg.vkTerminals ?? {};
@@ -1143,6 +1144,7 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
           { key: 'orchestrator.watchdogIdleMs',  label: 'ウォッチドッグ idle (ms)', type: 'number', help: 'この時間ターミナルが無活動だと停滞とみなす閾値をミリ秒で指定します。\n例: 10800000 = 3 時間' },
           { key: 'orchestrator.paneResumeMax',   label: 'ペイン消失時の自動再開上限 (回)', type: 'number', help: '作業ペイン消失時（PR 未生成に限る）に自動で再実行する上限回数。超えると failed になり手動確認が必要（既定: 3）' },
           { key: 'orchestrator.conflictHandbackMax', label: 'コンフリクト差し戻し上限 (回)', type: 'number', help: 'automerge ラベル付きタスクの PR がコンフリクトしたとき、作業ペインへ「解消 → push → 再レビュー」を自動依頼する上限回数。タスク 1 件あたりの通算で、一度解消しても回数はリセットされません。\n上限を超えるとタスクの issue にコメントし、ラベルを変えずに自動依頼をやめるため、以降は手動対応が必要です。\n0 を指定すると自動依頼を行わず、すべてのコンフリクトが手動対応になります（既定: 2）' },
+          { key: 'orchestrator.replyForwardRetryMax', label: '返信転送の再試行上限 (回)', type: 'number', help: 'issue に投稿された返信が作業ペインの入力欄へ届かなかった場合に、再送する上限回数を指定します。初回送信は回数に含みません。上限に達すると issue にお知らせを投稿し、タスクは失敗にせず指示待ちのまま維持します。\n0 を指定すると再送せず、初回送信だけを行います（既定: 2）' },
           { key: 'task.commandTemplate', label: 'issue を処理する Claude のコマンドテンプレート', type: 'text', placeholder: '/vk-kore {issueUrl} wp-env-port={wpPort} headless=1', help: 'issue に対して仕様検討・実装・プルリク作成・レビューまで自動で処理してマージできる状態にする Claude のコマンドを指定してください。未指定の場合は、次の形式で投げられます。\n/vk-kore {issueUrl} wp-env-port={wpPort} headless=1\n{issueUrl} と {wpPort} は自動で置換します。\n独自のコマンドを使用する場合、オーケストレーターと円滑に連携するための決め事がいくつかあります。詳しくは docs/agent-rules.md をご確認ください。デフォルトの /vk-kore スキルは vendor/vk-agents-public/skills/vk-kore/ にありますので、必要に応じてそれを参考に独自のスキルをご利用の PC の .claude に作ってください。' },
         ],
       },

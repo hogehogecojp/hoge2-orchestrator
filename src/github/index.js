@@ -498,6 +498,16 @@ export class GitHubClient {
     });
   }
 
+  // 作業対象リポジトリ側 issue へ、明示された owner/repo/number でコメントを投稿する。
+  async addSourceComment(sourceRef, body) {
+    await this.octokit.issues.createComment({
+      owner: sourceRef.owner,
+      repo: sourceRef.repo,
+      issue_number: sourceRef.number,
+      body,
+    });
+  }
+
   // issueにコメントを追加
   async addComment(issueNumber, body) {
     await this.octokit.issues.createComment({

@@ -154,6 +154,20 @@ test('LocalQueueClient: removeSourceWorkingLabel を GitHub client へ委譲す�
   assert.deepEqual(calls, [[target]]);
 });
 
+test('LocalQueueClient: addSourceComment を GitHub client へ委譲する', async () => {
+  const calls = [];
+  const client = createLocalQueueClient([], {
+    githubClient: fakeGitHubClient({
+      addSourceComment: async (...args) => calls.push(args),
+    }),
+  });
+  const target = { owner: 'vektor-inc', repo: 'vk-blocks-pro', number: 1234, isSelf: false };
+
+  await client.addSourceComment(target, 'retry exhausted');
+
+  assert.deepEqual(calls, [[target, 'retry exhausted']]);
+});
+
 test('LocalQueueClient: setStatus は done 再設定でも作業中ラベルを外し、完了コメントは遷移時だけ投稿する', async () => {
   const calls = [];
   const client = createLocalQueueClient([

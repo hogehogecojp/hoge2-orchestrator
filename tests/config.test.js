@@ -117,7 +117,7 @@ test('loadUnifiedConfig: JSON を読み込む', () => {
 });
 
 test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
-  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'QUEUE_BACKEND', 'VK_TERMINALS_PORT', 'CONFLICT_HANDBACK_MAX', 'ASSIGNEE_FILTER', 'TASK_CWD'];
+  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'QUEUE_BACKEND', 'VK_TERMINALS_PORT', 'CONFLICT_HANDBACK_MAX', 'REPLY_FORWARD_RETRY_MAX', 'ASSIGNEE_FILTER', 'TASK_CWD'];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   try {
@@ -128,6 +128,7 @@ test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
         assigneeFilter: 'alice',
         taskCwd: '/work/task',
         conflictHandbackMax: 4,
+        replyForwardRetryMax: 5,
       },
       vkTerminals: { port: 20000 },
     });
@@ -137,6 +138,7 @@ test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
     assert.equal(process.env.QUEUE_BACKEND, 'local');
     assert.equal(process.env.VK_TERMINALS_PORT, undefined);
     assert.equal(process.env.CONFLICT_HANDBACK_MAX, '4');
+    assert.equal(process.env.REPLY_FORWARD_RETRY_MAX, '5');
     assert.equal(process.env.ASSIGNEE_FILTER, 'alice');
     assert.equal(process.env.TASK_CWD, undefined);
   } finally {
@@ -1954,6 +1956,22 @@ test('buildSettingsDescriptor: コンフリクト差し戻し上限を設定で�
   assert.match(field.help, /0 を指定すると自動依頼を行わず/);
   assert.match(field.help, /既定: 2/);
   assert.equal(field.help.split('\n').length, 3);
+});
+
+test('buildSettingsDescriptor: 返信転送の再試行上限を設定できる', () => {
+  const desc = buildSettingsDescriptor('/tmp/config.json');
+  const field = desc.groups
+    .flatMap((group) => group.fields ?? [])
+    .find((item) => item.key === 'orchestrator.replyForwardRetryMax');
+  assert.ok(field);
+  assert.equal(field.type, 'number');
+  assert.match(field.help, /作業ペイン/);
+  assert.match(field.help, /初回送信は回数に含みません/);
+  assert.match(field.help, /issue にお知らせを投稿/);
+  assert.match(field.help, /タスクは失敗にせず指示待ちのまま維持/);
+  assert.doesNotMatch(field.help, /waiting-input/);
+  assert.match(field.help, /0 を指定すると再送せず/);
+  assert.match(field.help, /既定: 2/);
 });
 
 test('buildSettingsDescriptor: github.repo は local モードで hide する visibleWhen を宣言する', () => {
