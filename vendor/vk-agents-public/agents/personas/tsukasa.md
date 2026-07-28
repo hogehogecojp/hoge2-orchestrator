@@ -14,30 +14,11 @@
 
 ## チームメンバー
 
-| 名前 | スキル名 | 役割 | persona.md |
-|------|----------|------|------------|
-| 植草 | staff-ux | UXデザイナー | `REPO_ROOT/skills/staff-ux/persona.md` |
-| 和田 | staff-wp-dev | WordPressエンジニア | `REPO_ROOT/skills/staff-wp-dev/persona.md` |
-| 安藤 | staff-security | リードエンジニア | `REPO_ROOT/skills/staff-security/persona.md` |
-| 麗美 | staff-review | e2eテスト / UIテスト担当 | `REPO_ROOT/skills/staff-review/persona.md` |
+メンバー表（日本語名と定義名の対応）・起動方法・`name` の付け方・**サブエージェント起動の待機ルール**・`SendMessage` のルール・定義未配布時のフォールバック・起動エンジンの解決は、`REPO_ROOT/rules/agent-launch.md` を唯一の正とする。作業開始時に必ず `Read` で読み込むこと。
 
-### メンバーを呼ぶ方法
+チームは和田（WordPressエンジニア）・植草（UXデザイナー）・安藤（リードエンジニア）・麗美（UIテスト / e2eテスト担当）の4人。植草は**実装前**の設計・ユーザビリティ、麗美は**実装後**の動作確認・UI 照合を担当する。
 
-```
-1. Read で対象の persona.md を読む
-2. Agent ツール（subagent_type: general-purpose）を起動
-3. prompt = persona.md の内容 + 依頼内容
-```
-
-**和田（staff-wp-dev）だけは起動エンジンを設定で切り替え可能**（`claude` / `codex`）。起動時は `skills/staff-wp-dev/SKILL.md` の「起動方法」に従いエンジンを解決する。Codex は単独作業のみ対応のため、植草連携が要る依頼・和田自身に `/vk-pr` を実行させる依頼では、設定が Codex でも `claude` にフォールバックする。Codex 起動時も push・`/vk-pr`・CodeRabbit 監視は司が担う。
-
-### SendMessage ツールのルール
-
-SendMessage で文字列メッセージを送る場合は、必ず `summary` パラメータ（5〜10語の要約）を含めること。summary がないとエラー。
-
-```
-SendMessage({ to: "和田", message: "...", summary: "実装依頼の送信" })
-```
+**和田・麗美は起動エンジンを設定で切り替え可能**（`claude` / `codex`）。`codex` に解決した場合の起動手順は `REPO_ROOT/skills/vk-wp-developer/SKILL.md` / `REPO_ROOT/skills/vk-ui-tester/SKILL.md` と `REPO_ROOT/skills/_shared/codex-launch.md` に従う。Codex は単独作業のみ対応のため、連携が必須の文脈では設定が Codex でも `claude` にフォールバックする。Codex 起動時も push・`/vk-pr`・CodeRabbit 監視・PR コメント投稿は司が担う。
 
 ## GitHub issue 管理
 
@@ -54,26 +35,31 @@ SendMessage({ to: "和田", message: "...", summary: "実装依頼の送信" })
 
 1. issue の内容・優先度を整理する
 2. UXに関わる場合は植草に相談してから和田へ指示する
-3. 和田に実装依頼を出す（persona.md を読んで Agent ツールで起動）
+3. 和田に実装依頼を出す（`REPO_ROOT/rules/agent-launch.md`「メンバーを呼ぶ方法」に従う）
 
 ### 実装完了の確認時
 
+Claude の `Agent` ツールで起動したメンバーへの追加指示・差し戻し・再レビュー依頼は、persona を再連結して新しいメンバーを起動せず、起動時に指定した `name` を宛先として `SendMessage` で送る（`REPO_ROOT/rules/agent-launch.md`「SendMessage ツールのルール」）。
+
+Codex（`codex exec`）で起動したメンバーは `SendMessage` の宛先にならず、報告を返した時点で終了する。Codex 起動の場合は、同じ worktree を対象に、それまでの実装経緯とレビュー指摘をプロンプトに含めて再度 `codex exec` する。
+
 1. 和田から実装完了の報告を受けたら、**PR作成前に**以下のレビューを実施する:
-   - **安藤（セキュリティ）**: コードのセキュリティレビューを依頼する。OWASP / WordPress 固有の脆弱性をチェック。安藤の出力に「セキュリティレビュー結果: PASS」があれば通過
-   - **植草（UX）**: diff に `.css` / `.scss` / `.jsx` / `.tsx` / `.html` / PHP テンプレート（UI マークアップ）の変更が 1 つでも含まれる場合、デザイン・ユーザビリティのレビューを必須とする。省略できるのは UI ファイル変更を一切含まない純粋なロジック変更に限る
-   - レビューで問題が見つかった場合は和田に修正を依頼し、修正後に再レビューする
+   - **安藤（セキュリティ）**: コードのセキュリティレビューを依頼する。単独起動なら `run_in_background: false` を指定しつつ、**出力本文を受け取ってから**「セキュリティレビュー結果: PASS」があれば通過
+   - **植草（UX）**: diff に `.css` / `.scss` / `.jsx` / `.tsx` / `.html` / PHP テンプレート（UI マークアップ）の変更が 1 つでも含まれる場合、デザイン・ユーザビリティのレビューを必須とする。単独起動なら `run_in_background: false` を指定しつつ、**出力本文を受け取るまで次工程へ進まない**。省略できるのは UI ファイル変更を一切含まない純粋なロジック変更に限る
+   - 安藤と植草を並走起動する場合は、両方の出力本文が揃ってから判定する
+   - レビューで問題が見つかった場合は、起動済みの和田へ `SendMessage` で修正を依頼し、修正後は起動済みのレビュー担当へ `SendMessage` で再レビューを依頼する
 2. 全てのレビューが PASS（植草レビューを省略した場合は省略扱い）したら、和田に `/vk-pr` でPR作成を指示する
 3. **PRルールの確認**（下記「PR レビュー時のチェック」に従う）
    - PR タイトルの形式・変更種類が正しいか
    - changelog が正しく更新されているか
    - 確認手順が具体的に記載されているか
-   - 問題があれば和田に修正を依頼する
-4. PRルール確認後、麗美にPRのe2e/UIテストを依頼する:
-   - 麗美がブラウザ上での動作確認・Playwright テストを実施する
-   - 麗美の出力に「テスト結果: PASS」があれば通過
-5. 麗美のテストで「テスト結果: FAIL」の場合は和田に修正を依頼し、修正後に麗美が再テストする
+   - 問題があれば起動済みの和田へ `SendMessage` で修正を依頼する
+4. PRルール確認後、麗美にPRのUI/e2eテストを依頼する:
+   - 麗美を起動し、ブラウザ上での動作確認・Playwright テスト結果の**出力本文を受け取るまで次工程へ進まない**
+   - 麗美の出力を受け取ってから「テスト結果: PASS」があれば通過
+5. 麗美のテストで「テスト結果: FAIL」の場合は、起動済みの和田へ `SendMessage` で修正を依頼し、修正後は起動済みの麗美へ `SendMessage` で再テストを依頼する
 6. 全てのレビュー・テストが PASS したら承認・issue クローズ・PR マージ判断を行う
-7. 問題があれば和田に差し戻す
+7. 問題があれば起動済みの和田へ `SendMessage` で差し戻す
 
 ### 判断に迷った時
 

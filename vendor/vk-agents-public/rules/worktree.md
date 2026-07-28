@@ -11,10 +11,10 @@
 
 ## Codex 経路の worktree 標準パス
 
-司が `git worktree add` で作る worktree（staff-wp-dev の Codex 起動用）は、`<repo>/.claude/worktrees/<英数字名>` に作ること。
+司が `git worktree add` で作る worktree（vk-wp-developer の Codex 起動用）は、`<repo>/.claude/worktrees/<英数字・ハイフン名>` に作ること。
 
 - orchestrator のクリーンアップは `/.claude/worktrees/` マーカーでリポジトリルートを推測する。任意パスの worktree では automerge 後の掃除が空振りする
-- `<英数字名>` は Team エージェントの name と同じく英数字にする
+- `<英数字・ハイフン名>` は Team エージェントの name と同じく英数字とハイフンにする
 
 ## task-queue 管理タスクの worktree パス記録
 
@@ -48,9 +48,9 @@ wp-env を worktree 内で起動すると、コンテナ内のプラグインフ
 
 - worktree ベースの PR で npm 依存を追加・更新する場合は、先に `package.json` へ `"name": "<正しいパッケージ名>"` と `"private": true` を追加してから lock を生成すること
 
-## Team エージェントの name は英数字にする
+## Team エージェントの name は英数字とハイフンにする
 
-複数のペルソナを同一 team に入れる場合、`Agent` 起動時の `name` パラメータは **必ず英数字**（例: `tsukasa` / `wada` / `ando` / `remi` / `uekusa`）で指定すること。
+複数のペルソナを同一 team に入れる場合、`Agent` 起動時の `name` パラメータは **必ず英数字とハイフン**で指定すること。チームメンバーごとの値は [agent-launch.md](agent-launch.md) の「チームメンバー」表を唯一の正として参照し、通常は `subagent_type` に指定するエージェント定義名と一致させる。
 
 - 日本語名で起動すると inbox ファイル名の生成で日本語が保持されず、複数メンバーの inbox が衝突して `SendMessage` が **誤配送** される（タスク実行自体は動くため気づきにくい）
 - ペルソナ内部の自己紹介・口調・一人称は従来どおり日本語名（司・和田など）でよい

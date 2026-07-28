@@ -39,6 +39,7 @@ usage() {
 
 展開先（自社ルール）:
   Claude Code    → {target}/.claude/skills/agent-skills/
+                 → {target}/.claude/agents/
   Cursor         → {target}/.cursor/rules/agent-skills/
   GitHub Copilot → {target}/.github/copilot-instructions.md（マーカーセクションを更新）
   Codex          → {target}/.codex/skills/agent-skills/
@@ -143,6 +144,254 @@ is_disabled_skill() {
         [[ "$s" == "$name" ]] && return 0
     done
     return 1
+}
+
+# Markdown 内の rules/・REPO_ROOT/・vendor/ 参照を配布形態に合わせて書き換える。
+# 各 mode の置換順序とアンカーは既存の配布挙動を維持するため変更しない。
+# REPO_ROOT/agents/personas/ は REPO_ROOT/ の一般規則より先に置換する。後にすると
+# ソースチェックアウトの絶対パスへ潰れ、配布済みコピー（rules/ 参照が絶対パスへ
+# 書き換わっている方）を指せなくなる。
+rewrite_md_paths() {
+    local mode="$1"
+    local src_file="$2"
+    local dst_file="$3"
+    local escaped_repo_root="$4"
+    local escaped_rules_dir="${5:-}"
+    local escaped_home_skills="${6:-}"
+    local escaped_home_personas
+    escaped_home_personas=$(printf '%s' "$HOME/.claude/vk-agents/personas" | sed 's/[\\#&]/\\&/g')
+
+    case "$mode" in
+        target)
+            sed -E -e 's#(^|[^A-Za-z0-9_/])rules/#\1.claude/skills/agent-skills/#g' \
+                -e 's#REPO_ROOT/agents/personas/#.claude/vk-agents/personas/#g' \
+                -e 's#REPO_ROOT/skills/#.claude/skills/#g' \
+                -e "s#REPO_ROOT/#${escaped_repo_root}/#g" \
+                -e "s#(^|[^A-Za-z0-9_/])vendor/#\1${escaped_repo_root}/vendor/#g" \
+                "$src_file" > "$dst_file"
+            ;;
+        global-skill)
+            sed -E -e "s#(^|[^A-Za-z0-9_/])rules/#\1${escaped_rules_dir}/#g" \
+                -e "s#REPO_ROOT/agents/personas/#${escaped_home_personas}/#g" \
+                -e "s#REPO_ROOT/#${escaped_repo_root}/#g" \
+                -e "s#(^|[^A-Za-z0-9_/])vendor/#\1${escaped_repo_root}/vendor/#g" \
+                "$src_file" > "$dst_file"
+            ;;
+        global-agent)
+            sed -E -e "s#(^|[^A-Za-z0-9_/])rules/#\1${escaped_rules_dir}/#g" \
+                -e "s#REPO_ROOT/agents/personas/#${escaped_home_personas}/#g" \
+                -e "s#REPO_ROOT/skills/#${escaped_home_skills}/#g" \
+                -e "s#REPO_ROOT/#${escaped_repo_root}/#g" \
+                -e "s#(^|[^A-Za-z0-9_/])vendor/#\1${escaped_repo_root}/vendor/#g" \
+                "$src_file" > "$dst_file"
+            ;;
+        *)
+            echo "エラー: 未対応の Markdown パス書き換え mode です: $mode" >&2
+            return 1
+            ;;
+    esac
+}
+
+# エージェント定義の frontmatter から所有スキル名（owner_skill）を取得する。
+# skills.disabled に指定されたスキルの定義を連動して配布対象外にするために使う。
+# frontmatter 以外の owner_skill: 行は拾わない。owner_skill が無い定義は無効化対象では
+# ないものとして扱う（＝常に配布する）。
+agent_owner_skill() {
+    local src_file="$1"
+    awk 'NR==1 { if ($0 != "---") exit; next }
+         /^---[[:space:]]*$/ { exit }
+         /^owner_skill:/ {
+             sub(/^owner_skill:[ \t]*/, "")
+             sub(/[ \t\r]+$/, "")
+             print
+             exit
+         }' "$src_file"
+}
+
+# 配布先の frontmatter から owner_skill 行を落とす。
+# owner_skill は vk-agents の配布処理用メタデータであり、Claude Code のエージェント定義
+# としては未知のキーになる。配布物に残さないことで Claude Code 側の解釈に依存しない。
+strip_owner_skill() {
+    local file="$1" tmp
+    tmp=$(mktemp)
+    awk 'BEGIN { fm = 0 }
+         NR == 1 && $0 == "---" { fm = 1; print; next }
+         fm == 1 && /^---[[:space:]]*$/ { fm = 0; print; next }
+         fm == 1 && /^owner_skill:/ { next }
+         { print }' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Claude Code のエージェント定義を配布する。
+# 旧マニフェストに載るファイルだけを vk-agents 管理対象とし、それ以外の既存ファイルは
+# 利用者所有として削除も上書きもしない。
+sync_agents() {
+    local agents_src="$SCRIPT_DIR/../agents"
+    local agents_dest="$1"
+    local mode="$2"
+    [[ -d "$agents_src" ]] || return 0
+
+    local escaped_rules_dir escaped_repo_root escaped_home_skills
+    escaped_rules_dir=$(printf '%s' "$RULES_DIR" | sed 's/[\\#&]/\\&/g')
+    escaped_repo_root=$(printf '%s' "$(cd "$SCRIPT_DIR/.." && pwd)" | sed 's/[\\#&]/\\&/g')
+    escaped_home_skills=$(printf '%s' "$HOME/.claude/skills" | sed 's/[\\#&]/\\&/g')
+
+    local manifest_file="$agents_dest/.agent-skills-manifest"
+    local old_agents=()
+    local current_agents=()
+    local old_agent
+    if [[ -f "$manifest_file" ]]; then
+        while IFS= read -r old_agent; do
+            [[ -z "$old_agent" ]] && continue
+            # マニフェストを手動編集されても agents/ 外を削除しないよう、ファイル名だけを受け付ける。
+            [[ "$old_agent" == */* ]] && continue
+            [[ "$old_agent" == "." || "$old_agent" == ".." ]] && continue
+            old_agents+=("$old_agent")
+        done < "$manifest_file"
+    fi
+
+    mkdir -p "$agents_dest"
+
+    local src_file agent_name owner_skill managed
+    for src_file in "$agents_src"/*.md; do
+        [[ -f "$src_file" ]] || continue
+        agent_name="$(basename "$src_file")"
+        owner_skill="$(agent_owner_skill "$src_file")"
+        if [[ -n "$owner_skill" ]] && is_disabled_skill "$owner_skill"; then
+            continue
+        fi
+
+        managed=false
+        for old_agent in ${old_agents[@]+"${old_agents[@]}"}; do
+            [[ "$old_agent" == "$agent_name" ]] && managed=true && break
+        done
+        if [[ -e "$agents_dest/$agent_name" ]] || [[ -L "$agents_dest/$agent_name" ]]; then
+            if [[ ! -f "$agents_dest/$agent_name" ]] || [[ -L "$agents_dest/$agent_name" ]]; then
+                echo "  ⚠ $agents_dest/$agent_name は通常ファイルではないため変更しませんでした" >&2
+                # 今回書き込めなくても、既存の管理対象なら所有権を手放さず次回の更新対象に残す。
+                [[ "$managed" == true ]] && current_agents+=("$agent_name")
+                continue
+            fi
+            if [[ "$managed" == false ]]; then
+                echo "  → $agents_dest/$agent_name は利用者ファイルのため変更しませんでした"
+                continue
+            fi
+        fi
+
+        if [[ "$mode" == "global-agent" ]]; then
+            rewrite_md_paths "$mode" "$src_file" "$agents_dest/$agent_name" \
+                "$escaped_repo_root" "$escaped_rules_dir" "$escaped_home_skills"
+            strip_owner_skill "$agents_dest/$agent_name"
+            echo "  → ~/.claude/agents/$agent_name をインストールしました"
+        else
+            rewrite_md_paths "$mode" "$src_file" "$agents_dest/$agent_name" "$escaped_repo_root"
+            strip_owner_skill "$agents_dest/$agent_name"
+            echo "  → .claude/agents/$agent_name をインストールしました"
+        fi
+        current_agents+=("$agent_name")
+    done
+
+    if [[ -f "$manifest_file" ]]; then
+        for old_agent in ${old_agents[@]+"${old_agents[@]}"}; do
+            local found=false
+            for agent_name in ${current_agents[@]+"${current_agents[@]}"}; do
+                [[ "$agent_name" == "$old_agent" ]] && found=true && break
+            done
+            if [[ "$found" == false ]] && [[ -f "$agents_dest/$old_agent" ]] && [[ ! -L "$agents_dest/$old_agent" ]]; then
+                rm -f "$agents_dest/$old_agent"
+                echo "  → $agents_dest/$old_agent を削除しました（廃止または無効化された定義）"
+            fi
+        done
+    fi
+
+    if [[ ${#current_agents[@]} -gt 0 ]]; then
+        printf '%s\n' "${current_agents[@]}" > "$manifest_file"
+    else
+        : > "$manifest_file"
+    fi
+    echo "  → $manifest_file を更新しました"
+}
+
+# 人格ファイル（agents/personas/*.md）を配布する。
+#
+# 配布先を ~/.claude/agents/personas/ にしないのは、Claude Code が ~/.claude/agents/ 配下を
+# エージェント定義として解釈するため。人格ファイルは frontmatter を持たないので、
+# エージェント定義の探索に混ぜない専用ディレクトリ（~/.claude/vk-agents/personas/）へ置く。
+# 配布先は agents/ と同じくフラットに保ち、旧マニフェストに載るファイルだけを管理対象とする。
+sync_personas() {
+    local personas_src="$SCRIPT_DIR/../agents/personas"
+    local personas_dest="$1"
+    local mode="$2"
+    [[ -d "$personas_src" ]] || return 0
+
+    local escaped_rules_dir escaped_repo_root
+    escaped_rules_dir=$(printf '%s' "$RULES_DIR" | sed 's/[\\#&]/\\&/g')
+    escaped_repo_root=$(printf '%s' "$(cd "$SCRIPT_DIR/.." && pwd)" | sed 's/[\\#&]/\\&/g')
+
+    local manifest_file="$personas_dest/.agent-skills-manifest"
+    local old_personas=()
+    local current_personas=()
+    local old_persona
+    if [[ -f "$manifest_file" ]]; then
+        while IFS= read -r old_persona; do
+            [[ -z "$old_persona" ]] && continue
+            # マニフェストを手動編集されても配布先の外を削除しないよう、ファイル名だけを受け付ける。
+            [[ "$old_persona" == */* ]] && continue
+            [[ "$old_persona" == "." || "$old_persona" == ".." ]] && continue
+            old_personas+=("$old_persona")
+        done < "$manifest_file"
+    fi
+
+    mkdir -p "$personas_dest"
+
+    local src_file persona_name managed
+    for src_file in "$personas_src"/*.md; do
+        [[ -f "$src_file" ]] || continue
+        persona_name="$(basename "$src_file")"
+
+        managed=false
+        for old_persona in ${old_personas[@]+"${old_personas[@]}"}; do
+            [[ "$old_persona" == "$persona_name" ]] && managed=true && break
+        done
+        if [[ -e "$personas_dest/$persona_name" ]] || [[ -L "$personas_dest/$persona_name" ]]; then
+            if [[ ! -f "$personas_dest/$persona_name" ]] || [[ -L "$personas_dest/$persona_name" ]]; then
+                echo "  ⚠ $personas_dest/$persona_name は通常ファイルではないため変更しませんでした" >&2
+                [[ "$managed" == true ]] && current_personas+=("$persona_name")
+                continue
+            fi
+            if [[ "$managed" == false ]]; then
+                echo "  → $personas_dest/$persona_name は利用者ファイルのため変更しませんでした"
+                continue
+            fi
+        fi
+
+        # 人格ファイル内の rules/ 参照を配布形態に合わせて絶対パス（--claude-global）または
+        # プロジェクト相対パス（--target）へ書き換える。
+        rewrite_md_paths "$mode" "$src_file" "$personas_dest/$persona_name" \
+            "$escaped_repo_root" "$escaped_rules_dir"
+        echo "  → $personas_dest/$persona_name をインストールしました"
+        current_personas+=("$persona_name")
+    done
+
+    if [[ -f "$manifest_file" ]]; then
+        for old_persona in ${old_personas[@]+"${old_personas[@]}"}; do
+            local found=false
+            for persona_name in ${current_personas[@]+"${current_personas[@]}"}; do
+                [[ "$persona_name" == "$old_persona" ]] && found=true && break
+            done
+            if [[ "$found" == false ]] && [[ -f "$personas_dest/$old_persona" ]] && [[ ! -L "$personas_dest/$old_persona" ]]; then
+                rm -f "$personas_dest/$old_persona"
+                echo "  → $personas_dest/$old_persona を削除しました（廃止された人格ファイル）"
+            fi
+        done
+    fi
+
+    if [[ ${#current_personas[@]} -gt 0 ]]; then
+        printf '%s\n' "${current_personas[@]}" > "$manifest_file"
+    else
+        : > "$manifest_file"
+    fi
+    echo "  → $manifest_file を更新しました"
 }
 
 # rules/ 以下のファイルをディレクトリ構造を維持してコピー
@@ -261,11 +510,7 @@ sync_to_project() {
                     # ように / や単語文字の直後にある同名部分を巻き込むと二重置換・誤置換になるため
                     # 境界でアンカーする。REPO_ROOT/rules/ 等は REPO_ROOT/ 置換でソースチェックアウトの
                     # 絶対パスとして解決する。
-                    sed -E -e 's#(^|[^A-Za-z0-9_/])rules/#\1.claude/skills/agent-skills/#g' \
-                        -e 's#REPO_ROOT/skills/#.claude/skills/#g' \
-                        -e "s#REPO_ROOT/#${escaped_repo_root}/#g" \
-                        -e "s#(^|[^A-Za-z0-9_/])vendor/#\1${escaped_repo_root}/vendor/#g" \
-                        "$src_file" > "$dest_dir/$rel_path"
+                    rewrite_md_paths "target" "$src_file" "$dest_dir/$rel_path" "$escaped_repo_root"
                 else
                     cp "$src_file" "$dest_dir/$rel_path"
                 fi
@@ -273,6 +518,11 @@ sync_to_project() {
             echo "  → .claude/skills/$skill_name/"
         done
     fi
+
+    # 人格ファイルとエージェント定義をプロジェクトに展開（Claude Code のみ）。
+    # エージェント定義は人格ファイルの配布先を指すため、人格ファイルを先に配布する。
+    sync_personas "$target/.claude/vk-agents/personas" "target"
+    sync_agents "$target/.claude/agents" "target"
 
     echo "  → .github/copilot-instructions.md"
     mkdir -p "$target/.github"
@@ -497,10 +747,8 @@ PYEOF
                     # 時だけ置換する。REPO_ROOT/rules/・$VK_AGENTS_DIR/rules/・**/rules/ や myvendor/ の
                     # ように / や単語文字の直後にある同名部分を巻き込むと二重置換・誤置換になるため
                     # 境界でアンカーする。REPO_ROOT/ は別途置換。
-                    sed -E -e "s#(^|[^A-Za-z0-9_/])rules/#\1${escaped_rules_dir}/#g" \
-                        -e "s#REPO_ROOT/#${escaped_repo_root}/#g" \
-                        -e "s#(^|[^A-Za-z0-9_/])vendor/#\1${escaped_repo_root}/vendor/#g" \
-                        "$src_file" > "$dest_dir/$rel_path"
+                    rewrite_md_paths "global-skill" "$src_file" "$dest_dir/$rel_path" \
+                        "$escaped_repo_root" "$escaped_rules_dir"
                     # #188 以降、repository-access.md を参照するスキルは自前で硬/軟ゲートを宣言する。
                     # 宣言なしスキルだけに org.allowed_owners 参照の汎用硬ゲートを挿入する。
                     if [[ "$(basename "$src_file")" == "SKILL.md" ]]; then
@@ -550,13 +798,26 @@ GUARD
 
         # vk-pr スキルに必要なパーミッションを ~/.claude/settings.json に追加
         local user_settings="$HOME/.claude/settings.json"
-        # settings.json が存在しない場合は最小構成で新規作成
-        if [[ ! -f "$user_settings" ]]; then
+        local update_user_settings=true
+        local user_settings_is_symlink=false
+        if [[ -L "$user_settings" ]]; then
+            if [[ ! -f "$user_settings" ]]; then
+                echo "  ⚠ $user_settings は通常ファイルではないため変更しませんでした" >&2
+                update_user_settings=false
+            else
+                user_settings_is_symlink=true
+            fi
+        elif [[ -e "$user_settings" ]] && [[ ! -f "$user_settings" ]]; then
+            echo "  ⚠ $user_settings は通常ファイルではないため変更しませんでした" >&2
+            update_user_settings=false
+        elif [[ ! -f "$user_settings" ]]; then
+            # settings.json が存在しない場合は最小構成で新規作成
             echo '{"permissions": {"allow": []}}' > "$user_settings"
         fi
-        local tmp
-        tmp=$(mktemp)
-        python3 - "$user_settings" "$tmp" <<'PYEOF'
+        if [[ "$update_user_settings" == true ]]; then
+            local tmp
+            tmp=$(mktemp)
+            if python3 - "$user_settings" "$tmp" <<'PYEOF'
 import sys, json
 src, dst = sys.argv[1], sys.argv[2]
 try:
@@ -589,9 +850,31 @@ with open(dst, "w") as f:
     json.dump(settings, f, indent=2, ensure_ascii=False)
     f.write("\n")
 PYEOF
-        mv "$tmp" "$user_settings"
-        echo "  → ~/.claude/settings.json に必要なスキル用パーミッションを追加しました"
+            then
+                if [[ "$user_settings_is_symlink" == true ]]; then
+                    if cat "$tmp" > "$user_settings"; then
+                        rm -f "$tmp"
+                        echo "  → ~/.claude/settings.json に必要なスキル用パーミッションを追加しました"
+                    else
+                        # リンク先へ書き込む形のため、書き込み途中で失敗するとリンク先が
+                        # 空または途中までの内容になりうる。「元の内容を保持」とは言えない。
+                        rm -f "$tmp"
+                        echo "  ⚠ $user_settings のリンク先を更新できませんでした。内容が壊れている可能性があるため中身を確認してください（上記のエラー内容も確認してください）" >&2
+                    fi
+                else
+                    mv "$tmp" "$user_settings"
+                    echo "  → ~/.claude/settings.json に必要なスキル用パーミッションを追加しました"
+                fi
+            else
+                rm -f "$tmp"
+                echo "  ⚠ $user_settings を更新できませんでした。元の内容を保持して続行します（上記のエラー内容を確認してください）" >&2
+            fi
+        fi
     fi
+
+    # エージェント定義は配布済みの人格ファイルを参照するため、人格ファイルを先に配布する。
+    sync_personas "$HOME/.claude/vk-agents/personas" "global-skill"
+    sync_agents "$HOME/.claude/agents" "global-agent"
 }
 
 # 実行

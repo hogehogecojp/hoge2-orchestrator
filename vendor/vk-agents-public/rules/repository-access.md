@@ -40,8 +40,8 @@ jq -r '.org.allowed_owners[]?' "${VK_AGENTS_CONFIG:-$HOME/.vk-agents/config.json
 |---|---|
 | `vk-bot-pr` | 硬 |
 | `vk-rtc-test` | 硬 |
-| `staff-review` | 硬 |
-| `staff-security` | 硬 |
+| `vk-ui-tester` | 硬 |
+| `vk-code-reviewer` | 硬 |
 | `vk-review-guide` | 硬 |
 | `vk-kore` | 軟 |
 | `vk-pr-review` | 軟 |

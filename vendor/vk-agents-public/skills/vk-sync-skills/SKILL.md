@@ -30,7 +30,7 @@ vk-agents のルールを指定プロジェクトに展開する。
 - 移行窓の間、`--claude-global` は配布済み旧スキルコピー互換のため、非推奨ミラー `~/.claude/vk-agents-settings.json` を書き続ける。次リリースで撤去予定（issue #235）。
 - 現在のキー:
   - `multi_repo_task.default_engine`（`claude` / `codex` = マルチリポジトリタスクの既定実行エンジン。ファイル不在・キー未設定時のフォールバックは `claude`）
-  - `staff_wp_dev.engine`（`claude` / `codex` = 和田（staff-wp-dev）の起動エンジン。ファイル不在・キー未設定時のフォールバックは `claude`。Codex は単独作業のみ対応。詳細は `skills/staff-wp-dev/SKILL.md`「起動方法」参照）
+  - `agents.engine.<定義名>` / `agents.default_engine`（`claude` / `codex` = メンバーごとの起動エンジンと既定。ファイル不在・キー未設定時のフォールバックは `claude`。Codex は単独作業のみ対応。詳細は `rules/agent-launch.md`「起動エンジンの解決」参照）
   - `features.coderabbit`（`true` / `false` = CodeRabbit 連携の有効/無効。ファイル不在・キー未設定時・JSON パース失敗時のフォールバックは `true`。詳細は `rules/coderabbit-monitoring.md`「前提条件」参照）
   - `features.coderabbit_ignore`（`true` / `false` = CodeRabbit 導入環境で PR 本文に `@coderabbitai ignore` を記載して監視をスキップするか。ファイル不在・キー未設定時・JSON パース失敗時のフォールバックは `false`。詳細は `rules/coderabbit-monitoring.md`「前提条件」参照）
   - 設定変更時は `~/.claude` を直接編集せず、正本 `~/.vk-agents/config.json` を編集する。

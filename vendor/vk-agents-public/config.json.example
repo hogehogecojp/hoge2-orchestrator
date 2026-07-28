@@ -2,11 +2,12 @@
   "multi_repo_task": {
     "default_engine": "codex"
   },
-  "staff_wp_dev": {
-    "engine": "claude"
-  },
-  "staff_review": {
-    "engine": "claude"
+  "agents": {
+    "default_engine": "claude",
+    "engine": {
+      "vk-wp-developer": "claude",
+      "vk-ui-tester": "claude"
+    }
   },
   "features": {
     "coderabbit": true,

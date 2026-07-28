@@ -55,11 +55,11 @@
 
 和田を呼ぶ方法:
 
-```
-1. Read で REPO_ROOT/skills/staff-wp-dev/persona.md を読む
-2. Agent ツール（subagent_type: general-purpose）を起動
-3. prompt = persona.md の内容 + 修正依頼内容
-```
+- 司が既に和田を起動している場合は、**新規起動しない**。`SendMessage` で起動済みの和田へ修正依頼内容を送る（宛先の `name` 値と `summary` 必須のルールは `REPO_ROOT/rules/agent-launch.md` を参照）
+- 和田が未起動の場合に限り新規起動する。起動方法・`name` の付け方・待機ルール・定義未配布時のフォールバックは `REPO_ROOT/rules/agent-launch.md` に従う（和田の定義名は `vk-wp-developer`）
+- prompt は修正依頼内容のみ（persona の Read・連結は定義ファイル側が行う）
+
+Codex（`codex exec`）で起動された和田は `SendMessage` の宛先にならないため、その場合は司に差し戻しを依頼する。
 
 ## GitHub コメント時のルール
 

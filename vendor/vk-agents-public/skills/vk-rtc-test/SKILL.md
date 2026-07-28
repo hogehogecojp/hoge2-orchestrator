@@ -135,16 +135,16 @@ npx playwright test "${TEST_DIR}/" --reporter=list
 
 ## 他スキルとの連携
 
-### staff-reviewから呼ぶ場合
+### vk-ui-testerから呼ぶ場合
 
-staff-review（麗美）がRTC関連PRをレビューする際は、このスキルのチェック項目を追加で実施できる:
+vk-ui-tester（麗美）がRTC関連PRをレビューする際は、このスキルのチェック項目を追加で実施できる:
 
 ```
 1. Readで REPO_ROOT/rules/testing/rtc.md を読む
 2. rtc.md のチェック項目1〜3を通常のe2eテストに追加する
 ```
 
-### staff-directorから呼ぶ場合
+### vk-directorから呼ぶ場合
 
 ディレクター（司）がRTC対応PRを検出した場合は、このスキルをAgentで起動できる:
 

@@ -38,7 +38,7 @@
 Codex（`codex exec`）で起動された場合は `SendMessage`（メンバー連携）と `Skill`（`/vk-pr` 等）が使えない。
 このとき植草連携・push・PR 作成（`/vk-pr`）・CodeRabbit 対応は**司が担う**ため、和田は行わない。
 和田の責務は **実装とローカルコミットまで** とし、結果を司に報告する。
-（エンジンの解決・起動方法は `skills/staff-wp-dev/SKILL.md` の「起動方法」を正とする。）
+（エンジンの解決は `rules/agent-launch.md`「起動エンジンの解決」、起動手順は `skills/vk-wp-developer/SKILL.md` を正とする。）
 
 ## 植草（UXデザイナー）との連携
 
@@ -52,11 +52,12 @@ Codex（`codex exec`）で起動された場合は `SendMessage`（メンバー�
 
 植草を呼ぶ方法:
 
-```
-1. Read で REPO_ROOT/skills/staff-ux/persona.md を読む
-2. Agent ツール（subagent_type: general-purpose）を起動
-3. prompt = persona.md の内容 + 相談内容
-```
+- 司が既に植草を起動している場合は、**新規起動しない**。`SendMessage` で起動済みの植草へ相談内容を送る（宛先の `name` 値と `summary` 必須のルールは `REPO_ROOT/rules/agent-launch.md` を参照）
+- 植草が未起動の場合に限り新規起動する。起動方法・`name` の付け方・待機ルール・定義未配布時のフォールバックは `REPO_ROOT/rules/agent-launch.md` に従う（植草の定義名は `vk-ux-designer`）
+- prompt は相談内容のみ（persona の Read・連結は定義ファイル側が行う）
+- 相談結果は待機ルールに従い、出力本文を受け取るまで判断・次工程へ進まない
+
+和田が Codex エンジンで起動されている場合は、上記「Codex エンジンで起動された場合」節に従い、植草への連携を司に依頼する。
 
 ## GitHub コメント時のルール
 
