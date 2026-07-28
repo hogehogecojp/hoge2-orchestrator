@@ -161,6 +161,16 @@ test('setTerminalTitle: pane タイトルを select-pane -T で設定、空な�
   assert.equal(calls.find(a => a.includes('select-pane')), undefined);
 });
 
+test('setTerminalTitle: 制御文字を除去して tmux に渡す', async () => {
+  const { run, calls } = fakeRunner();
+  const be = createTmuxBackend({ session: 'vk-orch', claudeCommand: 'claude', run });
+
+  await be.setTerminalTitle(0, '%3', 'issue\x00 #\x1b222\x7f');
+
+  const sp = calls.find(a => a.includes('select-pane'));
+  assert.deepEqual(sp, ['select-pane', '-t', '%3', '-T', 'issue #222']);
+});
+
 test('getStates: list-panes から消えた pane は panes から除去され、以後も正しく振る舞う', async () => {
   let listPanesOut = '%3\n';
   const run = (args) => {
