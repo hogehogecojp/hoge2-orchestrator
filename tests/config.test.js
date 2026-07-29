@@ -46,7 +46,11 @@ import {
   GPU_MODES,
   defaultGpuMode,
   getVkTerminalsGpuMode,
+  resolveVkTerminalsTimeoutScale,
   gpuLaunchOptions,
+  DEFAULT_VK_TERMINALS_TIMEOUT_SCALE,
+  MIN_VK_TERMINALS_TIMEOUT_SCALE,
+  MAX_VK_TERMINALS_TIMEOUT_SCALE,
   DEFAULT_LABELS,
   DEFAULT_QUEUE,
 } from '../src/config.js';
@@ -117,7 +121,7 @@ test('loadUnifiedConfig: JSON を読み込む', () => {
 });
 
 test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
-  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'QUEUE_BACKEND', 'VK_TERMINALS_PORT', 'CONFLICT_HANDBACK_MAX', 'REPLY_FORWARD_RETRY_MAX', 'ASSIGNEE_FILTER', 'TASK_CWD'];
+  const keys = ['GITHUB_OWNER', 'GITHUB_REPO', 'QUEUE_LABEL', 'QUEUE_BACKEND', 'VK_TERMINALS_PORT', 'VK_TERMINALS_TIMEOUT_SCALE', 'CONFLICT_HANDBACK_MAX', 'REPLY_FORWARD_RETRY_MAX', 'ASSIGNEE_FILTER', 'TASK_CWD'];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   try {
@@ -130,13 +134,14 @@ test('applyConfigToEnv: 未設定の env に config 値を反映する', () => {
         conflictHandbackMax: 4,
         replyForwardRetryMax: 5,
       },
-      vkTerminals: { port: 20000 },
+      vkTerminals: { port: 20000, timeoutScale: 2.5 },
     });
     assert.equal(process.env.GITHUB_OWNER, 'acme');
     assert.equal(process.env.GITHUB_REPO, 'q');
     assert.equal(process.env.QUEUE_LABEL, 'lbl');
     assert.equal(process.env.QUEUE_BACKEND, 'local');
     assert.equal(process.env.VK_TERMINALS_PORT, undefined);
+    assert.equal(process.env.VK_TERMINALS_TIMEOUT_SCALE, '2.5');
     assert.equal(process.env.CONFLICT_HANDBACK_MAX, '4');
     assert.equal(process.env.REPLY_FORWARD_RETRY_MAX, '5');
     assert.equal(process.env.ASSIGNEE_FILTER, 'alice');
@@ -159,6 +164,66 @@ test('applyConfigToEnv: 既存 env を上書きしない（env が優先）', ()
     if (saved === undefined) delete process.env.GITHUB_OWNER;
     else process.env.GITHUB_OWNER = saved;
   }
+});
+
+test('applyConfigToEnv: 既存の通信待ち時間倍率を config 値で上書きしない', () => {
+  withSavedEnv(['VK_TERMINALS_TIMEOUT_SCALE'], () => {
+    process.env.VK_TERMINALS_TIMEOUT_SCALE = '3';
+    applyConfigToEnv({ vkTerminals: { timeoutScale: 2 } });
+    assert.equal(process.env.VK_TERMINALS_TIMEOUT_SCALE, '3');
+  });
+});
+
+test('resolveVkTerminalsTimeoutScale: 未設定・不正値・上下限を正規化し、警告は種別ごとに一度だけ出す', () => {
+  withSavedEnv(['VK_TERMINALS_TIMEOUT_SCALE'], () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (message) => warnings.push(message);
+    try {
+      delete process.env.VK_TERMINALS_TIMEOUT_SCALE;
+      assert.equal(resolveVkTerminalsTimeoutScale(), DEFAULT_VK_TERMINALS_TIMEOUT_SCALE);
+
+      for (const value of ['abc', 'NaN', '0', '-1']) {
+        process.env.VK_TERMINALS_TIMEOUT_SCALE = value;
+        assert.equal(resolveVkTerminalsTimeoutScale(), DEFAULT_VK_TERMINALS_TIMEOUT_SCALE);
+      }
+
+      for (const value of ['0.05', '0.001']) {
+        process.env.VK_TERMINALS_TIMEOUT_SCALE = value;
+        assert.equal(resolveVkTerminalsTimeoutScale(), MIN_VK_TERMINALS_TIMEOUT_SCALE);
+      }
+
+      process.env.VK_TERMINALS_TIMEOUT_SCALE = '1.5';
+      assert.equal(resolveVkTerminalsTimeoutScale(), 1.5);
+
+      for (const value of ['61', '100']) {
+        process.env.VK_TERMINALS_TIMEOUT_SCALE = value;
+        assert.equal(resolveVkTerminalsTimeoutScale(), MAX_VK_TERMINALS_TIMEOUT_SCALE);
+      }
+
+      assert.equal(warnings.length, 3, '不正・下限・上限の各種別で一度ずつ警告する');
+      assert.ok(warnings.some((message) => message.includes('不正')));
+      assert.ok(warnings.some((message) => message.includes('下限')));
+      assert.ok(warnings.some((message) => message.includes('上限')));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('resolveVkTerminalsTimeoutScale: 空文字は警告せず既定値を返す', () => {
+  withSavedEnv(['VK_TERMINALS_TIMEOUT_SCALE'], () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (message) => warnings.push(message);
+    try {
+      process.env.VK_TERMINALS_TIMEOUT_SCALE = '';
+      assert.equal(resolveVkTerminalsTimeoutScale(), DEFAULT_VK_TERMINALS_TIMEOUT_SCALE);
+      assert.equal(warnings.length, 0);
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
 });
 
 test('applyConfigToEnv: null の assigneeFilter は反映しない', () => {
@@ -2369,6 +2434,7 @@ test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ',
   const tabsByLabel = Object.fromEntries(desc.groups.map((group) => [group.label, group.tab]));
   assert.equal(tabsByLabel.GitHub, 'orchestrator');
   assert.equal(tabsByLabel['オーケストレーター'], 'orchestrator');
+  assert.equal(tabsByLabel['VK Terminals との通信（Orchestrator 側設定）'], 'terminals');
   assert.equal(tabsByLabel['VK Terminals（本体設定）'], 'terminals');
   assert.equal(tabsByLabel['VK Terminals 起動オプション（オーケストレーター制御）'], undefined);
   // 独立していた「issue を処理する Claude のコマンド」グループは廃止（オーケストレーターへ統合）。
@@ -2378,6 +2444,36 @@ test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ',
   // Orchestrator タブ内は「オーケストレーター」→「GitHub」の順。
   const orchestratorLabels = desc.groups.filter((g) => g.tab === 'orchestrator').map((g) => g.label);
   assert.deepEqual(orchestratorLabels, ['オーケストレーター', 'GitHub']);
+});
+
+test('buildSettingsDescriptor: VK Terminals API の通信待ち時間倍率を orchestrator config に保存する', () => {
+  const desc = buildSettingsDescriptor('/tmp/config.json');
+  const group = desc.groups.find((g) => g.label === 'VK Terminals との通信（Orchestrator 側設定）');
+  assert.ok(group);
+  assert.equal(group.tab, 'terminals');
+  assert.equal(group.targetPath, undefined, 'トップレベルの orchestrator config を保存先に使う');
+
+  const field = group.fields.find((f) => f.key === 'vkTerminals.timeoutScale');
+  assert.ok(field);
+  assert.equal(field.type, 'number');
+  assert.equal(field.default, 1);
+  assert.equal(field.placeholder, '1');
+  assert.equal(field.label, '応答を待つ時間の倍率 (倍)');
+  assert.equal(field.min, undefined, 'VK Terminals 側が min 属性に未対応のため付与しない');
+  assert.equal(field.max, undefined, 'VK Terminals 側が max 属性に未対応のため付与しない');
+  assert.match(field.help, /まとめて何倍/);
+  assert.match(field.help, /3〜10 秒/);
+  assert.match(field.help, /Tailscale/);
+  assert.match(field.help, /状態表示が更新されない/);
+  assert.match(field.help, /入力待ちを検知できない/);
+  assert.match(field.help, /2〜3/);
+  assert.match(field.help, /0\.1〜60 倍/);
+  assert.match(field.help, /自動で 0\.1 \/ 60 に丸め/);
+  assert.match(field.help, /空欄のままなら 1 倍/);
+
+  const terminalLabels = desc.groups.filter((g) => g.tab === 'terminals').map((g) => g.label);
+  assert.equal(terminalLabels[0], 'VK Terminals（本体設定）');
+  assert.equal(terminalLabels.at(-1), 'VK Terminals との通信（Orchestrator 側設定）');
 });
 
 test('buildSettingsDescriptor: 保存後の反映タイミング案内をタブごとの note で持つ', () => {

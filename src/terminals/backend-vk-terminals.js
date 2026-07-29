@@ -2,6 +2,9 @@
 // 127.0.0.1:13847 の HTTP API 経由で駆動する。ここにある 8 プリミティブは
 // src/terminals/index.js から移設したもので、挙動は不変。
 //
+// 新規の呼び出しでは timeoutMs を明示しないこと（明示すると全体倍率が効かなくなる）。
+import { resolveVkTerminalsTimeoutScale } from '../config.js';
+
 // VK Terminals API の接続先ホスト。既定は localhost。
 // VK Terminals が Tailscale IP 等の特定インターフェースだけにバインドしている場合は
 // .env の VK_TERMINALS_HOST で接続先を上書きできる。
@@ -11,13 +14,35 @@
 const apiHost = () => process.env.VK_TERMINALS_HOST ?? '127.0.0.1';
 const BASE_URL = (port) => `http://${apiHost()}:${port}`;
 
+const BASE_TIMEOUT_MS = Object.freeze({
+  light: 3_000,
+  states: 5_000,
+  createPane: 10_000,
+});
+
+/**
+ * 明示された打ち切り時間はそのまま使い、省略時だけ全体倍率を基準値へ掛ける。
+ * setTerminalPrUrl が解決済みの値を getStates へ渡しても二重に倍率が掛からない。
+ * @param {number} timeoutMs 呼び出し側が明示した打ち切り時間
+ * @param {number} baseTimeoutMs 倍率 1 のときの基準値
+ * @returns {number}
+ */
+function resolveTimeoutMs(timeoutMs, baseTimeoutMs) {
+  if (timeoutMs !== undefined) return timeoutMs;
+  // 倍率で 1 回の待ちが伸びるほど readiness のポーリング回数は減る性質がある
+  // （backend-tmux.js の「病的に遅い環境で readiness ゲートを諦める」コメント参照）。
+  return Math.round(baseTimeoutMs * resolveVkTerminalsTimeoutScale());
+}
+
 // VK Terminals が起動しているか確認
 // timeoutMs: 応答しないホスト（Tailscale IP 未接続など）で fetch が無限にハングして
 // 呼び出し側（waitForHealth のポーリング等）が固まるのを防ぐための打ち切り時間。
-export async function fetchHealth(port, { timeoutMs = 3_000 } = {}) {
+// 3000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
+export async function fetchHealth(port, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   try {
     const res = await fetch(`${BASE_URL(port)}/api/health`, {
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(resolvedTimeoutMs),
     });
     const json = await res.json();
     if (!json || typeof json !== 'object') return null;
@@ -33,7 +58,7 @@ export async function fetchHealth(port, { timeoutMs = 3_000 } = {}) {
 
 // VK Terminals が起動しているか確認
 // 既存呼び出しとの互換性のため boolean 契約を維持する。
-export async function checkHealth(port, { timeoutMs = 3_000 } = {}) {
+export async function checkHealth(port, { timeoutMs } = {}) {
   const health = await fetchHealth(port, { timeoutMs });
   return health?.ok === true;
 }
@@ -47,15 +72,17 @@ export async function checkHealth(port, { timeoutMs = 3_000 } = {}) {
  *   レイテンシ SLA ではなく「無限ハングの回避」なので、短く締めすぎると高負荷時の
  *   遅延応答を打ち切って states 取得失敗が増え、かえって tick が空回りする。
  *   ポーリング間隔（約 2 秒）より長い 5 秒を取り、遅延応答は待ち切る側に倒す。
+ *   5000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *
  * @param {number} port VK Terminals API ポート
  * @param {object} [options]
- * @param {number} [options.timeoutMs=5000] fetch の打ち切り時間
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。省略時は基準値 5000ms に全体倍率を適用
  * @returns {Promise<object>} `{ terminals: {...} }` 形の states
  */
-export async function getStates(port, { timeoutMs = 5_000 } = {}) {
+export async function getStates(port, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.states);
   const res = await fetch(`${BASE_URL(port)}/api/states`, {
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   return res.json();
 }
@@ -70,6 +97,7 @@ export async function getStates(port, { timeoutMs = 5_000 } = {}) {
  *   短く締めると「VK Terminals 側では生成に成功したがこちらは abort した」状態になり、
  *   誰も掴んでいない孤児ペインが残る（こちらから閉じる API も無い）。他より長めの
  *   10 秒を取り、abort は本当にハングしているときだけに寄せる。
+ *   10000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *
  * @param {number} port VK Terminals API ポート
  * @param {string|null} [cwd] ペインを開くディレクトリ
@@ -78,10 +106,11 @@ export async function getStates(port, { timeoutMs = 5_000 } = {}) {
  *   （orchestrator 自体をペインで動かす用途など）
  * @param {boolean} [options.stashed] true ならサイドバーに格納した状態でペインを開く
  *   （VK Terminals が未対応の版では未知フィールドとして無視される）
- * @param {number} [options.timeoutMs=10000] fetch の打ち切り時間
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。省略時は基準値 10000ms に全体倍率を適用
  * @returns {Promise<string>} 作成したペインの termId
  */
-export async function createNewPane(port, cwd = null, { noClaude, stashed, timeoutMs = 10_000 } = {}) {
+export async function createNewPane(port, cwd = null, { noClaude, stashed, timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.createPane);
   const body = {};
   if (cwd) body.cwd = cwd;
   if (typeof noClaude === 'boolean') body.noClaude = noClaude;
@@ -90,7 +119,7 @@ export async function createNewPane(port, cwd = null, { noClaude, stashed, timeo
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   const json = await res.json();
   if (!json.ok) throw new Error(json.error ?? 'new-pane failed');
@@ -106,20 +135,22 @@ export async function createNewPane(port, cwd = null, { noClaude, stashed, timeo
  *   ハングするとディスパッチが止まる。abort 後の再送は submitToClaude 側が
  *   入力欄クリア → 本文再送（追記ではなく置換）で行うため、打ち切りによる
  *   二重入力にはならない。
+ *   3000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *
  * @param {number} port VK Terminals API ポート
  * @param {string|number} termId 送信先のターミナル ID
  * @param {string} input 送信するテキスト
  * @param {object} [options]
- * @param {number} [options.timeoutMs=3000] fetch の打ち切り時間
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。省略時は基準値 3000ms に全体倍率を適用
  * @returns {Promise<object>} VK Terminals のレスポンス JSON
  */
-export async function sendToTerminal(port, termId, input, { timeoutMs = 3_000 } = {}) {
+export async function sendToTerminal(port, termId, input, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   const res = await fetch(`${BASE_URL(port)}/api/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ termId, input }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   return res.json();
 }
@@ -130,6 +161,7 @@ export async function sendToTerminal(port, termId, input, { timeoutMs = 3_000 } 
  *
  * timeoutMs の既定を 3000ms にしている理由: 表示更新だけの軽い API なので
  * fetchHealth / postMenu と同じ 3 秒に揃える。
+ * 3000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *
  * @param {number} port VK Terminals API ポート
  * @param {string|number} termId 対象ターミナル ID
@@ -137,17 +169,18 @@ export async function sendToTerminal(port, termId, input, { timeoutMs = 3_000 } 
  * @param {string|null} [url] タスクに紐づくリンク先 URL。文字列なら body に含めて送信し、
  *   null/undefined なら body に含めない（VK Terminals 旧バージョンとの後方互換のため）。
  * @param {object} [options]
- * @param {number} [options.timeoutMs=3000] fetch の打ち切り時間
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。省略時は基準値 3000ms に全体倍率を適用
  * @returns {Promise<object>} VK Terminals のレスポンス JSON
  */
-export async function setTerminalTitle(port, termId, title, url = null, { timeoutMs = 3_000 } = {}) {
+export async function setTerminalTitle(port, termId, title, url = null, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   const payload = { termId, title };
   if (typeof url === 'string') payload.url = url;
   const res = await fetch(`${BASE_URL(port)}/api/set-title`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   const json = await res.json();
   if (!res.ok || !json.ok) {
@@ -179,15 +212,17 @@ export async function setTerminalTitle(port, termId, title, url = null, { timeou
  * @param {object} [options]
  * @param {boolean} [options.prMerged=false] PR ボタンをマージ済み表示（紫）へ切り替えるフラグ。
  *   既定 false。省略時は VK Terminals 側でも false 扱いになる。
- * @param {number} [options.timeoutMs=3000] HTTP リクエスト 1 本あたりの打ち切り時間。
+ * @param {number} [options.timeoutMs] HTTP リクエスト 1 本あたりの打ち切り時間。
  *   表示更新だけの軽い API なので fetchHealth / postMenu と同じ 3 秒に揃える。
+ *   3000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *   この関数は states 取得 → set-title の 2 本を直列に投げるため、**同じ timeoutMs を
  *   内部の getStates にも伝播させる**（getStates 自身の既定 5000ms は使わない）。
  *   こうすることで最悪の待ち時間が「2 × timeoutMs」で読み切れる形に固定され、
  *   打ち切り時間が意図せず積み上がらない。
  */
-export async function setTerminalPrUrl(port, termId, prUrl, { prMerged = false, timeoutMs = 3_000 } = {}) {
-  const { terminals } = await getStates(port, { timeoutMs });
+export async function setTerminalPrUrl(port, termId, prUrl, { prMerged = false, timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
+  const { terminals } = await getStates(port, { timeoutMs: resolvedTimeoutMs });
   // /api/states のレスポンス形が想定外（terminals 欠落・非オブジェクト）だと
   // Object.values(undefined) で TypeError になり原因が追いづらいため、
   // 明示的に検証して原因が分かるエラーメッセージを返す。
@@ -209,7 +244,7 @@ export async function setTerminalPrUrl(port, termId, prUrl, { prMerged = false, 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   let json;
   try {
@@ -234,16 +269,18 @@ export async function setTerminalPrUrl(port, termId, prUrl, { prMerged = false, 
  * @param {string|number} termId     対象ターミナル ID
  * @param {*} waiting                入力待ちマーカーを点灯するなら truthy、消灯するなら falsy
  * @param {object} [options]
- * @param {number} [options.timeoutMs=3000] fetch の打ち切り時間。マーカーのフラグ更新だけの
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。マーカーのフラグ更新だけの
  *   軽い API なので fetchHealth / postMenu と同じ 3 秒に揃える。
+ *   省略時は基準値 3000ms に VK_TERMINALS_TIMEOUT_SCALE の全体倍率を適用する。
  * @returns {Promise<object>} VK Terminals のレスポンス JSON
  */
-export async function setExternalWaiting(port, termId, waiting, { timeoutMs = 3_000 } = {}) {
+export async function setExternalWaiting(port, termId, waiting, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   const res = await fetch(`${BASE_URL(port)}/api/set-status`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ termId, waiting: !!waiting }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   let json;
   try {
@@ -269,18 +306,20 @@ export async function setExternalWaiting(port, termId, waiting, { timeoutMs = 3_
  * @param {string|number} termId 対象ターミナル ID
  * @param {object|null} lock     設定するロック。例: `{ close: false }` または `null`
  * @param {object} [options]
- * @param {number} [options.timeoutMs=3000] fetch の打ち切り時間。ロックのフラグ更新だけの
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。ロックのフラグ更新だけの
  *   軽い API なので fetchHealth / postMenu と同じ 3 秒に揃える。打ち切りが無いと
  *   「未応答」は例外にならないため `up` 側の try/catch による graceful degradation が
  *   機能せず、起動そのものが完了しなくなる（issue #218）。
+ *   省略時は基準値 3000ms に VK_TERMINALS_TIMEOUT_SCALE の全体倍率を適用する。
  * @returns {Promise<object>} VK Terminals のレスポンス JSON
  */
-export async function setPaneLock(port, termId, lock, { timeoutMs = 3_000 } = {}) {
+export async function setPaneLock(port, termId, lock, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   const res = await fetch(`${BASE_URL(port)}/api/set-lock`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ termId, lock }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   let json;
   try {
@@ -300,19 +339,21 @@ export async function setPaneLock(port, termId, lock, { timeoutMs = 3_000 } = {}
  * POST /api/menu は source 単位で丸ごと置換する冪等 API のため、起動時・接続確立時・
  * ポーリングごとに何度呼んでも安全。timeoutMs は未応答ホスト（Tailscale IP 未接続等）で
  * fetch が無限にハングするのを防ぐ打ち切り時間（checkHealth と同じ理由）。
+ * 3000ms は倍率 1 のときの基準値で、VK_TERMINALS_TIMEOUT_SCALE で全体を伸縮できる。
  *
  * @param {number} port VK Terminals API ポート
  * @param {object} section 投稿するメニューセクション payload
  * @param {object} [options]
- * @param {number} [options.timeoutMs=3000] fetch の打ち切り時間
+ * @param {number} [options.timeoutMs] fetch の打ち切り時間。省略時は基準値 3000ms に全体倍率を適用
  * @returns {Promise<object>} VK Terminals のレスポンス JSON
  */
-export async function postMenu(port, section, { timeoutMs = 3_000 } = {}) {
+export async function postMenu(port, section, { timeoutMs } = {}) {
+  const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs, BASE_TIMEOUT_MS.light);
   const res = await fetch(`${BASE_URL(port)}/api/menu`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(section),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(resolvedTimeoutMs),
   });
   let json;
   try {

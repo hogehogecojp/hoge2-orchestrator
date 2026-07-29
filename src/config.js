@@ -21,6 +21,13 @@ const REPO_ROOT = resolve(__dirname, '..');
 const require = createRequire(import.meta.url);
 export const DEFAULT_VENDORED_VK_AGENTS_DIR = join(REPO_ROOT, 'vendor', 'vk-agents-public');
 const DEFAULT_VK_TERMINALS_PORT = 13847;
+export const DEFAULT_VK_TERMINALS_TIMEOUT_SCALE = 1;
+// 最短の基準値 3000ms でも 300ms は確保でき、打ち切り時間が 0ms へ
+// 丸められて全 API が即 abort する事故を防ぐ。
+export const MIN_VK_TERMINALS_TIMEOUT_SCALE = 0.1;
+// 60 倍なら最長のペイン作成でも 10 分。設定ミスで通信待ちが事実上無制限に
+// なることを防ぎつつ、高レイテンシ環境向けの十分な調整幅を確保する。
+export const MAX_VK_TERMINALS_TIMEOUT_SCALE = 60;
 const VK_TERMINALS_CONFIG_TARGET_PATH = '~/.vk-terminals/config.json';
 const VK_TERMINALS_SETTINGS_NOTE = 'VK Terminals 本体の設定ファイル（~/.vk-terminals/config.json）に直接保存され、VK Terminals が読み込みます。';
 // VK Terminals 本体スキーマ由来の項目のうち、orchestrator の設定画面には
@@ -229,6 +236,9 @@ export function applyConfigToEnv(cfg = {}) {
   // host は現在 ~/.vk-terminals/config.json の apiHost が正本。
   // 旧 config.json(vkTerminals.host) を使っている環境だけ後方互換として env へ流す。
   set('VK_TERMINALS_HOST', vk.host);
+  // getStates は約 2 秒間隔で呼ばれるため、API 呼び出しごとに統合 config.json を
+  // 読み直さず、host と同じ config.json → env → 呼び出し時解決の流れに揃える。
+  set('VK_TERMINALS_TIMEOUT_SCALE', vk.timeoutScale);
 
   const queue = cfg.queue ?? {};
   set('QUEUE_BACKEND', queue.backend);
@@ -577,6 +587,62 @@ export function gpuLaunchOptions(mode) {
 export const TERMINALS_MODES = ['vk-terminals', 'tmux'];
 
 let warnedUnknownTerminalsMode = false;
+
+// 通信待ち時間倍率の警告種別ごとの通知済みフラグ。
+const warnedVkTerminalsTimeoutScale = {
+  invalid: false,
+  belowMin: false,
+  aboveMax: false,
+};
+
+function warnVkTerminalsTimeoutScaleOnce(kind, message) {
+  if (warnedVkTerminalsTimeoutScale[kind]) return;
+  warnedVkTerminalsTimeoutScale[kind] = true;
+  console.warn(message);
+}
+
+/**
+ * VK Terminals API の通信待ち時間に掛ける倍率を解決する。
+ * process.env は dotenv の読み込み後の値を反映できるよう、関数の呼び出し時に読む。
+ * 未設定は 1、不正値は警告して 1、範囲外は警告して上下限へクランプする。
+ * 0 と負数は倍率として成立せず設定ミスの可能性が高いため、下限へクランプせず不正値として扱う。
+ * @returns {number} MIN_VK_TERMINALS_TIMEOUT_SCALE 以上 MAX_VK_TERMINALS_TIMEOUT_SCALE 以下の有限数
+ */
+export function resolveVkTerminalsTimeoutScale() {
+  const rawValue = process.env.VK_TERMINALS_TIMEOUT_SCALE;
+  if (rawValue === undefined) return DEFAULT_VK_TERMINALS_TIMEOUT_SCALE;
+
+  const raw = String(rawValue).trim();
+  if (raw === '') return DEFAULT_VK_TERMINALS_TIMEOUT_SCALE;
+
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    if (parsed > MAX_VK_TERMINALS_TIMEOUT_SCALE) {
+      warnVkTerminalsTimeoutScaleOnce(
+        'aboveMax',
+        `[Config] VK_TERMINALS_TIMEOUT_SCALE "${raw}" は上限を超えるため ` +
+          `${MAX_VK_TERMINALS_TIMEOUT_SCALE} を使用します。`,
+      );
+      return MAX_VK_TERMINALS_TIMEOUT_SCALE;
+    }
+    if (parsed < MIN_VK_TERMINALS_TIMEOUT_SCALE) {
+      warnVkTerminalsTimeoutScaleOnce(
+        'belowMin',
+        `[Config] VK_TERMINALS_TIMEOUT_SCALE "${raw}" は下限を下回るため ` +
+          `${MIN_VK_TERMINALS_TIMEOUT_SCALE} を使用します。`,
+      );
+      return MIN_VK_TERMINALS_TIMEOUT_SCALE;
+    }
+    return parsed;
+  }
+
+  warnVkTerminalsTimeoutScaleOnce(
+    'invalid',
+    `[Config] 不正な VK_TERMINALS_TIMEOUT_SCALE "${raw}" は無視し、` +
+      `既定 "${DEFAULT_VK_TERMINALS_TIMEOUT_SCALE}" を使用します。`,
+  );
+  return DEFAULT_VK_TERMINALS_TIMEOUT_SCALE;
+}
 
 /**
  * 実行面モードを解決する。優先順位: env VK_TERMINALS_MODE > config(terminals.mode) > 既定。
@@ -1343,6 +1409,20 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
         ],
       },
       ...buildVkTerminalsSettingsGroups(options),
+      {
+        label: 'VK Terminals との通信（Orchestrator 側設定）',
+        tab: 'terminals',
+        fields: [
+          {
+            key: 'vkTerminals.timeoutScale',
+            label: '応答を待つ時間の倍率 (倍)',
+            type: 'number',
+            default: DEFAULT_VK_TERMINALS_TIMEOUT_SCALE,
+            placeholder: '1',
+            help: 'VK Terminals とのやり取り（状態の取得・ペインの作成・入力の送信など）で応答を待つ時間を、まとめて何倍にするか指定します。\n既定の 1 では 3〜10 秒待ちます。2 なら 6〜20 秒、3 なら 9〜30 秒に伸びます。\nTailscale 越しなど離れたネットワークから接続していて、ターミナルの状態表示が更新されない・入力待ちを検知できないときに 2〜3 へ上げてください。\n指定できるのは 0.1〜60 倍です。範囲外は自動で 0.1 / 60 に丸められます。空欄のままなら 1 倍として扱います。',
+          },
+        ],
+      },
       {
         label: 'GitHub',
         tab: 'orchestrator',

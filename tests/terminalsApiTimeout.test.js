@@ -22,8 +22,11 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  checkHealth,
   createNewPane,
+  fetchHealth,
   getStates,
+  postMenu,
   sendToTerminal,
   setExternalWaiting,
   setPaneLock,
@@ -36,6 +39,7 @@ const TERMID = 'term-1';
 
 let originalFetch;
 let originalTimeout;
+let originalTimeoutScale;
 /** @type {Array<{url:string, init:object|undefined}>} */
 let requests;
 /** @type {number[]} AbortSignal.timeout() に渡された ms の記録（呼ばれた順） */
@@ -61,6 +65,8 @@ function okResponse(url) {
 beforeEach(() => {
   originalFetch   = global.fetch;
   originalTimeout = AbortSignal.timeout;
+  originalTimeoutScale = process.env.VK_TERMINALS_TIMEOUT_SCALE;
+  delete process.env.VK_TERMINALS_TIMEOUT_SCALE;
   requests   = [];
   timeoutArgs = [];
 
@@ -80,11 +86,25 @@ beforeEach(() => {
 afterEach(() => {
   global.fetch = originalFetch;
   AbortSignal.timeout = originalTimeout;
+  if (originalTimeoutScale === undefined) delete process.env.VK_TERMINALS_TIMEOUT_SCALE;
+  else process.env.VK_TERMINALS_TIMEOUT_SCALE = originalTimeoutScale;
 });
 
 // 各 API の「関数 / 既定 timeout / 呼び出し方」表。
 // 既定値の根拠は backend-vk-terminals.js の JSDoc を参照。
 const CASES = [
+  {
+    name:        'fetchHealth',
+    endpoint:    '/api/health',
+    defaultMs:   3_000,
+    call:        (options) => fetchHealth(PORT, options),
+  },
+  {
+    name:        'checkHealth',
+    endpoint:    '/api/health',
+    defaultMs:   3_000,
+    call:        (options) => checkHealth(PORT, options),
+  },
   {
     name:        'getStates',
     endpoint:    '/api/states',
@@ -121,6 +141,12 @@ const CASES = [
     defaultMs:   3_000,
     call:        (options) => setPaneLock(PORT, TERMID, { close: false }, options),
   },
+  {
+    name:        'postMenu',
+    endpoint:    '/api/menu',
+    defaultMs:   3_000,
+    call:        (options) => postMenu(PORT, { source: 'test', title: 'Test', items: [] }, options),
+  },
 ];
 
 for (const { name, endpoint, defaultMs, call } of CASES) {
@@ -139,9 +165,17 @@ for (const { name, endpoint, defaultMs, call } of CASES) {
   });
 
   test(`${name}: timeoutMs オプションで打ち切り時間を上書きできる`, async () => {
+    process.env.VK_TERMINALS_TIMEOUT_SCALE = '2';
     await call({ timeoutMs: 1_234 });
 
     assert.deepEqual(timeoutArgs, [1_234]);
+  });
+
+  test(`${name}: 全体倍率 2 で既定の打ち切り時間だけを 2 倍にする`, async () => {
+    process.env.VK_TERMINALS_TIMEOUT_SCALE = '2';
+    await call(undefined);
+
+    assert.deepEqual(timeoutArgs, [defaultMs * 2]);
   });
 }
 
@@ -163,7 +197,15 @@ test('setTerminalPrUrl: timeoutMs の既定値は 3000ms で、内部の getStat
   assert.deepEqual(timeoutArgs, [3_000, 3_000]);
 });
 
+test('setTerminalPrUrl: 全体倍率は一度だけ掛け、解決済みの値を内部の getStates に伝播する', async () => {
+  process.env.VK_TERMINALS_TIMEOUT_SCALE = '2';
+  await setTerminalPrUrl(PORT, TERMID, 'https://example.test/pr/1');
+
+  assert.deepEqual(timeoutArgs, [6_000, 6_000]);
+});
+
 test('setTerminalPrUrl: timeoutMs を上書きすると内部の getStates にも同じ値が伝播する', async () => {
+  process.env.VK_TERMINALS_TIMEOUT_SCALE = '2';
   await setTerminalPrUrl(PORT, TERMID, 'https://example.test/pr/1', { timeoutMs: 1_234 });
 
   assert.deepEqual(timeoutArgs, [1_234, 1_234]);
@@ -174,6 +216,28 @@ test('setTerminalPrUrl: timeoutMs を渡しても prMerged の既定 false は�
 
   const title = requests.find(r => r.url.endsWith('/api/set-title'));
   assert.equal(JSON.parse(title.init.body).prMerged, false);
+});
+
+test('小数倍率を掛けた打ち切り時間はミリ秒の整数へ四捨五入する', async () => {
+  process.env.VK_TERMINALS_TIMEOUT_SCALE = '1.2345';
+  await getStates(PORT);
+
+  assert.deepEqual(timeoutArgs, [6_173]);
+});
+
+test('不正な倍率でも既定の打ち切り時間は変わらない', async () => {
+  process.env.VK_TERMINALS_TIMEOUT_SCALE = 'abc';
+  await getStates(PORT);
+
+  assert.deepEqual(timeoutArgs, [5_000]);
+});
+
+test('極小の正数を指定しても解決後の打ち切り時間は必ず 1ms 以上になる', async () => {
+  process.env.VK_TERMINALS_TIMEOUT_SCALE = '1e-9';
+  await fetchHealth(PORT);
+
+  assert.equal(timeoutArgs.length, 1);
+  assert.ok(timeoutArgs[0] >= 1);
 });
 
 // 上のテスト群は「何 ms で signal を組み立てたか」までを見る。ここでは実物の

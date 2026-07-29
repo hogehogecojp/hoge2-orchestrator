@@ -291,6 +291,7 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | `orchestrator.assigneeFilter` | `ASSIGNEE_FILTER` | 担当者フィルタ。空/未設定は一切取り込まず、全件対象は `all` を明示 | `null`（拾わない） |
 | `workspace.search_paths`（vk-agents config） | なし | 作業対象リポジトリのローカルクローン探索起点。タスク用ペインの起点決定にも使用 | 未設定時は `~/vk-orchestrator-tasks`（無ければ自動作成） |
 | なし | `TASK_CWD` | タスク用ペインの Claude Code 起点ディレクトリの緊急上書き | 未設定 |
+| `vkTerminals.timeoutScale` | `VK_TERMINALS_TIMEOUT_SCALE` | VK Terminals API の応答を待つ時間へ掛ける全体倍率（0.1〜60 倍、範囲外は上下限へ丸める）。Tailscale 越しなどで状態表示や入力待ち検知が更新されない場合は `2`〜`3` を指定。設定パネルの「VK Terminals との通信」から編集可。大きすぎる値では起動時の疎通待ち（最大 3 秒 × 倍率）も同じだけ延長 | `1` |
 | `~/.vk-terminals/config.json` の `port` / `apiHost` | `VK_TERMINALS_PORT` / `VK_TERMINALS_HOST` | VK Terminals API | `13847` / `127.0.0.1` |
 | `~/.vk-terminals/config.json` の `gpu` | `VK_TERMINALS_GPU` | GUI の GPU 起動モード（下記）。設定パネルの「VK Terminals（本体設定）」から編集可 | 空=自動 |
 | `~/.vk-terminals/config.json` の `initialCommand` / `additionalPanes` 等 | 設定パネルから保存 | VK Terminals のペイン構成等 | — |

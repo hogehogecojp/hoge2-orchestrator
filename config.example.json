@@ -19,6 +19,7 @@
   "vkTerminals": {
     "port": 13847,
     "host": "127.0.0.1",
+    "timeoutScale": 1,
     "gpu": "",
     "initialCommand": "",
     "agentroom": true,

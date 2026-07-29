@@ -790,58 +790,67 @@ export async function waitForTerminalEvent(port, termId, options = {}) {
   let lastOutputTime = Date.now();
   let lastLines      = '';
   let initialized    = false;
+  let polling        = false;
 
   return new Promise((resolve) => {
     const interval = setInterval(async () => {
-      let terminals;
+      // API の打ち切り時間はポーリング間隔より長くなりうるため、前回の状態取得が
+      // 未完了なら新しいリクエストを積まず、遅い回線での多重実行を防ぐ。
+      if (polling) return;
+      polling = true;
       try {
-        ({ terminals } = await getStates(port));
-      } catch {
-        // API一時エラーはスキップ
-        return;
-      }
+        let terminals;
+        try {
+          ({ terminals } = await getStates(port));
+        } catch {
+          // API一時エラーはスキップ
+          return;
+        }
 
-      const term = Object.values(terminals).find(t => t.termId === termId);
-      if (!term) {
-        clearInterval(interval);
-        resolve({ type: 'error', reason: 'terminal_not_found' });
-        return;
-      }
+        const term = Object.values(terminals).find(t => t.termId === termId);
+        if (!term) {
+          clearInterval(interval);
+          resolve({ type: 'error', reason: 'terminal_not_found' });
+          return;
+        }
 
-      // 初回: 現在の出力時刻を起点にする
-      if (!initialized) {
-        lastOutputTime = term.lastOutputTime ?? Date.now();
-        lastLines      = term.lastLines ?? '';
-        initialized    = true;
-      }
+        // 初回: 現在の出力時刻を起点にする
+        if (!initialized) {
+          lastOutputTime = term.lastOutputTime ?? Date.now();
+          lastLines      = term.lastLines ?? '';
+          initialized    = true;
+        }
 
-      // 出力の更新を追跡
-      if (term.lastOutputTime > lastOutputTime || term.lastLines !== lastLines) {
-        lastOutputTime = term.lastOutputTime;
-        lastLines      = term.lastLines;
-      }
+        // 出力の更新を追跡
+        if (term.lastOutputTime > lastOutputTime || term.lastLines !== lastLines) {
+          lastOutputTime = term.lastOutputTime;
+          lastLines      = term.lastLines;
+        }
 
-      // ① waiting フラグ検出（y/n確認・権限承認など）
-      if (term.waiting) {
-        clearInterval(interval);
-        resolve({ type: 'waiting', lastLines: term.lastLines });
-        return;
-      }
+        // ① waiting フラグ検出（y/n確認・権限承認など）
+        if (term.waiting) {
+          clearInterval(interval);
+          resolve({ type: 'waiting', lastLines: term.lastLines });
+          return;
+        }
 
-      const idle = Date.now() - lastOutputTime;
+        const idle = Date.now() - lastOutputTime;
 
-      // ② 長時間アイドル（vk-kore が仕様確認待ちで止まるケース）
-      if (extendedIdleMs !== null && idle >= extendedIdleMs) {
-        clearInterval(interval);
-        resolve({ type: 'extended-idle', lastLines: term.lastLines });
-        return;
-      }
+        // ② 長時間アイドル（vk-kore が仕様確認待ちで止まるケース）
+        if (extendedIdleMs !== null && idle >= extendedIdleMs) {
+          clearInterval(interval);
+          resolve({ type: 'extended-idle', lastLines: term.lastLines });
+          return;
+        }
 
-      // ③ 通常アイドル（タスク完了）
-      if (idle >= idleTimeoutMs) {
-        clearInterval(interval);
-        resolve({ type: 'idle', lastLines: term.lastLines });
-        return;
+        // ③ 通常アイドル（タスク完了）
+        if (idle >= idleTimeoutMs) {
+          clearInterval(interval);
+          resolve({ type: 'idle', lastLines: term.lastLines });
+          return;
+        }
+      } finally {
+        polling = false;
       }
     }, pollIntervalMs);
   });
