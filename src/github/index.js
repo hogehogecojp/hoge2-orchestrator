@@ -1070,10 +1070,13 @@ export class GitHubClient {
 
   // issue 本文に追記された PR URL を抽出する（appendPRUrlToIssue と対応）
   // 複数の PR URL が追記されている場合は最新（末尾）のものを返す
+  // owner / repo は GitHub が許す文字種に絞る。`[^\s]+` のように広く拾うと、issue 本文は
+  // 編集できるため「空白を含まない任意の文字列（日本語の指示文など）」を URL の途中へ
+  // 紛れ込ませられ、その文字列が抽出結果として下流（ペインへのマージ通知など）へ流れる。
   extractPRUrlFromIssueBody(body) {
     if (!body) return null;
     const matches = [
-      ...body.matchAll(/\*\*PR:\*\*\s*(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/g),
+      ...body.matchAll(/\*\*PR:\*\*\s*(https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+)/g),
     ];
     return matches.length > 0 ? matches[matches.length - 1][1] : null;
   }

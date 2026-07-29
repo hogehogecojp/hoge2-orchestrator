@@ -394,7 +394,20 @@ const notifyPaneMerged = createNotifyPaneMerged({
   getTask,
   setTerminalPrUrl,
   getStates,
+  // 作業ペインの会話へ「マージされた」旨を 1 通残す（#241）。入力欄の残留文字クリアと
+  // 再送を持つ submitToClaude を使う（sendToTerminal 直叩きは残留文字と連結するため不可）。
+  submitToClaude,
+  // 同じ PR について二重投稿しないための送信済みマーク（mergedNoticeSentPrUrl）の記録用。
+  updateTask,
   port: VK_PORT,
+  submitDelayMs: CLAUDE_SUBMIT_DELAY_MS,
+  // clearBeforeSend:false — マージ検知は waiting-input（＝Claude が y/n 確認や権限承認の
+  // ダイアログを出して止まっているペイン）にも到達する。生きたダイアログへ
+  // Ctrl-A(\x01) + Ctrl-K(\x0b) を撃つと Claude Code 側がどう解釈するか（意図しない確定＝
+  // 承認していないツール実行の許可）はこちらから検証できないため、初回クリアは撃たない。
+  // #189 が守りたいのは新規ディスパッチ時のアイドルペインであって、この経路は対象外
+  // （返信転送 src/engine/reply-forward.js と同じ理由・同じ方針）。
+  submitOptions: { maxRetries: CLAUDE_SUBMIT_MAX_RETRIES, clearBeforeSend: false },
   logger: {
     log: (...args) => console.log(...args),
     info: (...args) => console.log(...args),
@@ -1756,7 +1769,10 @@ async function tryAutoMerge(issue, prRef, prState, prUrl, source) {
     return;
   }
 
-  await notifyPaneMerged(issue.number, prUrl, tag);
+  // 自分でマージした直後の経路なので、ペインへは「オーケストレーターがマージしました。」と伝える。
+  // 他の呼び出し元（merge-watch / scan-in-progress / reconcile-orphaned）は既定の
+  // 「外部マージの可能性あり」文面のまま（マージ主体を断定できないため）。
+  await notifyPaneMerged(issue.number, prUrl, tag, { mergedByOrchestrator: true });
 
   // run-once モードでは次回 checkWaitingMergeIssues() が来ないため、その場で close + done まで進める。
   // 通常ループでも次回の merged 判定が冪等に走るので二重処理にはならないが、こちらで先に閉じることで

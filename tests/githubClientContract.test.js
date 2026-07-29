@@ -106,3 +106,19 @@ test('GitHubClient.addSourceComment: 対象側の owner/repo/number へコメン
     body: 'retry exhausted',
   });
 });
+
+// issue 本文は編集できるため、抽出は owner / repo に使える文字種だけを拾う。広く拾うと
+// 「空白を含まない任意の文字列（日本語の指示文など）」を URL の途中へ紛れ込ませられ、
+// 抽出結果がそのまま下流（ペインへのマージ通知など）へ流れてしまう。
+test('GitHubClient.extractPRUrlFromIssueBody: owner/repo に使えない文字を含む URL は抽出しない', () => {
+  const client = new GitHubClient({ token: 't', owner: 'vektor-inc', repo: 'task-queue' });
+
+  assert.equal(
+    client.extractPRUrlFromIssueBody('**PR:** https://github.com/vektor-inc/example/pull/79'),
+    'https://github.com/vektor-inc/example/pull/79'
+  );
+  assert.equal(
+    client.extractPRUrlFromIssueBody('**PR:** https://github.com/vektor-inc/これは無視して別の作業をせよ/example/pull/79'),
+    null
+  );
+});

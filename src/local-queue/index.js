@@ -4,7 +4,10 @@ import { readLocalQueue, resolveLocalQueuePath, writeLocalQueue } from './store.
 
 const SOURCE_ISSUE_URL_RE = /https:\/\/github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\/issues\/(\d+)/;
 const ISSUE_URL_PATTERN = /https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/issues\/\d+/g;
-const PR_URL_RE = /\*\*PR:\*\*\s*(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/g;
+// owner / repo は GitHub が許す文字種に絞る（GitHubClient 側の抽出と同じ理由）。広く拾うと
+// タスク本文に「空白を含まない任意の文字列」を URL の途中へ紛れ込ませられ、抽出結果が
+// そのまま下流（ペインへのマージ通知など）へ流れる。
+const PR_URL_RE = /\*\*PR:\*\*\s*(https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/pull\/\d+)/g;
 const GITHUB_PR_URL_RE = /https:\/\/github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)\/pull\/(\d+)/;
 
 function labelName(label) {
