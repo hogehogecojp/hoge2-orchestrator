@@ -58,6 +58,8 @@ npm run release:preflight
 
 **設定キーの追随を確認する**：本体（`src/config.js`）が vk-agents の設定キーを変更している場合、同梱 `vendor/vk-agents-public` のスキルが**新しいキーを読む版に更新されているか**を確認する。追随前の同梱物をリリースすると、同梱スキル利用環境では設定パネルの値が読まれず無言で効かなくなる（例: エンジン設定キー `agents.engine.<定義名>` / `agents.default_engine`）。未追随なら vk-agents 側のリリースを待ち、Phase 1 を再実行する。
 
+**vendor 更新に連動する README の条件付き記述を確認する**：`grep -n "vendor 更新時に削除" README.md` で、同梱 `vendor/vk-agents-public` の更新を前提に置かれた注記を洗い出す。今回の更新でその条件が解消していれば、注記とマーカー（HTML コメント）の両方を削除する。残したままリリースすると、README が実際には発生する動作を「発生しません」と否定する状態になる。逆に、vendor の更新を前提とする条件付き記述を新たに README へ書くときは、**同じマーカー（`<!-- vendor 更新時に削除: … -->`）を対象記述の直前に置く**。この grep に引っかからない書き方をすると、次のリリースで検知できない。
+
 exit 1 のときにスクリプトが報告した版数（例: `vk-terminals ピン → 1.43.0`、`vk-agents 同梱 → v0.13.0`）と、**更新前の版数**を控える。更新前の vk-terminals ピンは次で取れる：
 ```
 git show HEAD:package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).optionalDependencies['vk-terminals'].match(/#(.+)$/)[1]))"

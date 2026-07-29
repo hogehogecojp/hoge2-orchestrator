@@ -147,9 +147,6 @@ npm run up                           # 設定を反映して VK Terminals(GUI) �
 | `~/.claude/vk-agents-settings.json` | 生成・変更・削除 | `~/.vk-agents/config.json` と同じ内容を vk-agents 用の派生設定として書き出します。`sync.sh --claude-global` 単体では、vk-agents 側 `config.json` が無い場合に既存ファイルを削除します。 |
 | `~/.claude/commands/<skill名>.md` | 削除 | 旧コマンドファイルが残っている場合、同名スキルへ移行済みとして削除します。`~/.claude/commands/` が無い場合は何もしません。 |
 
-<!-- vendor 更新時に削除: 同梱 vendor/vk-agents-public が agents/ の配布に対応したら、直後の注記を外すこと（issue #230） -->
-> エージェント定義（`~/.claude/agents/<定義名>.md` とその管理台帳）と人格ファイル（`~/.claude/vk-agents/personas/<人格ファイル名>.md` とその管理台帳）の4行は、同梱 `vendor/vk-agents-public/` がこれらの配布に対応したバージョンに更新されて以降に有効になります。現時点の同梱版では、これらのパスへの書き込みは発生しません。
-
 `rules/` は `--claude-global` では `~/.claude/rules/` などへコピーされません。`~/.claude/CLAUDE.md` と展開済みスキル内の参照は、同梱 `vendor/vk-agents-public/rules/` の絶対パスを指す形に更新されます。
 
 エージェント定義と人格ファイルは、配布先ディレクトリ自体を削除せず、各ディレクトリの管理台帳（`.agent-skills-manifest`）に載っているファイルだけを上書き・削除の対象にします。そのため、利用者が自前で置いたエージェント定義や人格ファイルはそのまま保持されます。逆に、管理台帳に載っている配布済みのファイルを直接編集した場合、その変更は次回の `npm run setup:agents` で上書きされます。独自に手を入れたいときは、別のファイル名で置いてください。
