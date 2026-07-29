@@ -43,6 +43,7 @@ import {
   getProtocolConfig,
   getLabelsConfig,
   buildSettingsDescriptor,
+  buildVkTerminalsContentTabs,
   GPU_MODES,
   defaultGpuMode,
   getVkTerminalsGpuMode,
@@ -2425,25 +2426,30 @@ test('buildSettingsDescriptor: sourceOrg は空欄保存時に未指定として
 });
 
 test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ', () => {
-  const desc = buildSettingsDescriptor('/tmp/config.json');
-  assert.deepEqual(desc.tabs, [
-    { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
-    { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
-    { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
-  ]);
-  const tabsByLabel = Object.fromEntries(desc.groups.map((group) => [group.label, group.tab]));
-  assert.equal(tabsByLabel.GitHub, 'orchestrator');
-  assert.equal(tabsByLabel['オーケストレーター'], 'orchestrator');
-  assert.equal(tabsByLabel['VK Terminals との通信（Orchestrator 側設定）'], 'terminals');
-  assert.equal(tabsByLabel['VK Terminals（本体設定）'], 'terminals');
-  assert.equal(tabsByLabel['VK Terminals 起動オプション（オーケストレーター制御）'], undefined);
-  // 独立していた「issue を処理する Claude のコマンド」グループは廃止（オーケストレーターへ統合）。
-  assert.equal(tabsByLabel['issue を処理する Claude のコマンド'], undefined);
-  assert.equal(tabsByLabel['vk-agents（エージェント共通設定）'], 'agents');
+  // 自前タブだけを厳密に検証したいので、スキーマは固定のフィクスチャ（content 専用タブ無し）を
+  // 明示的に渡す。vkTerminalsDir を省略すると実インストール先の settings-schema.json を読み、
+  // そこに説明専用タブがあると tabs が増えて deepEqual が環境依存で壊れる。
+  withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    assert.deepEqual(desc.tabs, [
+      { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+      { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
+      { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
+    ]);
+    const tabsByLabel = Object.fromEntries(desc.groups.map((group) => [group.label, group.tab]));
+    assert.equal(tabsByLabel.GitHub, 'orchestrator');
+    assert.equal(tabsByLabel['オーケストレーター'], 'orchestrator');
+    assert.equal(tabsByLabel['VK Terminals との通信（Orchestrator 側設定）'], 'terminals');
+    assert.equal(tabsByLabel['VK Terminals（本体設定）'], 'terminals');
+    assert.equal(tabsByLabel['VK Terminals 起動オプション（オーケストレーター制御）'], undefined);
+    // 独立していた「issue を処理する Claude のコマンド」グループは廃止（オーケストレーターへ統合）。
+    assert.equal(tabsByLabel['issue を処理する Claude のコマンド'], undefined);
+    assert.equal(tabsByLabel['vk-agents（エージェント共通設定）'], 'agents');
 
-  // Orchestrator タブ内は「オーケストレーター」→「GitHub」の順。
-  const orchestratorLabels = desc.groups.filter((g) => g.tab === 'orchestrator').map((g) => g.label);
-  assert.deepEqual(orchestratorLabels, ['オーケストレーター', 'GitHub']);
+    // Orchestrator タブ内は「オーケストレーター」→「GitHub」の順。
+    const orchestratorLabels = desc.groups.filter((g) => g.tab === 'orchestrator').map((g) => g.label);
+    assert.deepEqual(orchestratorLabels, ['オーケストレーター', 'GitHub']);
+  });
 });
 
 test('buildSettingsDescriptor: VK Terminals API の通信待ち時間倍率を orchestrator config に保存する', () => {
@@ -2806,6 +2812,195 @@ test('buildSettingsDescriptor: settings-schema.json が不正 JSON または構�
       }
     });
   }
+});
+
+// -------------------------------------------------------
+// #238: VK Terminals の「外出先から確認」のような説明専用タブ（入力欄を持たず content だけを
+// 持つタブ）は、Orchestrator 起動時（env VK_TERMINALS_SETTINGS 経由）でも表示する。
+// -------------------------------------------------------
+
+// 説明専用タブ（content 専用）を持つスキーマのフィクスチャ。
+// groups は既定フィクスチャと同じ（tab: 'general' に属する入力欄）。
+function vkTerminalsSchemaWithContentTabFixture(tabs) {
+  return {
+    ...vkTerminalsSchemaFixture([{
+      label: '基本',
+      tab: 'general',
+      fields: [
+        { key: 'apiHost', label: 'API ホスト', type: 'text' },
+        { key: 'initialCommand', label: '初期コマンド', type: 'text' },
+      ],
+    }]),
+    tabs,
+  };
+}
+
+test('buildSettingsDescriptor: VK Terminals の content 専用タブを自前 3 タブの後ろへ引き継ぐ', () => {
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'general', label: '設定' },
+    {
+      id: 'mobile',
+      label: '外出先から確認',
+      note: 'スマートフォンから確認できます。',
+      content: [
+        { type: 'heading', text: 'スマートフォンから確認できます' },
+        { type: 'paragraph', text: 'Tailscale を使うと外出先から開けます。' },
+        { type: 'code', text: 'tailscale ip -4' },
+      ],
+    },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile']);
+
+    const mobile = desc.tabs.at(-1);
+    assert.equal(mobile.label, '外出先から確認');
+    assert.equal(mobile.note, 'スマートフォンから確認できます。');
+    assert.deepEqual(mobile.content, [
+      { type: 'heading', text: 'スマートフォンから確認できます' },
+      { type: 'paragraph', text: 'Tailscale を使うと外出先から開けます。' },
+      { type: 'code', text: 'tailscale ip -4' },
+    ]);
+
+    // 入力欄を持つタブ（general）は引き継がない。入力欄は terminals タブへまとめるため、
+    // 引き継ぐと中身の無い空タブが増えるだけになる。
+    assert.equal(desc.tabs.some((tab) => tab.id === 'general'), false);
+  });
+});
+
+test('buildSettingsDescriptor: 引き継いだタブの tabLink はスキーマ側のタブ ID を terminals へ読み替える', () => {
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'general', label: '設定' },
+    {
+      id: 'mobile',
+      label: '外出先から確認',
+      content: [
+        { type: 'heading', text: '外出先から開く' },
+        { type: 'tabLink', label: 'API ホストの設定へ移動', tab: 'general', field: 'apiHost' },
+        // 引き継いだタブ自身への参照は読み替えない（Orchestrator でも同じ ID で存在する）。
+        { type: 'tabLink', label: 'このタブの先頭へ', tab: 'mobile' },
+      ],
+    },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const mobile = desc.tabs.find((tab) => tab.id === 'mobile');
+    assert.deepEqual(mobile.content.filter((block) => block.type === 'tabLink'), [
+      { type: 'tabLink', label: 'API ホストの設定へ移動', tab: 'terminals', field: 'apiHost' },
+      { type: 'tabLink', label: 'このタブの先頭へ', tab: 'mobile' },
+    ]);
+    // 読み替え先の terminals タブに、リンクが指す入力欄（apiHost）が実在すること。
+    // 実在しないと VK Terminals 側が field 指定だけを落とすため、リンクの意味が失われる。
+    const terminalsFieldKeys = desc.groups
+      .filter((group) => group.tab === 'terminals')
+      .flatMap((group) => (group.fields ?? []).map((field) => field.key));
+    assert.ok(terminalsFieldKeys.includes('apiHost'));
+  });
+});
+
+test('buildVkTerminalsContentTabs: 読み替えは元スキーマのオブジェクトを書き換えない', () => {
+  // descriptor 経由だと呼び出しごとにスキーマを読み直すため、in-place 変更をしていても
+  // 検出できない（ディスク上のファイルは元のまま）。渡したオブジェクトを直接見て検証する。
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'general', label: '設定' },
+    {
+      id: 'mobile',
+      label: '外出先から確認',
+      content: [
+        { type: 'paragraph', text: '外出先から開く' },
+        { type: 'tabLink', label: 'API ホストの設定へ移動', tab: 'general', field: 'apiHost' },
+      ],
+    },
+  ]);
+  const snapshot = structuredClone(schema);
+
+  const tabs = buildVkTerminalsContentTabs(schema, ['orchestrator', 'terminals', 'agents']);
+  assert.equal(tabs[0].content[1].tab, 'terminals', '読み替え自体は効いていること');
+
+  // 渡したオブジェクトが（配列・ブロックの中身まで）一切変わっていないこと。
+  assert.deepEqual(schema, snapshot);
+  // 読み替えたブロックは元と別オブジェクト（＝コピーを返している）であること。
+  assert.notStrictEqual(tabs[0].content[1], schema.tabs[1].content[1]);
+});
+
+test('buildSettingsDescriptor: tabs[] に無いタブ ID でも group.tab 由来なら terminals へ読み替える', () => {
+  // vk-terminals 側が tabs[] の宣言を省いて group.tab だけで運用するケース。
+  // 読み替えの対応表は group.tab からも集めるため、リンクは terminals へ着地する。
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    {
+      id: 'mobile',
+      label: '外出先から確認',
+      content: [{ type: 'tabLink', label: 'API ホストの設定へ移動', tab: 'general', field: 'apiHost' }],
+    },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    const mobile = desc.tabs.find((tab) => tab.id === 'mobile');
+    assert.equal(mobile.content[0].tab, 'terminals');
+  });
+});
+
+test('buildSettingsDescriptor: 自前タブと ID が衝突する content 専用タブは引き継がない', () => {
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'terminals', label: '衝突するタブ', content: [{ type: 'paragraph', text: '衝突' }] },
+    { id: 'mobile', label: '外出先から確認', content: [{ type: 'paragraph', text: '引き継ぐ' }] },
+    { id: 'mobile', label: '重複した外出先から確認', content: [{ type: 'paragraph', text: '後勝ちにしない' }] },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    try {
+      console.warn = (message) => warnings.push(message);
+      const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile']);
+      assert.equal(desc.tabs.find((tab) => tab.id === 'terminals').label, 'Terminals');
+      assert.deepEqual(desc.tabs.at(-1).content, [{ type: 'paragraph', text: '引き継ぐ' }]);
+      // 黙って捨てると原因を追えないため、捨てたタブごとに警告を出す
+      // （自前タブとの衝突 1 件＋スキーマ内での ID 重複 1 件）。
+      const skipped = warnings.filter((message) => /重複するため引き継ぎません/.test(message));
+      assert.equal(skipped.length, 2);
+      assert.ok(skipped.some((message) => message.includes('「terminals」')));
+      assert.ok(skipped.some((message) => message.includes('「mobile」')));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('buildSettingsDescriptor: id / label が空、content が空のタブは引き継がない', () => {
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'general', label: '設定' },
+    { id: '  ', label: '空 ID', content: [{ type: 'paragraph', text: '落とす' }] },
+    { id: 'noLabel', content: [{ type: 'paragraph', text: '落とす' }] },
+    { id: 'emptyContent', label: '空 content', content: [] },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+  });
+});
+
+test('buildSettingsDescriptor: tabs を持たないスキーマでは自前 3 タブのままにする', () => {
+  withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+  });
+});
+
+test('buildSettingsDescriptor: スキーマを読めない場合は自前 3 タブのまま、読み込み警告も 1 回だけ', () => {
+  withTmpDir('vko-vk-terminals-no-schema-', (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    try {
+      console.warn = (message) => warnings.push(message);
+      const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
+      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+      // スキーマ読み込みは 1 回だけ（groups とタブ引き継ぎで読み直すと警告が二重に出る）。
+      assert.equal(warnings.filter((message) => /settings-schema\.json を読み込めませんでした/.test(message)).length, 1);
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
 });
 
 test('buildSettingsDescriptor: vk-agents group は正本リゾルバ（env 上書き）を targetPath に持つ', () => {

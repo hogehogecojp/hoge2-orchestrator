@@ -1330,8 +1330,17 @@ function resolveVkTerminalsSettingsSchemaForDescriptor(options) {
   return loadVkTerminalsSettingsSchema(vkTerminalsDir);
 }
 
-function buildVkTerminalsSettingsGroups(options = {}) {
-  const schema = resolveVkTerminalsSettingsSchemaForDescriptor(options);
+/**
+ * VK Terminals のスキーマ由来 group を、Orchestrator の設定ディスクリプタ用 group へ変換する。
+ *
+ * schema は呼び出し側（buildSettingsDescriptor）が 1 度だけ読み込んだものを受け取る。
+ * ここで読み直すと、スキーマを読めなかったときの警告が group 構築とタブ引き継ぎで
+ * 二重に出てしまうため。
+ * @param {object|null} schema resolveVkTerminalsSettingsSchemaForDescriptor() の戻り値
+ * @param {{ hiddenKeys?: string[] }} [options]
+ * @returns {object[]}
+ */
+function buildVkTerminalsSettingsGroups(schema, options = {}) {
   if (!schema) {
     console.warn('[Config] settings-schema.json が見つからない／読めないため、VK Terminals 本体設定は orchestrator 独自項目（port）のみ表示します。');
     return [vkTerminalsPortOnlySettingsGroup()];
@@ -1369,6 +1378,124 @@ function buildVkTerminalsSettingsGroups(options = {}) {
 }
 
 /**
+ * VK Terminals のスキーマから「入力欄側で使われているタブ ID」を集める。
+ *
+ * buildVkTerminalsSettingsGroups() はスキーマ由来の group をすべて `tab: 'terminals'` に
+ * 載せ替えるため、スキーマ側で入力欄が属していたタブ ID は Orchestrator では
+ * `terminals` タブに相当する。tabLink の移動先を読み替えるための対応表として使う。
+ *
+ * `general` 決め打ちにしないのは、vk-terminals 側がタブ構成を変えたときに黙って
+ * 読み替えが効かなくなる（＝リンクが renderer に落とされて消える）のを避けるため。
+ * @param {object} schema vk-terminals の settings-schema.json
+ * @param {Set<string>} carriedTabIds 説明専用タブとして引き継いだタブ ID
+ * @returns {Set<string>}
+ */
+function collectVkTerminalsFieldTabIds(schema, carriedTabIds) {
+  const ids = new Set();
+  for (const group of schema.groups) {
+    if (isNonEmptyString(group.tab)) ids.add(group.tab);
+  }
+  for (const tab of Array.isArray(schema.tabs) ? schema.tabs : []) {
+    if (!tab || typeof tab !== 'object' || Array.isArray(tab)) continue;
+    if (!isNonEmptyString(tab.id)) continue;
+    // 説明専用タブ（content を持つタブ）は入力欄側ではないので対象外。引き継げなかった
+    // ものも含めて除外する（引き継がなかったタブへのリンクを terminals へ曲げない）。
+    if (Array.isArray(tab.content) && tab.content.length > 0) continue;
+    if (carriedTabIds.has(tab.id)) continue;
+    // 「宣言だけあって入力欄も content も持たないタブ」もここに入るため、その ID 宛ての
+    // tabLink は terminals へ曲がる。意図的な割り切り（読み替えないと renderer に落とされて
+    // リンクごと消えるので、行き先のある terminals へ着地させる方がまだ良い）。
+    ids.add(tab.id);
+  }
+  return ids;
+}
+
+/**
+ * 引き継ぐ content ブロックの tabLink 移動先を Orchestrator のタブ ID へ読み替える。
+ *
+ * vk-terminals 側の schema では移動先が入力欄のタブ（例: `general`）だが、Orchestrator では
+ * スキーマ由来の入力欄はすべて `terminals` タブに入る。読み替えないと renderer 側で
+ * 「未知の tab」と判定されてブロックごと黙って落とされ、「API ホストの設定へ移動」のような
+ * リンクが消える。
+ *
+ * 元スキーマのオブジェクトは書き換えず、読み替えるブロックだけコピーを作る。
+ * @param {object[]} content 引き継ぎ元の content 配列
+ * @param {{ fieldTabIds: Set<string>, carriedTabIds: Set<string> }} maps
+ * @returns {object[]}
+ */
+function remapVkTerminalsTabContent(content, { fieldTabIds, carriedTabIds }) {
+  return content.map((block) => {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return block;
+    if (block.type !== 'tabLink' || !isNonEmptyString(block.tab)) return block;
+    // 引き継いだ説明専用タブ同士の移動（自己参照を含む）は ID がそのまま通用する。
+    if (carriedTabIds.has(block.tab)) return block;
+    if (!fieldTabIds.has(block.tab)) return block;
+    return { ...block, tab: 'terminals' };
+  });
+}
+
+/**
+ * VK Terminals のスキーマから「入力欄を持たない説明専用タブ」を引き継ぐ。
+ *
+ * vk-terminals 単体起動では settings-schema.json の tabs[] がそのまま使われるため
+ * 「外出先から確認」のような説明タブが出るが、Orchestrator 起動では
+ * env VK_TERMINALS_SETTINGS が指すこのディスクリプタが使われる。tabs を自前定義だけに
+ * すると説明タブが丸ごと消えるので、content を持つタブだけをここで引き継ぐ。
+ *
+ * 入力欄を持つタブ（groups の受け皿）は引き継がない。スキーマ由来の入力欄は
+ * buildVkTerminalsSettingsGroups() が `terminals` タブへまとめるため、引き継ぐと
+ * 中身の無い空タブが増えるだけになる。
+ *
+ * **前提: content と入力欄の両方を持つ「ハイブリッドタブ」は想定していない。** 引き継ぎ条件は
+ * content の有無だけなので、groups からも参照されているタブは説明部分だけが引き継がれ、
+ * 入力欄は terminals タブへ分かれる。そのタブ宛ての tabLink は引き継ぎ済み ID として
+ * 読み替えられないため、リンク先に目的の欄が無い状態になり得る。現行の
+ * settings-schema.json はタブを「入力欄用」「説明用」に分けているため発生しない。
+ * vk-terminals 側がハイブリッドタブを導入したら、ここの引き継ぎ条件を見直すこと。
+ *
+ * 「元スキーマを破壊的に書き換えない」という不変条件を単体で検証するためにエクスポートする
+ * （descriptor 経由だと呼び出しごとにスキーマを読み直すため、in-place 変更を検出できない）。
+ * 本番の利用箇所は buildSettingsDescriptor() のみ。
+ * @param {object|null} schema vk-terminals の settings-schema.json（読めなければ null）
+ * @param {string[]} ownTabIds Orchestrator 自前タブの ID 一覧
+ * @returns {object[]} 追加するタブ定義（引き継ぐものが無ければ空配列）
+ */
+export function buildVkTerminalsContentTabs(schema, ownTabIds) {
+  if (!schema || !Array.isArray(schema.tabs)) return [];
+
+  const takenIds = new Set(ownTabIds);
+  const carried = [];
+  for (const tab of schema.tabs) {
+    if (!tab || typeof tab !== 'object' || Array.isArray(tab)) continue;
+    if (!Array.isArray(tab.content) || tab.content.length === 0) continue;
+    if (!isNonEmptyString(tab.id) || !isNonEmptyString(tab.label)) continue;
+    // 自前タブや先に引き継いだタブと ID が衝突するものは捨てる（安全側）。renderer は
+    // 同じ ID を先勝ちで 1 つだけ採用するため、通すと自前タブが中身の無い空タブになる。
+    // 黙って捨てるとタブが消えた理由を追えないので警告を残す。
+    if (takenIds.has(tab.id)) {
+      console.warn(`[Config] settings-schema.json のタブ「${tab.id}」は既存タブ ID（Orchestrator 自前タブ／引き継ぎ済みタブ）と重複するため引き継ぎません。`);
+      continue;
+    }
+    takenIds.add(tab.id);
+    carried.push(tab);
+  }
+  if (carried.length === 0) return [];
+
+  const carriedTabIds = new Set(carried.map((tab) => tab.id));
+  const fieldTabIds = collectVkTerminalsFieldTabIds(schema, carriedTabIds);
+  return carried.map((tab) => {
+    const next = {
+      id: tab.id,
+      label: tab.label,
+      content: remapVkTerminalsTabContent(tab.content, { fieldTabIds, carriedTabIds }),
+    };
+    // note は renderer がタブ冒頭の案内文として描画するため、あれば一緒に引き継ぐ。
+    if (isNonEmptyString(tab.note)) next.note = tab.note;
+    return next;
+  });
+}
+
+/**
  * VK Terminals の設定パネル用「設定ディスクリプタ」を組み立てる。
  *
  * VK Terminals 側は特定ツールの設定内容を知らない汎用パネルで、env
@@ -1381,13 +1508,21 @@ function buildVkTerminalsSettingsGroups(options = {}) {
  * @returns {object} 設定ディスクリプタ
  */
 export function buildSettingsDescriptor(targetPath = resolveConfigPath(), options = {}) {
+  // スキーマの読み込みはここで 1 回だけ行い、入力欄（groups）と説明専用タブの引き継ぎで
+  // 使い回す。それぞれが読み直すと、読めなかったときの警告が二重に出てしまう。
+  const vkTerminalsSchema = resolveVkTerminalsSettingsSchemaForDescriptor(options);
+  const ownTabs = [
+    { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+    { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
+    { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
+  ];
   return {
     title: 'VK Orchestrator 設定',
     targetPath,
+    // 自前タブの後ろに、vk-terminals 由来の説明専用タブ（例:「外出先から確認」）を並べる。
     tabs: [
-      { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
-      { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
-      { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
+      ...ownTabs,
+      ...buildVkTerminalsContentTabs(vkTerminalsSchema, ownTabs.map((tab) => tab.id)),
     ],
     groups: [
       {
@@ -1408,7 +1543,7 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
           { key: 'task.commandTemplate', label: 'issue を処理する Claude のコマンドテンプレート', type: 'text', placeholder: '/vk-kore {issueUrl} wp-env-port={wpPort} headless=1', help: 'issue に対して仕様検討・実装・プルリク作成・レビューまで自動で処理してマージできる状態にする Claude のコマンドを指定してください。未指定の場合は、次の形式で投げられます。\n/vk-kore {issueUrl} wp-env-port={wpPort} headless=1\n{issueUrl} と {wpPort} は自動で置換します。\n独自のコマンドを使用する場合、オーケストレーターと円滑に連携するための決め事がいくつかあります。詳しくは docs/agent-rules.md をご確認ください。デフォルトの /vk-kore スキルは vendor/vk-agents-public/skills/vk-kore/ にありますので、必要に応じてそれを参考に独自のスキルをご利用の PC の .claude に作ってください。' },
         ],
       },
-      ...buildVkTerminalsSettingsGroups(options),
+      ...buildVkTerminalsSettingsGroups(vkTerminalsSchema, options),
       {
         label: 'VK Terminals との通信（Orchestrator 側設定）',
         tab: 'terminals',
