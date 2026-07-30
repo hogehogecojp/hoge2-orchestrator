@@ -5,7 +5,7 @@
 
 ## 内容
 
-- skills: 17 件
+- skills: 18 件
 - agents: 4 件
 - rules: 24 件
 - files: 10 件
