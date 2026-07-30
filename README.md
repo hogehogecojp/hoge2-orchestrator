@@ -26,7 +26,9 @@ VK Terminals                     … 実際に Claude を動かす実行面
 - **Node.js 20 以上**
 - **タスク登録リポジトリ（task-queue）**と、そこに設定されたステータスラベル群（`status:ready` ほか。`config.example.json` の owner/repo で指定）
 - **GitHub CLI (`gh`)** と `gh auth login` 済みの認証
-- 各ペインで動作する **Claude Code**
+- 各ペインで動作する **Claude Code**（未導入なら `npm install -g @anthropic-ai/claude-code`）
+
+不足しているものは `npx vk-orchestrator doctor` で確認できます（`npm start` の起動時にも自動で確認し、不足があれば案内します）。
 
 VK Terminals は `npm install` 時に依存として自動導入されます（`optionalDependencies`）。
 
@@ -102,6 +104,7 @@ CLI だけで「自分の環境で何が足りないか」を確認したい場�
 ```bash
 npx vk-orchestrator doctor           # 充足状況の診断（✅/❌ と次にやるコマンド）
 npx vk-orchestrator doctor --json    # 機械可読（{ id, group, label, required, ok, current, hint, target } の配列＋要約）
+                                     # ※ claude 項目のみ usesDefaultCommand（検査対象が既定の claude か）を追加で持ちます
 ```
 
 ## セットアップ（手動）
@@ -233,7 +236,7 @@ npx vk-orchestrator up       # config.json を反映 → GUI 起動 → API 疎�
 # npm start でも同じ（start スクリプトは up に割り当て済み）
 ```
 
-`up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、初回セットアップとして `/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
+`up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、`/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。ただし Claude Code 自体が未導入の場合は、`/vk-orchestrator-setup` を実行できないため先に Claude Code の導入を案内します。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
 
 `up` は VK Terminals API の起動を待ってから、**GUI の中に orchestrator 専用ペイン（Claude を起動しない素のシェル）を開いて `vk-orchestrator start` を自動実行**します。ペイン上部には「オーケストレーター」というタイトルが立つので他ペインと一目で区別でき、GUI を閉じればペインごと orchestrator も終了します。これで **「ペインを開いて Claude を止めて `vk-orchestrator start` を打つ」手動手順は不要**です。
 

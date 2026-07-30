@@ -21,7 +21,7 @@ const BIN_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'vk-
 
 // テスト環境を丸ごと注入するためのヘルパ。
 // homeDir 配下に config（A）・canonical（C）・manifest を任意で用意し、
-// gh 認証 / VK Terminals 導入 / tmux 導入 / platform / node を明示注入する。
+// gh 認証 / VK Terminals 導入 / tmux 導入 / Claude Code 導入 / platform / node を明示注入する。
 function withDoctorEnv(
   {
     config = {},
@@ -32,6 +32,7 @@ function withDoctorEnv(
     ghAuthenticated = true,
     vkTerminalsInstalled = true,
     tmuxInstalled = true,
+    claudeInstalled = true,
     platform = 'darwin',
     nodeVersion = '20.11.0',
   } = {},
@@ -42,6 +43,9 @@ function withDoctorEnv(
   // 実行環境の env でテストがぶれないよう退避して外す（finally で復元）。
   const savedTerminalsModeEnv = process.env.VK_TERMINALS_MODE;
   delete process.env.VK_TERMINALS_MODE;
+  // resolveTmuxClaudeCommand も env VK_TMUX_CLAUDE_CMD を config より優先するため同様に外す。
+  const savedTmuxClaudeCmdEnv = process.env.VK_TMUX_CLAUDE_CMD;
+  delete process.env.VK_TMUX_CLAUDE_CMD;
   try {
     const configPath = join(dir, 'config.json');
     writeFileSync(configPath, JSON.stringify(config));
@@ -80,11 +84,19 @@ function withDoctorEnv(
         if (!tmuxInstalled) throw new Error('tmux not found');
         return 'tmux 3.4';
       },
+      // claude も tmux と同じく専用フックにする。実 PATH の claude を見に行くと
+      // 「開発マシンには入っているのでテストが通る」状態になり、未導入環境の検知を検証できない。
+      resolveClaudeVersion: () => {
+        if (!claudeInstalled) throw new Error('claude not found');
+        return '2.0.14 (Claude Code)';
+      },
     };
     return fn(options);
   } finally {
     if (savedTerminalsModeEnv === undefined) delete process.env.VK_TERMINALS_MODE;
     else process.env.VK_TERMINALS_MODE = savedTerminalsModeEnv;
+    if (savedTmuxClaudeCmdEnv === undefined) delete process.env.VK_TMUX_CLAUDE_CMD;
+    else process.env.VK_TMUX_CLAUDE_CMD = savedTmuxClaudeCmdEnv;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -251,6 +263,235 @@ test('runDoctor: tmux -V の出力は先頭行・制御文字除去・長さ制�
     const report = formatDoctorReport(runDoctor(options));
     assert.doesNotMatch(report, /偽の要件行/);
   });
+});
+
+test('runDoctor: claude 未導入は必須欠損として案内される（issue #247）', () => {
+  // 初回 `npm start` で Claude Code が未導入の環境。以前はこの要件自体が無く、
+  // doctor も up も何も案内しないままペインで claude が起動できずに詰んでいた。
+  withDoctorEnv({ queueBackend: 'local', claudeInstalled: false, allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor(options);
+    const claude = byId(reqs, 'claude');
+    assert.equal(claude.required, true);
+    assert.equal(claude.ok, false);
+    assert.equal(claude.group, '前提');
+    assert.equal(claude.target, 'external');
+    assert.match(claude.current, /未導入/);
+    // インストール手順が hint に載っていること（自動インストールはしない方針）。
+    assert.match(claude.hint, /@anthropic-ai\/claude-code/);
+
+    const summary = summarizeDoctor(reqs);
+    assert.equal(summary.allRequiredOk, false);
+    assert.ok(summary.missingRequired.map((r) => r.id).includes('claude'));
+
+    // up / doctor の案内文（missingRequired の label + hint）に出ること。
+    const report = formatDoctorReport(reqs);
+    assert.match(report, /Claude Code/);
+    assert.match(report, /@anthropic-ai\/claude-code/);
+  });
+});
+
+test('runDoctor: claude 導入済みは ok=true・current にバージョンを出す', () => {
+  withDoctorEnv({ queueBackend: 'local', claudeInstalled: true, allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor(options);
+    const claude = byId(reqs, 'claude');
+    assert.equal(claude.ok, true);
+    assert.equal(claude.current, '2.0.14 (Claude Code)');
+    assert.equal(summarizeDoctor(reqs).allRequiredOk, true);
+  });
+});
+
+test('runDoctor: vk-terminals モードでは素の claude を検査対象にする', () => {
+  // vk-terminals モードのペイン起動は VK Terminals 側が素の claude を叩くため、
+  // tmux.claudeCommand の指定があっても検査対象は 'claude' のまま。
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      config: { tmux: { claudeCommand: 'my-claude --dangerously-skip-permissions' } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const checked = [];
+      options.resolveClaudeVersion = (command) => {
+        checked.push(command);
+        return '2.0.14 (Claude Code)';
+      };
+      assert.equal(byId(runDoctor(options), 'claude').ok, true);
+      assert.deepEqual(checked, ['claude']);
+    },
+  );
+});
+
+test('runDoctor: tmux モードは tmux.claudeCommand の先頭トークンを検査対象にする', () => {
+  // 独自コマンド運用（bypass 用の引数付きなど）で「素の claude が無い」と誤検知しないこと。
+  // 設定値は任意文字列なので、シェルへ渡さず実行ファイル名（先頭トークン）だけを検査する。
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      config: { tmux: { claudeCommand: 'my-claude --dangerously-skip-permissions' } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const checked = [];
+      options.resolveClaudeVersion = (command) => {
+        checked.push(command);
+        return '2.0.14 (Claude Code)';
+      };
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.ok, true);
+      assert.deepEqual(checked, ['my-claude'], '引数を落とした実行ファイル名だけを検査すること');
+      // 独自コマンド利用者が原因に気づけるよう、hint に設定キーと現在値を出す。
+      assert.match(claude.hint, /tmux\.claudeCommand/);
+      assert.match(claude.hint, /my-claude/);
+      // 成功時も検査対象を出す（自分の設定が見られているか確認できるようにする）。
+      assert.match(claude.current, /コマンド: my-claude/);
+    },
+  );
+});
+
+test('runDoctor: 64 文字を超える絶対パスを切り詰めずに検査対象へ渡す', () => {
+  // 表示用サニタイズ（64 文字で切り詰め）を実行対象に流用すると、fnm / volta 配下の
+  // claude の絶対パスが途中で切れて別の実体を指す。「tmux サーバーの PATH に claude が
+  // 無いから絶対パスを書く」は典型的な設定動機なので、正しく設定できている人ほど
+  // 誤検知される。実行に渡す値は切り詰めないこと。
+  const longPath = '/Users/someuser/.local/share/fnm/node-versions/v20.11.0/installation/bin/claude';
+  assert.ok(longPath.length > 64, '前提: 検証には 64 文字超のパスを使う');
+  withDoctorEnv(
+    { terminalsMode: 'tmux', config: { tmux: { claudeCommand: `${longPath} --dangerously-skip-permissions` } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const checked = [];
+      options.resolveClaudeVersion = (command) => {
+        checked.push(command);
+        return '2.0.14 (Claude Code)';
+      };
+      assert.equal(byId(runDoctor(options), 'claude').ok, true);
+      assert.deepEqual(checked, [longPath]);
+    },
+  );
+});
+
+test('runDoctor: 長い検査対象コマンドは実行には全長を渡し、レポートには有界な値だけ出す', () => {
+  // 実行側（切り詰めない）と表示側（切り詰める）の両方向を 1 本でロックする。
+  // 表示を生の値に戻しても、実行を切り詰めた値に戻しても、どちらでも落ちること。
+  const longPath = `/opt/${'a'.repeat(200)}/claude`;
+  withDoctorEnv(
+    { terminalsMode: 'tmux', config: { tmux: { claudeCommand: longPath } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const checked = [];
+      options.resolveClaudeVersion = (command) => {
+        checked.push(command);
+        throw new Error('claude not found');
+      };
+      const claude = byId(runDoctor(options), 'claude');
+      // 実行対象は全長のまま（途中で切れたパスは別の実体を指す）。
+      assert.deepEqual(checked, [longPath]);
+      // 表示は有界。レポート 1 行が設定値の長さで無制限に伸びないこと。
+      assert.ok(!claude.current.includes(longPath), 'current に全長を出さないこと');
+      assert.ok(
+        claude.current.length <= 100,
+        `current が有界であること（実際: ${claude.current.length} 文字）`,
+      );
+    },
+  );
+});
+
+test('runDoctor: tmux モードで独自 claude コマンドが未導入なら ok=false・current に対象名を出す', () => {
+  withDoctorEnv(
+    { terminalsMode: 'tmux', config: { tmux: { claudeCommand: 'my-claude' } }, claudeInstalled: false, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.ok, false);
+      assert.equal(claude.current, '未導入（コマンド: my-claude）');
+      // 独自コマンドが見つからないときに「npm install …」を先頭に置くと、それを実行しても
+      // 生えるのは claude で設定した独自コマンドは直らない。一番効く行動を先に出すこと。
+      assert.match(claude.hint, /^ペイン起動に使うコマンド "my-claude" が見つかりません。/);
+    },
+  );
+});
+
+test('runDoctor: 既定コマンドのときは hint に tmux.claudeCommand の説明を出さない', () => {
+  // 独自コマンドを使っていない大多数に設定キーの説明を出すのは冗長なので、
+  // 検査対象が既定 claude かどうかで hint 自体を分ける。
+  for (const terminalsMode of ['vk-terminals', 'tmux']) {
+    withDoctorEnv({ terminalsMode, claudeInstalled: false, allowedOwners: ['vektor-inc'] }, (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.current, '未導入（コマンド: claude）');
+      // 独自コマンド分岐と同じ「何が見つからないか → 打つ手」の型で始めること。
+      assert.match(claude.hint, /^`claude` コマンドが見つかりません。/);
+      assert.doesNotMatch(claude.hint, /tmux\.claudeCommand/);
+      // 「入れたのに見つからない（PATH 未反映）」は最頻の詰まりどころなので両モードで案内する。
+      assert.match(claude.hint, /claude --version/);
+      assert.match(claude.hint, /シェルを開き直して/);
+    });
+  }
+});
+
+test('runDoctor: claude 導入済み・既定コマンドなら current にコマンド名を添えない', () => {
+  withDoctorEnv({ terminalsMode: 'tmux', allowedOwners: ['vektor-inc'] }, (options) => {
+    assert.equal(byId(runDoctor(options), 'claude').current, '2.0.14 (Claude Code)');
+  });
+});
+
+test('formatDoctorReport: claude 未充足なら /vk-orchestrator-setup ではなく先に導入を促す（詰みループ回避）', () => {
+  // Claude Code が無いから ❌ が出ている人に「Claude Code で開いて /vk-orchestrator-setup」と
+  // 案内すると実行不可能で、この機能が救おうとしている当事者が二度目の壁にぶつかる。
+  withDoctorEnv({ queueBackend: 'local', claudeInstalled: false, allowedOwners: ['vektor-inc'] }, (options) => {
+    const report = formatDoctorReport(runDoctor(options));
+    assert.match(report, /まず Claude Code をインストールしてください/);
+    assert.match(report, /導入後、Claude Code でこのリポジトリを開き/);
+  });
+});
+
+test('formatDoctorReport: 独自コマンドが見つからない場合はインストールを勧めない', () => {
+  // 独自コマンド（cly 等）が無いだけなら Claude Code 自体は入っていることが多く、
+  // インストールを勧めても解決しない。締めでも hint と同じ優先順位を守る。
+  withDoctorEnv(
+    { terminalsMode: 'tmux', queueBackend: 'local', config: { tmux: { claudeCommand: 'cly' } }, claudeInstalled: false, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const report = formatDoctorReport(runDoctor(options));
+      assert.doesNotMatch(report, /まず Claude Code をインストールしてください/);
+      assert.match(report, /まず上記の「Claude Code コマンド導入」を解消してください/);
+    },
+  );
+});
+
+test('formatDoctorReport: claude が充足していれば従来どおり /vk-orchestrator-setup へ誘導する', () => {
+  withDoctorEnv({ queueBackend: 'github', config: {}, ghAuthenticated: false, claudeInstalled: true }, (options) => {
+    const report = formatDoctorReport(runDoctor(options));
+    assert.doesNotMatch(report, /まず Claude Code をインストールしてください/);
+    assert.match(report, /Claude Code でこのリポジトリを開き `\/vk-orchestrator-setup` を実行すると/);
+  });
+});
+
+test('runDoctor: claude --version の出力は先頭行・制御文字除去・長さ制限してから current に入れる', () => {
+  withDoctorEnv({ queueBackend: 'local', allowedOwners: ['vektor-inc'] }, (options) => {
+    // 改行で偽の ✅ 行を混ぜ込む／ANSI エスケープ／長すぎる出力を注入する。
+    options.resolveClaudeVersion = () =>
+      `\u001b[32m2.0.14 (Claude Code)\u0007\u001b[0m\n  ✅ 偽の要件行（必須） … なりすまし\n${'x'.repeat(500)}`;
+    const claude = byId(runDoctor(options), 'claude');
+    assert.equal(claude.current, '2.0.14 (Claude Code)');
+    assert.equal(claude.ok, true);
+    // レポートに偽の行が混ざらないこと。
+    assert.doesNotMatch(formatDoctorReport(runDoctor(options)), /偽の要件行/);
+  });
+});
+
+test('runDoctor: tmux.claudeCommand が制御文字入りでもレポート行を壊さない', () => {
+  // 設定値は current / hint に出るため、そこから偽の要件行を混ぜ込めないこと。
+  // 実際にここを守っているのは先頭トークン抽出（split(/\s+/)）で、改行以降は
+  // その時点で落ちる。制御文字の除去はそれをすり抜ける値への多層防御。
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      config: { tmux: { claudeCommand: 'my-claude\n  ✅ 偽の要件行（必須） … なりすまし' } },
+      claudeInstalled: false,
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(byId(reqs, 'claude').ok, false);
+      assert.doesNotMatch(formatDoctorReport(reqs), /偽の要件行/);
+    },
+  );
 });
 
 test('runDoctor: terminals.mode を options ではなく config から解決する', () => {

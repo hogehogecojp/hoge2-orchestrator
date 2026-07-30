@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 機能追加 ] Claude Code が未導入の場合に `npm start` と `vk-orchestrator doctor` でインストール手順を案内する機能を追加。ペインで Claude Code が起動できず、何も案内されないまま作業が進まない状態を解消
+
 = 0.26.0 =
 
 - [ 機能追加 ] VK Terminals との通信で応答を待つ時間の倍率を設定パネルから変更できる項目を追加。Tailscale 越しなど応答が遅い環境で、ターミナルの状態表示や入力待ち検知が途切れる問題を緩和

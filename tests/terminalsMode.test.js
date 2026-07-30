@@ -85,6 +85,12 @@ test('bin up（tmux モード）: 未定義関数で落ちず doctor 案内を�
     // VK Terminals 未導入は（tmux モードでは任意なので）案内に出ない。
     assert.match(out, /tmux コマンド導入/);
     assert.doesNotMatch(out, /VK Terminals 導入/);
+    // 未充足の案内は「初回」と限定しない（長く使っている人でも PATH 変化でここに落ちる）。
+    assert.match(out, /起動に必要な項目が未充足です/);
+    // このフェイク PATH には claude も無い。Claude Code 未導入の人に
+    // 「Claude Code で開いて /vk-orchestrator-setup」と案内すると実行不可能な指示になるため、
+    // 先に導入を促す締めへ差し替わること（詰みループ回避）。
+    assert.match(out, /まず Claude Code をインストールしてください/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

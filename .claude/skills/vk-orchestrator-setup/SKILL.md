@@ -46,7 +46,7 @@ node bin/vk-orchestrator.js doctor
 
 （または `node bin/vk-orchestrator.js doctor --json` で機械可読）。✅ の項目は変更不要。❌（必須で未充足）と ⚠️（任意で未充足）を、以下のヒアリング順で埋めていく。**すでに ✅ の項目は質問しない**。
 
-前提（`node` / `platform` / `terminals.mode` / `vk-terminals` / `tmux` / `vk-agents-setup`）が ❌ の場合は、doctor の `hint` に出るコマンド（`npm run setup:terminals` / `npm run setup:agents` / `brew install tmux` など）を案内し、ユーザーに実行してもらってから続ける。前提の必須／任意は実行面モード（`terminals.mode`）でも変わる（tmux モードでは `vk-terminals` は任意になり、代わりに `tmux` が必須。vk-terminals モードでは `tmux` の行自体が出ない）ので、**必須かどうかは doctor の `required` をそのまま読む**（このスキルで判断しない）。
+前提（`node` / `platform` / `terminals.mode` / `vk-terminals` / `tmux` / `claude` / `vk-agents-setup`）が ❌ の場合は、doctor の `hint` に出るコマンド（`npm run setup:terminals` / `npm run setup:agents` / `brew install tmux` / `npm install -g @anthropic-ai/claude-code` など）を案内し、ユーザーに実行してもらってから続ける。前提の必須／任意は実行面モード（`terminals.mode`）でも変わる（tmux モードでは `vk-terminals` は任意になり、代わりに `tmux` が必須。vk-terminals モードでは `tmux` の行自体が出ない）ので、**必須かどうかは doctor の `required` をそのまま読む**（このスキルで判断しない）。また `claude` 項目は独自コマンド（`tmux.claudeCommand`）を設定している場合に案内内容が変わるため、**例示ではなく doctor の `hint` の文面をそのまま案内する**（インストールを勧めても独自コマンドは直らないため）。
 
 ### 手順 1: モード選択（`queue.backend`）
 

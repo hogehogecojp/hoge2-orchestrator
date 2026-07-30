@@ -15,7 +15,7 @@
 //   - GitHub モード: gh 認証 / github.owner / github.repo / orchestrator.assigneeFilter /
 //                    org.allowed_owners(owner を含む) を required にする。
 //   - ローカルモード: それらは任意。必須は Node / プラットフォーム / 実行面モードの前提 /
-//                    vk-agents 展開 / queue.backend / org.allowed_owners。
+//                    Claude Code コマンド / vk-agents 展開 / queue.backend / org.allowed_owners。
 //
 // 2) 実行面モード（terminals.mode）
 //   - vk-terminals モード: VK Terminals 導入を required にする（GUI 前提。platform の
@@ -33,6 +33,7 @@ import {
   getQueueBackend,
   resolveVkTerminalsDir as realResolveVkTerminalsDir,
   resolveTerminalsMode,
+  resolveTmuxClaudeCommand,
   isVkAgentsSetup,
   vkAgentsSkillsManifestPath,
   resolveVkAgentsCanonicalConfigPath,
@@ -40,11 +41,19 @@ import {
   readVendoredVkAgentsVersion,
   readVkAgentsManifestSource,
 } from './config.js';
+// 制御文字の除去は build-command.js の stripControlChars に集約している（DRY）。
+// terminals/index.js と同じ出所を使い、文字クラスを 3 箇所目に複製しない。
+import { stripControlChars } from './engine/build-command.js';
 import { evaluateAgentsVersionState } from './engine/agents-redeploy.js';
 import { formatAgentsVersionRequirement } from './engine/update-messages.js';
 
 const DEFAULT_OWNER = 'vektor-inc';
 const DEFAULT_REPO = 'task-queue';
+// ペイン起動に使う既定の Claude Code コマンド（config.js の resolveTmuxClaudeCommand の既定と同じ）。
+const DEFAULT_CLAUDE_COMMAND = 'claude';
+// Claude Code のインストール手順。要件の hint とレポート末尾の両方で使うため 1 か所に持つ
+// （文言が枝分かれすると、サポート時に別々の手順として扱われてしまう）。
+export const CLAUDE_INSTALL_COMMAND = '`npm install -g @anthropic-ai/claude-code`';
 
 function getPath(obj, path) {
   return path.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj);
@@ -77,6 +86,24 @@ function readAllowedOwners(canonicalConfigPath) {
 }
 
 /**
+ * 外部由来の文字列（コマンド出力・config の設定値）を、レポート／--json に載せても
+ * 安全な 1 行の値へ整える。
+ *
+ * 先頭行のみ・ANSI エスケープと制御文字を除去・長さを制限する。改行入りの値をそのまま
+ * 載せるとレポートの行構造が崩れ、偽の ✅/❌ 行を混ぜ込めてしまうため
+ * （利用者は「必須項目が充足している」と誤読しうる）。
+ * @param {*} value 外部由来の値
+ * @returns {string} 表示に使える 1 行の値（空なら空文字）
+ */
+function sanitizeReportValue(value) {
+  const firstLine = String(value ?? '')
+    .split('\n')[0]
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, ''); // ANSI CSI シーケンス（ESC 自体は次段で落ちる）
+  // 残った C0/C1 制御文字は共通ヘルパで落とす（文字クラスを複製しない）。
+  return stripControlChars(firstLine).trim().slice(0, 64);
+}
+
+/**
  * tmux コマンドのバージョン文字列（例: "tmux 3.4"）を返す。
  * 未導入なら execFileSync が throw するので、呼び出し側で未導入扱いにする。
  *
@@ -96,6 +123,61 @@ function realResolveTmuxVersion() {
 }
 
 /**
+ * Claude Code コマンドのバージョン文字列（例: "2.0.14 (Claude Code)"）を返す。
+ * 未導入なら execFileSync が throw するので、呼び出し側で未導入扱いにする。
+ *
+ * realResolveTmuxVersion と同じく専用フックにしている（gh 認証用の execFileSync と
+ * 共用すると、引数を見ないフェイクで「claude 常に導入済み」に倒れてテストが書けない）。
+ *
+ * command は「実行ファイル名だけ」を受け取る前提で、**シェルを介さず execFileSync へ
+ * 直接渡す**。tmux モードの起動コマンドは設定で任意文字列に差し替えられるため、
+ * 引数付きの値をそのままシェルに通すと設定ファイル経由のコマンド実行になってしまう。
+ * @param {string} command 実行ファイル名（引数を含まない先頭トークン）
+ * @returns {string}
+ */
+function realResolveClaudeVersion(command) {
+  return String(
+    realExecFileSync(command, ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // tmux(-V) より長め。claude は Node ランタイムの起動を挟むため、コールドスタートでは
+      // 2 秒に収まらず「入っているのに未導入」と誤検知しうる。それでも doctor はローカル
+      // 高速判定なので上限は設ける（timeout は throw → 未導入扱い）。
+      timeout: 5000,
+      maxBuffer: 64 * 1024, // 想定は 1 行のバージョン表記。異常な巨大出力は throw させる
+    }) ?? '',
+  ).trim();
+}
+
+/**
+ * doctor が導入確認に使う Claude Code の実行ファイル名を決める。
+ *
+ * 実際にペインで起動されるコマンドと同じものを検査しないと、独自コマンド運用の環境で
+ * 「素の claude が無い」と誤検知する。tmux モードの起動コマンドは
+ * resolveTmuxClaudeCommand()（env VK_TMUX_CLAUDE_CMD > tmux.claudeCommand > 'claude'）で
+ * 差し替えられるので、そこから実行ファイル名を取り出す。値は
+ * `claude --dangerously-skip-permissions` のような任意文字列なので、空白区切りの
+ * 先頭トークンだけを使う（引数は導入確認に不要で、シェルへ渡すと危険なため）。
+ *
+ * vk-terminals モードは VK Terminals 側が素の claude を起動するため 'claude' 固定。
+ *
+ * **戻り値は「実行に渡す値」なので長さで切り詰めない。** 表示用の sanitizeReportValue を
+ * ここへ流用すると 64 文字で切れる。fnm / volta / asdf 配下の claude の絶対パスは 64 文字を
+ * 簡単に超えるうえ、「tmux サーバーの PATH に claude が無いので絶対パスを書く」は
+ * tmux.claudeCommand に絶対パスを設定する典型的な動機なので、正しく設定できている人ほど
+ * 途中で切れたパスを検査されて誤検知される。表示用の整形は呼び出し側に任せ、ここでは
+ * レポートの行構造を壊す制御文字だけを落とす。
+ * @param {boolean} tmuxMode 実行面モードが tmux か
+ * @param {object} cfg loadUnifiedConfig() の戻り値
+ * @returns {string} 検査対象の実行ファイル名／絶対パス（解決できなければ 'claude'）
+ */
+function resolveClaudeCommandName(tmuxMode, cfg) {
+  if (!tmuxMode) return 'claude';
+  const head = String(resolveTmuxClaudeCommand(cfg)).trim().split(/\s+/)[0];
+  return stripControlChars(head).trim() || 'claude';
+}
+
+/**
  * 要件チェックリストを実状態から計算して返す。
  *
  * 依存注入でテスト可能にするため、副作用のある入力（fs / gh / platform / node / config パス）は
@@ -111,10 +193,13 @@ function realResolveTmuxVersion() {
  *   execFileSync?: Function,
  *   resolveVkTerminalsDir?: () => string,
  *   resolveTmuxVersion?: () => string,
+ *   resolveClaudeVersion?: (command: string) => string,
  *   platform?: string,
  *   nodeVersion?: string,
  * }} [options]
- * @returns {Array<{ id:string, group:string, label:string, required:boolean, ok:boolean, current:string, hint:string, target:'A'|'B'|'C'|'external'|'manifest' }>}
+ * @returns {Array<{ id:string, group:string, label:string, required:boolean, ok:boolean, current:string, hint:string, target:'A'|'B'|'C'|'external'|'manifest', usesDefaultCommand?:boolean }>}
+ *   usesDefaultCommand は claude 要件のみが持ち、検査対象が既定の `claude` だったかを表す
+ *   （締めの案内でインストールを勧めてよいかの判断に使う）。
  */
 export function runDoctor(options = {}) {
   const homeDir = options.homeDir ?? homedir();
@@ -132,6 +217,7 @@ export function runDoctor(options = {}) {
   const execFileSyncImpl = options.execFileSync ?? realExecFileSync;
   const resolveVkTerminals = options.resolveVkTerminalsDir ?? realResolveVkTerminalsDir;
   const resolveTmuxVersion = options.resolveTmuxVersion ?? realResolveTmuxVersion;
+  const resolveClaudeVersion = options.resolveClaudeVersion ?? realResolveClaudeVersion;
 
   const requirements = [];
 
@@ -205,15 +291,9 @@ export function runDoctor(options = {}) {
   if (tmuxMode) {
     let tmuxVersion = '';
     try {
-      // 外部コマンドの stdout をそのままレポート／--json に載せない。
-      // 先頭行のみ・ANSI エスケープと制御文字を除去・長さを制限する（想定値は "tmux 3.4" 程度）。
-      // 改行入りの値でレポートの行構造が崩れ、偽の ✅/❌ 行を混ぜ込めるのを防ぐ。
-      tmuxVersion = String(resolveTmuxVersion() ?? '')
-        .split('\n')[0]
-        .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '') // ANSI CSI シーケンス
-        .replace(/[\u0000-\u001f\u007f-\u009f]/g, '') // C0/C1 制御文字
-        .trim()
-        .slice(0, 64);
+      // 外部コマンドの stdout はそのままレポート／--json に載せない（sanitizeReportValue）。
+      // 想定値は "tmux 3.4" 程度。
+      tmuxVersion = sanitizeReportValue(resolveTmuxVersion());
     } catch {
       tmuxVersion = '';
     }
@@ -229,6 +309,54 @@ export function runDoctor(options = {}) {
       hint: 'tmux をインストールしてください（例: `brew install tmux` / Ubuntu は `sudo apt install tmux`）。',
     });
   }
+
+  // Claude Code コマンド導入（両モードで必須）
+  //
+  // オーケストレーターの中核は「ペインで Claude Code を起動して作業させる」ことなので、
+  // claude コマンドが無いとペインは開いても即終了し、タスクが一切進まない。それにも関わらず
+  // 従来はこの要件自体が無く、doctor も `up` も何も案内しないまま詰んでいた（issue #247）。
+  //
+  // 自動インストールはしない。doctor は副作用の無いローカル高速判定に限定し、外部依存
+  // （Node.js / tmux / gh など）はすべて「検知して hint で案内」に統一しているため。
+  const claudeCommand = resolveClaudeCommandName(tmuxMode, cfg);
+  // 検査対象は実行に渡すため切り詰めていないので、レポートへ載せるときだけ 1 行・長さ制限へ整える。
+  const claudeCommandLabel = sanitizeReportValue(claudeCommand);
+  // 素の claude を見ているか、利用者が設定した独自コマンドを見ているかで案内すべき行動が変わる。
+  const usesDefaultClaudeCommand = claudeCommand === DEFAULT_CLAUDE_COMMAND;
+  let claudeVersion = '';
+  try {
+    // 外部コマンドの stdout はそのままレポート／--json に載せない（sanitizeReportValue）。
+    // 想定値は "2.0.14 (Claude Code)" 程度。
+    claudeVersion = sanitizeReportValue(resolveClaudeVersion(claudeCommand));
+  } catch {
+    claudeVersion = '';
+  }
+  const claudeOk = claudeVersion !== '';
+  requirements.push({
+    id: 'claude',
+    group: '前提',
+    label: 'Claude Code コマンド導入',
+    required: true,
+    target: 'external',
+    ok: claudeOk,
+    // 独自コマンド運用のときだけコマンド名を添える。何を見て ❌／✅ になったのかが分からないと
+    // 「claude は入っているのに ❌ になる」「自分の設定が見られているのか分からない」と混乱するため。
+    // 既定の claude しか使っていない大多数には、余計な情報を出さない。
+    current: claudeOk
+      ? (usesDefaultClaudeCommand ? claudeVersion : `${claudeVersion}（コマンド: ${claudeCommandLabel}）`)
+      : `未導入（コマンド: ${claudeCommandLabel}）`,
+    // 独自コマンドが見つからないときに「npm install -g @anthropic-ai/claude-code してください」を
+    // 先頭に置くと、それを実行しても生えるのは claude で、設定した独自コマンドは直らない。
+    // 一番効く行動（PATH 確認 → 設定値の見直し）を先に出す。
+    // 2 分岐とも「何が見つからないか → 打つ手」の型で揃える（レポート末尾の締めは
+    // 単独で読まれるので自己完結させ、重複はコマンド文字列だけに留める）。
+    hint: usesDefaultClaudeCommand
+      ? `\`claude\` コマンドが見つかりません。${CLAUDE_INSTALL_COMMAND} でインストールし、\`claude --version\` が動くことを確認してください（インストール済みなのに未導入と出る場合は、シェルを開き直して PATH を通し直してください）。`
+      : `ペイン起動に使うコマンド "${claudeCommandLabel}" が見つかりません。\`${claudeCommandLabel} --version\` が動くか確認してください。動かない場合は config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`,
+    // レポート末尾の締め（formatSetupEntryGuidance）が「Claude Code 自体が無い」と
+    // 「独自コマンドが見つからない」を区別するためのフラグ。この要件だけが持つ。
+    usesDefaultCommand: usesDefaultClaudeCommand,
+  });
 
   // 0-5 vk-agents スキル展開
   const agentsSetupOk = isVkAgentsSetup({ manifestPath, homeDir });
@@ -383,6 +511,34 @@ export function summarizeDoctor(requirements) {
 }
 
 /**
+ * 未充足時の締め（＝次にどこへ行けばよいか）の一文を組み立てる。
+ *
+ * 従来は無条件で「Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行」と
+ * 締めていたが、Claude Code 未導入で ❌ が出ている人にとっては実行不可能な指示で、
+ * この診断が救おうとしている当事者がそのまま二度目の壁にぶつかる（詰みループ）。
+ * claude が未充足のときだけ、先にインストールを促す締めへ差し替える。
+ *
+ * doctor のレポートと `up` の警告で判断と文言を一致させるため、ここを唯一の正にする。
+ * @param {ReturnType<typeof summarizeDoctor>} summary
+ * @returns {string}
+ */
+export function formatSetupEntryGuidance(summary) {
+  const claudeMissing = summary.missingRequired.find((r) => r.id === 'claude');
+  if (!claudeMissing) {
+    return 'Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行すると、対話でまとめてセットアップできます。';
+  }
+  // 独自コマンド（tmux.claudeCommand）が見つからないだけの場合、Claude Code 自体は入って
+  // いることが多く、インストールを勧めても解決しない（勧めても生えるのは claude で、
+  // 設定した独自コマンドは直らない）。設定の見直しは要件側の hint に出ているので、
+  // ここでは「その項目を解消してから」とだけ伝える。
+  // 「残りの項目」とは書かない。claude だけが未充足のときは残りが無く、setup 実行を促す
+  // 迂回になるため、どちらのケースでも成立する言い方にする。
+  return claudeMissing.usesDefaultCommand
+    ? `まず Claude Code をインストールしてください（例: ${CLAUDE_INSTALL_COMMAND}）。導入後、Claude Code でこのリポジトリを開き \`/vk-orchestrator-setup\` を実行すると、ほかに未充足の項目があれば対話でまとめて設定できます。`
+    : 'まず上記の「Claude Code コマンド導入」を解消してください。そのうえで Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行すると、ほかに未充足の項目があれば対話でまとめて設定できます。';
+}
+
+/**
  * 人間可読の診断レポート（✅/❌/⚠️ と次にやること）を組み立てる。
  * @param {ReturnType<typeof runDoctor>} requirements
  * @param {ReturnType<typeof summarizeDoctor>} [summary]
@@ -414,7 +570,7 @@ export function formatDoctorReport(requirements, summary = summarizeDoctor(requi
       lines.push(`  - ${r.label}: ${r.hint}`);
     }
     lines.push('');
-    lines.push('Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行すると、対話でまとめてセットアップできます。');
+    lines.push(formatSetupEntryGuidance(summary));
   }
 
   return lines.join('\n');

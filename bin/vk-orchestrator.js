@@ -88,13 +88,15 @@ async function resolveVkDirOrExit() {
 // up 起動時のセットアップ充足チェック（doctor ベースに一般化）。
 //
 // 従来は vk-agents 展開の有無だけを警告していたが、doctor の要件チェックリストを使い、
-// モード（queue.backend）に応じた required && !ok の項目が 1 つでもあれば
-// `/vk-orchestrator-setup` の実行を案内する。既存ユーザーの up を壊さないよう非致命（警告のみ）。
+// モード（queue.backend）に応じた required && !ok の項目が 1 つでもあれば次の行動を案内する
+// （案内先は doctor の formatSetupEntryGuidance が決める。Claude Code 未導入の人へ
+// 「Claude Code で開いて /vk-orchestrator-setup」と言うと詰みループになるため）。
+// 既存ユーザーの up を壊さないよう非致命（警告のみ）。
 //
 // 全 required が ok なら A（統合 config）に setup.completedAt を記録し、次回以降の案内を省く
 // （真実はあくまで毎回の doctor。フラグは案内スキップ用のヒントに過ぎない）。
 async function warnIfNotReady() {
-  const { runDoctor, summarizeDoctor } = await import('../src/doctor.js');
+  const { runDoctor, summarizeDoctor, formatSetupEntryGuidance } = await import('../src/doctor.js');
   let requirements;
   try {
     requirements = runDoctor();
@@ -105,10 +107,18 @@ async function warnIfNotReady() {
   const summary = summarizeDoctor(requirements);
 
   if (!summary.allRequiredOk) {
+    // 「初回セットアップが未完了」とは言わない。長く使っている人でも Node のバージョン管理
+    // ツールの入れ替え等で claude が PATH から外れればここに落ちるため、「初回」と書くと
+    // 自分の話ではないと読み飛ばされ、そのまま起動して元の詰まりが再現する。
+    // 締めの案内（/vk-orchestrator-setup へ誘導するか、先に Claude Code の導入を促すか）は
+    // doctor 側の formatSetupEntryGuidance を唯一の正とし、レポートと文言を一致させる。
     console.warn(
-      `[up] 初回セットアップが未完了です（未充足の必須項目 ${summary.missingRequired.length} 件）。\n` +
-      summary.missingRequired.map((r) => `  - ${r.label}: ${r.hint}`).join('\n') + '\n' +
-      '  Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行してください（詳細は `vk-orchestrator doctor`）。'
+      `[up] 起動に必要な項目が未充足です（${summary.missingRequired.length} 件）。このまま起動しますが、タスクは進みません。\n` +
+      // 締めの前で 1 行空ける。長い hint が折り返すと、同じインデントの締めが箇条書きの
+      // 続きに見えて階層が潰れるため（doctor のレポートは空行で切っている）。
+      summary.missingRequired.map((r) => `  - ${r.label}: ${r.hint}`).join('\n') + '\n\n' +
+      `  ${formatSetupEntryGuidance(summary)}\n` +
+      '  詳細は `vk-orchestrator doctor` で確認できます。'
     );
     return;
   }
