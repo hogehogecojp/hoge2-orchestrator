@@ -15,7 +15,13 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 import { tmpdir } from 'os';
-import { runDoctor, summarizeDoctor, formatDoctorReport } from '../src/doctor.js';
+import {
+  runDoctor,
+  summarizeDoctor,
+  formatDoctorReport,
+  formatSetupEntryGuidance,
+  isLocalVkTerminalsApiHost,
+} from '../src/doctor.js';
 
 const BIN_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'vk-orchestrator.js');
 
@@ -33,6 +39,13 @@ function withDoctorEnv(
     vkTerminalsInstalled = true,
     tmuxInstalled = true,
     claudeInstalled = true,
+    // VK Terminals API の接続先。既定は手元（127.0.0.1）＝ claude 要件は必須のまま。
+    // 実 env（VK_TERMINALS_HOST）や実ファイル（~/.vk-terminals/config.json）でテストが
+    // ぶれないよう、常に明示注入する（別マシン構成の検証はこの値を差し替えて行う）。
+    vkTerminalsApiHost = '127.0.0.1',
+    // 「手元のマシン」判定に使う自マシンのアドレス一覧。実マシンの NIC 構成でテストが
+    // ぶれないよう既定を固定する（実運用では os.networkInterfaces() から集める）。
+    localMachineAddresses = ['127.0.0.1'],
     platform = 'darwin',
     nodeVersion = '20.11.0',
   } = {},
@@ -69,6 +82,8 @@ function withDoctorEnv(
       terminalsMode,
       manifestPath,
       canonicalConfigPath,
+      vkTerminalsApiHost,
+      localMachineAddresses,
       platform,
       nodeVersion,
       execFileSync: () => {
@@ -429,6 +444,272 @@ test('runDoctor: claude 導入済み・既定コマンドなら current にコ�
   withDoctorEnv({ terminalsMode: 'tmux', allowedOwners: ['vektor-inc'] }, (options) => {
     assert.equal(byId(runDoctor(options), 'claude').current, '2.0.14 (Claude Code)');
   });
+});
+
+// --- VK Terminals API の接続先が別マシンのときの claude 要件（issue #249）---
+
+test('isLocalVkTerminalsApiHost: ループバック・全アドレス束縛・判定不能な値は手元へ倒す', () => {
+  const localAddresses = ['127.0.0.1', '100.64.0.2'];
+  const localHosts = [
+    '127.0.0.1', 'localhost', 'LOCALHOST', '::1', '[::1]', // ループバック
+    '127.0.1.1', '::ffff:127.0.0.1', // 127.0.0.0/8 と IPv4 射影ループバック
+    '0.0.0.0', '::', // 全アドレス束縛（どの NIC で受けても手元のプロセス）
+    '', '  ', undefined, null, // 未設定・解決失敗
+    '127.0.0.1\u0000', '192.0.2.10\n  ✅ 偽の要件行', // ホストとして妥当でない＝判定不能
+    '100.64.0.2', // 自マシンのアドレス（Tailscale IP をそのまま書く運用）
+  ];
+  for (const host of localHosts) {
+    assert.equal(isLocalVkTerminalsApiHost(host, localAddresses), true, `${String(host)} は手元扱い`);
+  }
+  for (const host of ['100.64.0.3', '192.0.2.10', 'mac-mini.local', 'example.tailnet.ts.net']) {
+    assert.equal(isLocalVkTerminalsApiHost(host, localAddresses), false, `${host} は別マシン扱い`);
+  }
+});
+
+test('runDoctor: apiHost が自マシンのアドレスなら claude は必須のまま（fail-open 回避）', () => {
+  // tailscale serve 経由でモバイルから確認する運用では、apiHost に自分の Tailscale IP や
+  // LAN IP を書く。ペインは手元で開くので claude は手元に必要。ループバック表記だけを
+  // 見て「別マシン」と判定すると、#247 が救おうとした「claude が無くてタスクが進まない
+  // のに何も案内されない」状態がそのまま再発する。engine 側（resolveTaskPaneCwd）と
+  // 同じ isLocalMachineHost() を使い、判定を 1 か所に寄せること。
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.2',
+      localMachineAddresses: ['127.0.0.1', '100.64.0.2'],
+      claudeInstalled: false,
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      const claude = byId(reqs, 'claude');
+      assert.equal(claude.required, true);
+      assert.equal(claude.current, '未導入（コマンド: claude）');
+      assert.ok(summarizeDoctor(reqs).missingRequired.map((r) => r.id).includes('claude'));
+    },
+  );
+});
+
+test('runDoctor: 全アドレス束縛・127.0.0.0/8・判定不能な apiHost は必須のまま（安全側）', () => {
+  // 「手元かどうか判断できない」ときに任意へ倒すと案内が消えて詰みが再発するので、
+  // 迷ったら従来どおり必須にする。
+  for (const host of ['0.0.0.0', '::', '127.0.1.1', '::ffff:127.0.0.1', '127.0.0.1\u0000']) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'vk-terminals',
+        vkTerminalsApiHost: host,
+        claudeInstalled: false,
+        queueBackend: 'local',
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        assert.equal(
+          byId(runDoctor(options), 'claude').required,
+          true,
+          `${JSON.stringify(host)} は手元扱いで必須のままにすること`,
+        );
+      },
+    );
+  }
+});
+
+test('runDoctor: vk-terminals モード＋別マシン接続なら claude は任意（⚠️）になる（issue #249）', () => {
+  // ペインは接続先マシンで開くため、手元に claude が無くてもタスクは進む。
+  // 従来はここが常に必須で、解消しようのない ❌ が出続けていた。
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.2',
+      claudeInstalled: false,
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      const claude = byId(reqs, 'claude');
+      assert.equal(claude.required, false);
+      assert.equal(claude.ok, false);
+      // レポート本体には label と current しか出ないので、current だけで理由が分かること。
+      assert.match(claude.current, /接続先/);
+      assert.match(claude.current, /100\.64\.0\.2/);
+      // hint は「接続先マシンに入っていれば足りる」ことを伝えること。
+      assert.match(claude.hint, /接続先/);
+      assert.match(claude.hint, /100\.64\.0\.2/);
+
+      const summary = summarizeDoctor(reqs);
+      assert.ok(!summary.missingRequired.map((r) => r.id).includes('claude'));
+      assert.equal(summary.allRequiredOk, true);
+
+      // レポートでも ⚠️（任意）として出て、未充足の必須項目としては数えないこと。
+      const report = formatDoctorReport(reqs);
+      assert.match(report, /⚠️ Claude Code コマンド導入（任意）/);
+      assert.doesNotMatch(report, /まず Claude Code をインストールしてください/);
+    },
+  );
+});
+
+test('runDoctor: vk-terminals モードでも接続先が手元なら claude は従来どおり必須', () => {
+  for (const host of ['127.0.0.1', 'localhost', '::1']) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'vk-terminals',
+        vkTerminalsApiHost: host,
+        claudeInstalled: false,
+        queueBackend: 'local',
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const reqs = runDoctor(options);
+        const claude = byId(reqs, 'claude');
+        assert.equal(claude.required, true, `${host} は手元扱いで必須のままにすること`);
+        assert.equal(claude.current, '未導入（コマンド: claude）');
+        assert.ok(summarizeDoctor(reqs).missingRequired.map((r) => r.id).includes('claude'));
+      },
+    );
+  }
+});
+
+test('runDoctor: tmux モードは接続先が別マシンでも claude は必須のまま', () => {
+  // tmux モードのペインは手元のマシンで開くので、VK Terminals API の接続先は無関係。
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      vkTerminalsApiHost: '100.64.0.2',
+      claudeInstalled: false,
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      const claude = byId(reqs, 'claude');
+      assert.equal(claude.required, true);
+      assert.equal(claude.ok, false);
+      assert.match(claude.hint, /^`claude` コマンドが見つかりません。/);
+      assert.ok(summarizeDoctor(reqs).missingRequired.map((r) => r.id).includes('claude'));
+    },
+  );
+});
+
+test('runDoctor: 別マシン接続でも claude が見つかれば従来どおり ✅（余計な注記を足さない）', () => {
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.2',
+      claudeInstalled: true,
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.ok, true);
+      assert.equal(claude.current, '2.0.14 (Claude Code)');
+    },
+  );
+});
+
+test('runDoctor: 接続先ホストは resolveVkTerminalsApiHost から解決する', () => {
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', claudeInstalled: false, queueBackend: 'local', allowedOwners: ['vektor-inc'] },
+    (options) => {
+      // 値の直接注入ではなく、解決関数の差し替えでも効くこと（実運用の経路）。
+      delete options.vkTerminalsApiHost;
+      options.resolveVkTerminalsApiHost = () => '192.0.2.10';
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.required, false);
+      assert.match(claude.current, /192\.0\.2\.10/);
+    },
+  );
+});
+
+test('runDoctor: 接続先ホストの解決が例外でも落ちず、従来どおり必須へ倒す（安全側）', () => {
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', claudeInstalled: false, queueBackend: 'local', allowedOwners: ['vektor-inc'] },
+    (options) => {
+      delete options.vkTerminalsApiHost;
+      options.resolveVkTerminalsApiHost = () => {
+        throw new Error('~/.vk-terminals/config.json is broken');
+      };
+      let reqs;
+      assert.doesNotThrow(() => {
+        reqs = runDoctor(options);
+      });
+      assert.equal(byId(reqs, 'claude').required, true);
+    },
+  );
+});
+
+test('runDoctor: 接続先ホストが制御文字入りなら必須のまま・レポート行も壊さない', () => {
+  // ホストとして妥当でない値は「手元かどうか判断できない」ので必須へ倒す（安全側）。
+  // そのうえで、値が current / hint に出ても偽の要件行を混ぜ込めないこと。
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', claudeInstalled: false, queueBackend: 'local', allowedOwners: ['vektor-inc'] },
+    (options) => {
+      options.vkTerminalsApiHost = '100.64.0.2\n  ✅ 偽の要件行（必須） … なりすまし';
+      const reqs = runDoctor(options);
+      assert.equal(byId(reqs, 'claude').required, true);
+      assert.doesNotMatch(formatDoctorReport(reqs), /偽の要件行/);
+    },
+  );
+});
+
+test('formatDoctorReport: 別マシン構成で claude が無いとき、締めが「手元で開いて実行」と矛盾しない', () => {
+  // 「ペインは接続先で開く（手元は任意）」と表示した数行後に「手元の Claude Code で開いて
+  // /vk-orchestrator-setup を実行」と締めると読み手が矛盾で止まる。claude が任意へ落ちると
+  // missingRequired から消えるため、締めの判定は missingRequired ではなく claude の ok を見る。
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.2',
+      claudeInstalled: false,
+      // 他に未充足の必須項目を作る（allowed_owners 未設定）。
+      queueBackend: 'local',
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      const summary = summarizeDoctor(reqs);
+      assert.equal(byId(reqs, 'claude').required, false);
+      assert.ok(!summary.allRequiredOk, '前提: 他に未充足の必須項目があること');
+
+      const report = formatDoctorReport(reqs);
+      // 従来の締め（手元で開いて実行）をそのまま出さないこと。
+      assert.doesNotMatch(report, /Claude Code でこのリポジトリを開き/);
+      assert.doesNotMatch(report, /まず Claude Code をインストールしてください/);
+      // 対話セットアップだけは手元で走ることと、入れない場合の逃げ道を示すこと。
+      assert.match(report, /`\/vk-orchestrator-setup` は手元の Claude Code で実行します/);
+      assert.match(report, /config\.json に直接記入/);
+    },
+  );
+});
+
+test('formatSetupEntryGuidance: requirements 省略時は従来動作（後方互換）', () => {
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', vkTerminalsApiHost: '100.64.0.2', claudeInstalled: false, queueBackend: 'local' },
+    (options) => {
+      const summary = summarizeDoctor(runDoctor(options));
+      // 第2引数なし＝ missingRequired だけを見るので、任意の claude は判定に入らない。
+      assert.match(
+        formatSetupEntryGuidance(summary),
+        /Claude Code でこのリポジトリを開き/,
+      );
+    },
+  );
+});
+
+test('formatDoctorReport: 別マシン構成でも claude が入っていれば従来の締めに戻る', () => {
+  withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.2',
+      claudeInstalled: true,
+      queueBackend: 'local',
+    },
+    (options) => {
+      const report = formatDoctorReport(runDoctor(options));
+      assert.match(report, /Claude Code でこのリポジトリを開き `\/vk-orchestrator-setup` を実行すると/);
+      assert.doesNotMatch(report, /は手元の Claude Code で実行します/);
+    },
+  );
 });
 
 test('formatDoctorReport: claude 未充足なら /vk-orchestrator-setup ではなく先に導入を促す（詰みループ回避）', () => {

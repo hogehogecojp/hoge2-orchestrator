@@ -117,7 +117,9 @@ async function warnIfNotReady() {
       // 締めの前で 1 行空ける。長い hint が折り返すと、同じインデントの締めが箇条書きの
       // 続きに見えて階層が潰れるため（doctor のレポートは空行で切っている）。
       summary.missingRequired.map((r) => `  - ${r.label}: ${r.hint}`).join('\n') + '\n\n' +
-      `  ${formatSetupEntryGuidance(summary)}\n` +
+      // doctor のレポートと同じく requirements も渡す（別マシン構成では claude が任意に
+      // 落ちて missingRequired に入らず、summary だけでは締めの分岐を選べないため）。
+      `  ${formatSetupEntryGuidance(summary, requirements)}\n` +
       '  詳細は `vk-orchestrator doctor` で確認できます。'
     );
     return;

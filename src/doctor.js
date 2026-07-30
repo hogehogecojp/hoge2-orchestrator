@@ -23,6 +23,13 @@
 //   - tmux モード: GUI を一切起動しないので VK Terminals 導入は任意（required: false）。
 //                  代わりに tmux コマンドの導入を required にし、platform は GUI 非依存の
 //                  文言（コンテナ環境でも可）に差し替える。
+//
+// さらに vk-terminals モードでは、VK Terminals API の接続先（apiHost）が手元のマシンか
+// どうかで Claude Code 要件の required が変わる。接続先が別マシンならペインはそのマシンで
+// 開くので、手元に claude が無くてもタスクは進む（required: false ＝ ⚠️）。手元を指している
+// とき（ループバックのほか、自マシンのアドレスを書いている場合を含む）は従来どおり必須。
+// 判定は engine と同じ isLocalMachineHost() に寄せ、判断できない値は必須側へ倒す。
+// tmux モードは常に手元で claude を起動するため、接続先の設定に関わらず required: true。
 
 import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
@@ -32,6 +39,7 @@ import {
   loadUnifiedConfig,
   getQueueBackend,
   resolveVkTerminalsDir as realResolveVkTerminalsDir,
+  resolveVkTerminalsApiHost as realResolveVkTerminalsApiHost,
   resolveTerminalsMode,
   resolveTmuxClaudeCommand,
   isVkAgentsSetup,
@@ -44,6 +52,10 @@ import {
 // 制御文字の除去は build-command.js の stripControlChars に集約している（DRY）。
 // terminals/index.js と同じ出所を使い、文字クラスを 3 箇所目に複製しない。
 import { stripControlChars } from './engine/build-command.js';
+// 「接続先が手元のマシンか」の判定は engine（resolveTaskPaneCwd）と同じ実装を使う。
+// 同じ apiHost を engine は「自分のマシン」、doctor は「別マシン」と読む状態を作らない。
+// os にしか依存しない小さなモジュールなので doctor から直接使える。
+import { isLocalMachineHost, normalizeHostForLocalComparison } from './engine/local-machine-host.js';
 import { evaluateAgentsVersionState } from './engine/agents-redeploy.js';
 import { formatAgentsVersionRequirement } from './engine/update-messages.js';
 
@@ -197,6 +209,49 @@ function realResolveClaudeVersion(command) {
 }
 
 /**
+ * ホスト名／IP として妥当な文字だけで構成されているか。
+ *
+ * 正規化後に許すのは英数字と `.` `-` `_` `:`（IPv6）だけ。制御文字や空白が混じった値は
+ * 「ホストとして解釈できない＝手元かどうか判断できない」ものとして扱う。
+ */
+const VALID_HOST_PATTERN = /^[a-z0-9._:-]+$/;
+
+/** 全アドレス束縛の表記（どの NIC で受けても待ち受けているのは手元のプロセス）。 */
+const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::']);
+
+/** 127.0.0.0/8（127.0.1.1 など）と IPv4 射影表記の ::ffff:127.x.x.x。 */
+const LOOPBACK_V4_PATTERN = /^(?:::ffff:)?127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/**
+ * VK Terminals API の接続先が手元のマシンかを判定する（純関数）。
+ *
+ * ループバックと自マシンのアドレス照合は engine と共通の isLocalMachineHost() に委ねる。
+ * apiHost に自分の Tailscale IP / LAN IP を書く運用（tailscale serve でモバイルから確認する
+ * 構成）があるため、ループバック表記だけを見て別マシンと判定してはいけない。そこを誤ると
+ * ペインは手元で開くのに claude 要件が任意へ落ち、「claude が無くてタスクが進まないのに
+ * 何も案内されない」状態（issue #247）が再発する。
+ *
+ * **判断できない値はすべて「手元」へ倒す**（＝従来どおり必須のまま）。任意へ倒すと案内が
+ * 消えて詰みが再発するのに対し、必須へ倒しても出るのは従来どおりの案内だけで済むため。
+ * - 空文字（未設定・解決失敗）※ isLocalMachineHost('') は false を返す仕様なのでここで拾う
+ * - 全アドレス束縛（0.0.0.0 / ::）
+ * - 127.0.0.0/8 と ::ffff:127.x.x.x（isLocalMachineHost は 127.0.0.1 のみをループバック扱い）
+ * - ホストとして妥当でない文字を含む値（制御文字混入など）
+ * @param {*} host resolveVkTerminalsApiHost() の戻り値
+ * @param {string[]} [localAddresses] 自マシンのアドレス一覧（省略時は os から収集）
+ * @returns {boolean} 手元のマシンを指していれば true
+ */
+export function isLocalVkTerminalsApiHost(host, localAddresses) {
+  const normalized = normalizeHostForLocalComparison(host);
+  if (normalized === '') return true;
+  if (!VALID_HOST_PATTERN.test(normalized)) return true;
+  if (WILDCARD_BIND_HOSTS.has(normalized)) return true;
+  if (LOOPBACK_V4_PATTERN.test(normalized)) return true;
+  // localAddresses が undefined のときは isLocalMachineHost 側の既定（os から収集）に任せる。
+  return isLocalMachineHost(normalized, localAddresses);
+}
+
+/**
  * doctor が導入確認に使う Claude Code の実行ファイル名を決める。
  *
  * 実際にペインで起動されるコマンドと同じものを検査しないと、独自コマンド運用の環境で
@@ -239,6 +294,9 @@ function resolveClaudeCommandName(tmuxMode, cfg) {
  *   canonicalConfigPath?: string,
  *   execFileSync?: Function,
  *   resolveVkTerminalsDir?: () => string,
+ *   resolveVkTerminalsApiHost?: (options?: object) => string,
+ *   vkTerminalsApiHost?: string,
+ *   localMachineAddresses?: string[],
  *   resolveTmuxVersion?: () => string,
  *   resolveClaudeVersion?: (command: string) => string,
  *   platform?: string,
@@ -265,6 +323,7 @@ export function runDoctor(options = {}) {
   const resolveVkTerminals = options.resolveVkTerminalsDir ?? realResolveVkTerminalsDir;
   const resolveTmuxVersion = options.resolveTmuxVersion ?? realResolveTmuxVersion;
   const resolveClaudeVersion = options.resolveClaudeVersion ?? realResolveClaudeVersion;
+  const resolveApiHost = options.resolveVkTerminalsApiHost ?? realResolveVkTerminalsApiHost;
 
   const requirements = [];
 
@@ -360,14 +419,60 @@ export function runDoctor(options = {}) {
     });
   }
 
-  // Claude Code コマンド導入（両モードで必須）
+  // Claude Code コマンド導入（手元でペインを開く構成では必須）
   //
   // オーケストレーターの中核は「ペインで Claude Code を起動して作業させる」ことなので、
   // claude コマンドが無いとペインは開いても即終了し、タスクが一切進まない。それにも関わらず
   // 従来はこの要件自体が無く、doctor も `up` も何も案内しないまま詰んでいた（issue #247）。
   //
+  // ただし vk-terminals モードで VK Terminals API の接続先が別マシンの場合、ペインは
+  // 接続先マシンで開くため、claude が必要なのは接続先であって手元ではない。従来はここを
+  // 常に required にしていたので、その構成では解消しようのない ❌ が出続け、`up` でも毎回
+  // 「未充足の項目があります」と警告された（issue #249）。接続先が手元以外なら任意にする。
+  // 「手元」には自マシンのアドレス（apiHost に自分の Tailscale IP / LAN IP を書く運用）も
+  // 含む。ここを取りこぼすと、ペインは手元で開くのに案内が消える（#247 の詰みが再発する）。
+  //
+  // tmux モードは接続先ホストに関係なく手元で claude を起動するので、常に必須のままにする。
+  //
   // 自動インストールはしない。doctor は副作用の無いローカル高速判定に限定し、外部依存
   // （Node.js / tmux / gh など）はすべて「検知して hint で案内」に統一しているため。
+  //
+  // ホスト解決は env / 外部ファイル（~/.vk-terminals/config.json）由来なので、例外が出ても
+  // doctor 全体を落とさない。失敗時は「手元」に倒し、従来どおり必須として扱う（安全側）。
+  let vkTerminalsApiHost = '';
+  if (options.vkTerminalsApiHost !== undefined) {
+    vkTerminalsApiHost = String(options.vkTerminalsApiHost ?? '');
+  } else {
+    try {
+      vkTerminalsApiHost = String(resolveApiHost({ homeDir }) ?? '');
+    } catch {
+      vkTerminalsApiHost = '';
+    }
+  }
+  // 接続先の表示は sanitizeReportValue（先頭行・長さ制限）を使う。sanitizeReportValue の
+  // JSDoc は「設定ファイル由来の値には使わない」としているが、それは許可オーナー一覧のように
+  // 長くなるのが正常な値を切ると別の混乱を生むため。apiHost は "100.64.0.2" のような 1 行の
+  // ホスト名／IP で 64 文字を超えるのは異常値なので、ここは切ってでも 1 行に収める方を選ぶ
+  // （長大な値でレポート 1 行が伸びるのを防ぐ）。合否判定には生の値を使う。
+  const apiHostLabel = sanitizeReportValue(vkTerminalsApiHost);
+  let claudeRunsOnRemoteHost = false;
+  if (!tmuxMode) {
+    try {
+      claudeRunsOnRemoteHost = !isLocalVkTerminalsApiHost(vkTerminalsApiHost, options.localMachineAddresses);
+    } catch {
+      // 自マシンのアドレス収集（os.networkInterfaces）で落ちても doctor 全体は止めない。
+      // 判断できないので手元扱い＝従来どおり必須へ倒す（安全側）。
+      claudeRunsOnRemoteHost = false;
+    }
+  }
+  // 制御文字だけの値など、整形後に空になっても文言が「接続先 () のマシン」と壊れないようにする。
+  const remoteHostText = apiHostLabel ? `接続先（${apiHostLabel}）` : '接続先';
+  // ⚠️（任意）の行は未充足リストに出ないので hint はレポート本体に一度も現れない。
+  // 「どこに Claude Code が必要か」は current 側で言い切る。「手元では不要」とは書かない
+  // （ペイン起動には不要でも、/vk-orchestrator-setup を手元で回すには要るため）。
+  const remoteClaudeCurrent = apiHostLabel
+    ? `手元は未導入（ペインは接続先 ${apiHostLabel} で開くため接続先側に必要）`
+    : '手元は未導入（ペインは接続先マシンで開くため、必要なのは接続先側）';
   const claudeCommand = resolveClaudeCommandName(tmuxMode, cfg);
   // 検査対象は実行に渡すため切り詰めていないので、レポートへ載せるときだけ 1 行・長さ制限へ整える。
   const claudeCommandLabel = sanitizeReportValue(claudeCommand);
@@ -386,23 +491,35 @@ export function runDoctor(options = {}) {
     id: 'claude',
     group: '前提',
     label: 'Claude Code コマンド導入',
-    required: true,
+    required: !claudeRunsOnRemoteHost,
     target: 'external',
     ok: claudeOk,
     // 独自コマンド運用のときだけコマンド名を添える。何を見て ❌／✅ になったのかが分からないと
     // 「claude は入っているのに ❌ になる」「自分の設定が見られているのか分からない」と混乱するため。
     // 既定の claude しか使っていない大多数には、余計な情報を出さない。
+    //
+    // 別マシン構成で未導入のときは、レポート本体（label と current しか出ない）だけを見ても
+    // 「なぜ ⚠️ 止まりなのか」が分かるよう、current に理由を添える。⚠️ の行は未充足リストに
+    // 出ないため、hint はレポート本体には現れない。
+    // 見つかった場合は素直に ✅（手元にも入っている、以上の意味は持たせない）。
     current: claudeOk
       ? (usesDefaultClaudeCommand ? claudeVersion : `${claudeVersion}（コマンド: ${claudeCommandLabel}）`)
-      : `未導入（コマンド: ${claudeCommandLabel}）`,
+      : claudeRunsOnRemoteHost
+        ? remoteClaudeCurrent
+        : `未導入（コマンド: ${claudeCommandLabel}）`,
     // 独自コマンドが見つからないときに「npm install -g @anthropic-ai/claude-code してください」を
     // 先頭に置くと、それを実行しても生えるのは claude で、設定した独自コマンドは直らない。
     // 一番効く行動（PATH 確認 → 設定値の見直し）を先に出す。
     // 2 分岐とも「何が見つからないか → 打つ手」の型で揃える（レポート末尾の締めは
     // 単独で読まれるので自己完結させ、重複はコマンド文字列だけに留める）。
-    hint: usesDefaultClaudeCommand
-      ? `\`claude\` コマンドが見つかりません。${CLAUDE_INSTALL_COMMAND} でインストールし、\`claude --version\` が動くことを確認してください（インストール済みなのに未導入と出る場合は、シェルを開き直して PATH を通し直してください）。`
-      : `ペイン起動に使うコマンド "${claudeCommandLabel}" が見つかりません。\`${claudeCommandLabel} --version\` が動くか確認してください。動かない場合は config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`,
+    //
+    // 別マシン構成では「手元に入れろ」と言わない。ペインが開くのは接続先マシンなので、
+    // 手元にインストールしても元の詰まり（接続先に claude が無い）は直らない。
+    hint: claudeRunsOnRemoteHost
+      ? `ペインは VK Terminals API の${remoteHostText}のマシンで開くため、Claude Code は接続先マシンに入っていれば足ります（手元は任意）。タスクが進まない場合は、接続先マシンで \`claude --version\` が動くかを確認してください。手元にも Claude Code が要るのは、\`/vk-orchestrator-setup\` を手元で実行する場合です。その場合は ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`
+      : usesDefaultClaudeCommand
+        ? `\`claude\` コマンドが見つかりません。${CLAUDE_INSTALL_COMMAND} でインストールし、\`claude --version\` が動くことを確認してください（インストール済みなのに未導入と出る場合は、シェルを開き直して PATH を通し直してください）。`
+        : `ペイン起動に使うコマンド "${claudeCommandLabel}" が見つかりません。\`${claudeCommandLabel} --version\` が動くか確認してください。動かない場合は config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`,
     // レポート末尾の締め（formatSetupEntryGuidance）が「Claude Code 自体が無い」と
     // 「独自コマンドが見つからない」を区別するためのフラグ。この要件だけが持つ。
     usesDefaultCommand: usesDefaultClaudeCommand,
@@ -585,14 +702,29 @@ export function summarizeDoctor(requirements) {
  * この診断が救おうとしている当事者がそのまま二度目の壁にぶつかる（詰みループ）。
  * claude が未充足のときだけ、先にインストールを促す締めへ差し替える。
  *
+ * **判定は summary.missingRequired ではなく claude 要件の ok を見る。** 別マシン構成では
+ * claude が required: false になって missingRequired から消えるため、missingRequired だけを
+ * 見ると「手元では不要」と表示した数行後に「手元の Claude Code で開いて実行してください」と
+ * 締めてしまう（issue #249 の対応で生まれた矛盾）。その構成では、対話セットアップにだけは
+ * 手元の Claude Code が要ることと、入れない場合の逃げ道（config.json の直接編集）を示す。
+ *
  * doctor のレポートと `up` の警告で判断と文言を一致させるため、ここを唯一の正にする。
  * @param {ReturnType<typeof summarizeDoctor>} summary
+ * @param {ReturnType<typeof runDoctor>} [requirements] 要件配列。省略すると
+ *   summary.missingRequired だけを見る従来動作（任意扱いの claude は判定に入らない）。
  * @returns {string}
  */
-export function formatSetupEntryGuidance(summary) {
-  const claudeMissing = summary.missingRequired.find((r) => r.id === 'claude');
+export function formatSetupEntryGuidance(summary, requirements) {
+  const claude = (requirements ?? summary.missingRequired).find((r) => r.id === 'claude');
+  const claudeMissing = claude && !claude.ok ? claude : null;
   if (!claudeMissing) {
     return 'Claude Code でこのリポジトリを開き `/vk-orchestrator-setup` を実行すると、対話でまとめてセットアップできます。';
+  }
+  // 別マシン構成（claude は任意）。ペイン起動には手元の claude は要らないので
+  // 「まずインストールを」とは言わない。ただし対話セットアップは手元で走るため、
+  // 手元に入れない人が詰まらないよう config.json を直接書く道も併記する。
+  if (claudeMissing.required === false) {
+    return '`/vk-orchestrator-setup` は手元の Claude Code で実行します（ペイン起動には手元の Claude Code は要りませんが、この対話セットアップには必要です）。手元に入れない場合は、上記の項目を config.json に直接記入してください。';
   }
   // 独自コマンド（tmux.claudeCommand）が見つからないだけの場合、Claude Code 自体は入って
   // いることが多く、インストールを勧めても解決しない（勧めても生えるのは claude で、
@@ -637,7 +769,9 @@ export function formatDoctorReport(requirements, summary = summarizeDoctor(requi
       lines.push(`  - ${r.label}: ${r.hint}`);
     }
     lines.push('');
-    lines.push(formatSetupEntryGuidance(summary));
+    // requirements も渡す。任意（⚠️）に落ちた claude は missingRequired に入らないため、
+    // summary だけでは別マシン構成の締めを選べない。
+    lines.push(formatSetupEntryGuidance(summary, requirements));
   }
 
   return lines.join('\n');

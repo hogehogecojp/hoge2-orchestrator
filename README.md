@@ -26,7 +26,7 @@ VK Terminals                     … 実際に Claude を動かす実行面
 - **Node.js 20 以上**
 - **タスク登録リポジトリ（task-queue）**と、そこに設定されたステータスラベル群（`status:ready` ほか。`config.example.json` の owner/repo で指定）
 - **GitHub CLI (`gh`)** と `gh auth login` 済みの認証
-- 各ペインで動作する **Claude Code**（未導入なら `npm install -g @anthropic-ai/claude-code`）
+- 各ペインで動作する **Claude Code**（未導入なら `npm install -g @anthropic-ai/claude-code`）。必要なのは**ペインが開くマシン**です（接続先が別マシンの構成での扱いは「[起動](#起動)」を参照）
 
 不足しているものは `npx vk-orchestrator doctor` で確認できます（`npm start` の起動時にも自動で確認し、不足があれば案内します）。
 
@@ -236,7 +236,16 @@ npx vk-orchestrator up       # config.json を反映 → GUI 起動 → API 疎�
 # npm start でも同じ（start スクリプトは up に割り当て済み）
 ```
 
-`up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、`/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。ただし Claude Code 自体が未導入の場合は、`/vk-orchestrator-setup` を実行できないため先に Claude Code の導入を案内します。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
+`up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、`/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。ただし Claude Code 自体が未導入の場合は、`/vk-orchestrator-setup` をそのまま実行できないため案内内容を切り替えます。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
+
+Claude Code の要件は、**ペインがどのマシンで開くか**で必須（❌）／任意（⚠️）が切り替わります。判定に使うのは VK Terminals API の接続先（`~/.vk-terminals/config.json` の `apiHost` または `VK_TERMINALS_HOST`）です。
+
+- **任意（⚠️）** — 接続先が手元以外のマシンのとき。ペインは接続先マシンで開くので、Claude Code は接続先に入っていれば足ります。
+- **必須（❌）** — 接続先が手元のマシンのとき。ループバック（`127.0.0.1` / `localhost` / `::1`）、自分のマシンのアドレス（tailscale serve 用に自分の Tailscale IP を書いている場合など）、全アドレス束縛（`0.0.0.0` / `::`）が該当します。
+- **必須（❌）** — 接続先がホストとして判定できない値のとき（安全側に倒して案内を出します）。
+- **必須（❌）** — tmux モードのとき。**接続先の設定に関わらず**ペインは手元で開くため、常に手元の Claude Code が要ります。
+
+> 任意（⚠️）になる構成でも、`/vk-orchestrator-setup` を手元で実行するには手元の Claude Code が必要です。手元に入れない場合は config.json を直接編集してください。
 
 `up` は VK Terminals API の起動を待ってから、**GUI の中に orchestrator 専用ペイン（Claude を起動しない素のシェル）を開いて `vk-orchestrator start` を自動実行**します。ペイン上部には「オーケストレーター」というタイトルが立つので他ペインと一目で区別でき、GUI を閉じればペインごと orchestrator も終了します。これで **「ペインを開いて Claude を止めて `vk-orchestrator start` を打つ」手動手順は不要**です。
 

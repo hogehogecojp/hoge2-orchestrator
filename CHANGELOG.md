@@ -1,6 +1,6 @@
 # Changelog
 
-- [ 機能追加 ] Claude Code が未導入の場合に `npm start` と `vk-orchestrator doctor` でインストール手順を案内する機能を追加。ペインで Claude Code が起動できず、何も案内されないまま作業が進まない状態を解消
+- [ 機能追加 ] Claude Code が未導入の場合に `npm start` と `vk-orchestrator doctor` でインストール手順を案内する機能を追加。ペインで Claude Code が起動できず、何も案内されないまま作業が進まない状態を解消。VK Terminals API の接続先が手元以外のマシンの構成では、ペインが接続先マシンで開くため手元の Claude Code は任意（⚠️）として扱う
 - [ 不具合修正 ] `vk-orchestrator doctor` の診断結果で、設定値に改行や制御文字が含まれていると表示が行ごと崩れ、未充足の必須項目が充足しているように読めてしまう不具合を修正
 
 = 0.26.0 =
