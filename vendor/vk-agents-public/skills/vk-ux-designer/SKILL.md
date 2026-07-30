@@ -9,7 +9,7 @@ description: "UIの設計提案・ユーザービリティレビューを行うU
 
 起動のルール（`subagent_type` / `name` の指定、待機ルール、定義未配布時のフォールバック）は `REPO_ROOT/rules/agent-launch.md` を唯一の正とします。植草は**実装前**の画面設計・ユーザビリティ・アクセシビリティを担当し、**実装後**のブラウザ動作確認・UI 照合は麗美（`vk-ui-tester`）の担当です（`REPO_ROOT/rules/agent-launch.md`「植草と麗美の境界」）。
 
-植草の人格ファイルは `REPO_ROOT/agents/personas/uekusa.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
+植草の人格ファイルは `REPO_ROOT/vk-agents-personas/uekusa.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
 
 ## 手順
 

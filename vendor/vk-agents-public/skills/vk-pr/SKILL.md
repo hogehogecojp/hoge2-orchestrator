@@ -15,7 +15,7 @@ description: "PR ルールに従い、コミット・changelog 記載・確認�
   - サブエージェントが長時間ループを抱えると指摘を見落としやすいため、PR 作成後は監視を司に引き渡す
   - `rules/coderabbit-monitoring.md`「前提条件」でスキップ判定になる環境では呼び出し元も監視しない。この場合、ハンドオフ文言は、CodeRabbit 未導入なら「CodeRabbit 連携は無効化されています。Claude Code の `/code-review` 等でのレビューをご検討ください」、ignore 指定なら「PR 本文に `@coderabbitai ignore` を記載済みのため、CodeRabbit 監視はスキップ対象です」に読み替える
 
-単発で `/vk-pr` だけ呼ばれた場合（司を経由しない場合）は、PR 作成完了後に「PR を作成しました。CodeRabbit 監視は別途必要な場合にお伝えください」と案内して終了する。`rules/coderabbit-monitoring.md`「前提条件」でスキップ判定になる場合は、CodeRabbit 未導入なら「CodeRabbit 連携は無効化されています。必要であれば `/code-review` 等でのレビューをご検討ください」、ignore 指定なら「PR 本文に `@coderabbitai ignore` を記載済みのため、CodeRabbit 監視はスキップ対象です」と案内する。
+単発で `/vk-pr` だけ呼ばれた場合（呼び出し元スキルを経由しない場合）は、PR 作成完了後に「PR を作成しました。CodeRabbit 監視は別途必要な場合にお伝えください」と案内して終了する。`rules/coderabbit-monitoring.md`「前提条件」でスキップ判定になる場合は、CodeRabbit 未導入なら「CodeRabbit 連携は無効化されています。必要であれば `/code-review` 等でのレビューをご検討ください」、ignore 指定なら「PR 本文に `@coderabbitai ignore` を記載済みのため、CodeRabbit 監視はスキップ対象です」と案内する。
 
 ## 手順
 
@@ -75,9 +75,10 @@ PR 作成後、ハンドオフ前に、対応する元 issue が判明してい�
 
 ### 5. ハンドオフ
 
-PR 作成およびタイトル・本文セルフチェック完了後:
+PR 作成およびタイトル・本文セルフチェック完了後、**呼ばれ方によってこの先の動きを変える**:
 
-- 呼び出し元（司）から呼ばれた場合: **PR URL を司に渡して終了する**。監視開始時刻 `START` の取得は司側の責務（PR の `createdAt` を `gh pr view --json createdAt` で取得する方式）。サブエージェント側で `date -u` を打つと、PR 作成 → CodeRabbit 即応答 → サブエージェント完了通知 → 司が受領 の順序競合で取り逃すため、和田は `START` 取得をしない（責務の詳細は `rules/coderabbit-monitoring.md` 参照）
-- 単発で呼ばれた場合: ユーザーに「PR を作成しました。CodeRabbit 監視は別途必要な場合にお伝えください」と伝えて終了する。`rules/coderabbit-monitoring.md`「前提条件」でスキップ判定になる場合は、上記の責務範囲にある読み替え文言で案内する
+- **呼び出し元スキル（`/vk-kore` 等）から `Skill` ツールで呼ばれた場合**: PR URL を控えたうえで、**ここでターンを閉じず、呼び出し元スキルの次のステップへそのまま戻って続行する**。`/vk-kore` から呼ばれた場合の戻り先は **4-5b（CodeRabbit レビュー監視）** で、そこから 4-6 以降・結果報告まで続ける。**「PR を作成しました」という報告で終わりにしない**（ここで終えると呼び出し元の残り工程が実行されないまま止まる。この書き分けの共通ルールは `rules/vk-agents-structure.md`「子スキルは呼び出し元スキルのフローを終わらせない」を参照）
+  - 監視開始時刻 `START`（CodeRabbit の指摘を拾い始める基準時刻）の取得は呼び出し元（司）側の責務で、PR の作成時刻を `gh pr view --json createdAt` で取得する方式をとる。このスキル側で `date -u`（現在時刻）を `START` にすると、PR 作成 → CodeRabbit が即座に反応 → このスキルの完了 → 呼び出し元が受け取る の順序が競合し、受け取るまでの間に届いた指摘を取り逃すため、このスキル側では `START` を取得しない（責務の詳細は `rules/coderabbit-monitoring.md` 参照）
+- **単発で呼ばれた場合（呼び出し元スキルを経由しない場合）**: ユーザーに「PR を作成しました。CodeRabbit 監視は別途必要な場合にお伝えください」と伝えて終了する。`rules/coderabbit-monitoring.md`「前提条件」でスキップ判定になる場合は、上記の責務範囲にある読み替え文言で案内する
 
 マージはユーザーが判断するため、自動でマージしないこと。

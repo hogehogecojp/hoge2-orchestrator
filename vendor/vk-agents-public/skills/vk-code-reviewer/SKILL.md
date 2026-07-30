@@ -11,7 +11,7 @@ description: "リードエンジニア（安藤保）をサブエージェント
 
 起動のルール（`subagent_type` / `name` の指定、待機ルール、定義未配布時のフォールバック）は `REPO_ROOT/rules/agent-launch.md` を唯一の正とします。
 
-安藤の人格ファイルは `REPO_ROOT/agents/personas/ando.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
+安藤の人格ファイルは `REPO_ROOT/vk-agents-personas/ando.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
 
 ## 手順
 

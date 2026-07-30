@@ -7,9 +7,9 @@ description: "WordPressエンジニア（和田）をサブエージェントと
 
 和田（WordPressエンジニア）をサブエージェントとして起動します。
 
-起動のルール（エンジン解決の優先順位、`subagent_type` / `name` の指定、待機ルール、定義未配布時のフォールバック、「Codex は単独作業のみ」の原則）は `REPO_ROOT/rules/agent-launch.md` を唯一の正とします。`codex exec` の共通手順は `REPO_ROOT/skills/_shared/codex-launch.md` を唯一の正とします。
+起動のルール（エンジン解決の優先順位、`subagent_type` / `name` の指定、待機ルール、定義未配布時のフォールバック、「Codex は単独作業のみ」の原則）は `REPO_ROOT/rules/agent-launch.md` を唯一の正とします。`codex exec` の共通手順は `REPO_ROOT/skills/vk-shared/codex-launch.md` を唯一の正とします。
 
-和田の人格ファイルは `REPO_ROOT/agents/personas/wada.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
+和田の人格ファイルは `REPO_ROOT/vk-agents-personas/wada.md` です（定義未配布時のフォールバックで Read する対象、および Codex 経路でプロンプトへ注入する対象）。
 
 ## 手順
 
@@ -27,11 +27,11 @@ description: "WordPressエンジニア（和田）をサブエージェントと
 
 - **単独起動では** `run_in_background: false` を指定する。実装完了報告の出力本文を受け取るまで次工程へ進まない。
 - 複数の依頼を並列で処理する場合は 1 メッセージで複数呼び出し、既定のバックグラウンド実行で並列起動する。並列時の `name` の一意化は `REPO_ROOT/rules/agent-launch.md`「name の付け方」に従う。全員分の実装完了報告の出力本文が揃うまで次工程へ進まない。
-- gh・git の確認プロンプトをスキップする必要がある文脈（`vk-kore` 等）では `mode: "bypassPermissions"` を指定する。
+- **和田自身に長時間処理の完了を待たせない。** フルビルド・依存インストール（`npm install` / `composer install`）・テストスイート全実行など、完了まで数分を超える見込みの処理は、和田が起動した時点で司へ「起動した。完了待ち」と返して一度終了させ、司が完了を検知してから `SendMessage` で和田を再開させる。`claude` サブエージェントは自分が起動したバックグラウンド処理の完了通知を受け取れず、待たせると処理が終わっても止まったままになるため（`REPO_ROOT/rules/agent-launch.md`「サブエージェントに長時間処理の完了を待たせない」）。この運用にする場合は、起動時の prompt にその旨を明記する。
 
 ## エンジン `codex` の場合（`codex exec`）
 
-手順は `REPO_ROOT/skills/_shared/codex-launch.md` に従う。和田固有の差分は以下。
+手順は `REPO_ROOT/skills/vk-shared/codex-launch.md` に従う。和田固有の差分は以下。
 
 ### ① worktree の要否
 
@@ -43,7 +43,7 @@ description: "WordPressエンジニア（和田）をサブエージェントと
 
 ### ③ 注入するルール
 
-`REPO_ROOT/agents/personas/wada.md` の「作業開始時に読み込むファイル」表がリストするルール（`rules/coding-rules.md`・`rules/common.md`・`rules/architecture-design.md`・`rules/block-deprecation.md`・`rules/design-rules.md`・`rules/css.md`・`rules/changelog.md`・`rules/testing/phpunit.md`・`rules/testing/e2e.md`）を REPO_ROOT 起点の絶対パスへ読み替えて注入する。
+`REPO_ROOT/vk-agents-personas/wada.md` の「作業開始時に読み込むファイル」表がリストするルール（`rules/coding-rules.md`・`rules/common.md`・`rules/architecture-design.md`・`rules/block-deprecation.md`・`rules/design-rules.md`・`rules/css.md`・`rules/changelog.md`・`rules/testing/phpunit.md`・`rules/testing/e2e.md`）を REPO_ROOT 起点の絶対パスへ読み替えて注入する。
 
 ### ④ 出力スキーマ
 

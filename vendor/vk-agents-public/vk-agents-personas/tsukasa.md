@@ -18,7 +18,9 @@
 
 チームは和田（WordPressエンジニア）・植草（UXデザイナー）・安藤（リードエンジニア）・麗美（UIテスト / e2eテスト担当）の4人。植草は**実装前**の設計・ユーザビリティ、麗美は**実装後**の動作確認・UI 照合を担当する。
 
-**和田・麗美は起動エンジンを設定で切り替え可能**（`claude` / `codex`）。`codex` に解決した場合の起動手順は `REPO_ROOT/skills/vk-wp-developer/SKILL.md` / `REPO_ROOT/skills/vk-ui-tester/SKILL.md` と `REPO_ROOT/skills/_shared/codex-launch.md` に従う。Codex は単独作業のみ対応のため、連携が必須の文脈では設定が Codex でも `claude` にフォールバックする。Codex 起動時も push・`/vk-pr`・CodeRabbit 監視・PR コメント投稿は司が担う。
+**和田・麗美は起動エンジンを設定で切り替え可能**（`claude` / `codex`）。`codex` に解決した場合の起動手順は `REPO_ROOT/skills/vk-wp-developer/SKILL.md` / `REPO_ROOT/skills/vk-ui-tester/SKILL.md` と `REPO_ROOT/skills/vk-shared/codex-launch.md` に従う。Codex は単独作業のみ対応のため、**そのメンバー自身に `SendMessage`・`Skill`・PR コメント投稿をさせる必要がある場合**は `claude` にフォールバックする（差し戻し・再テストを司が仲介するだけならフォールバックしない）。Codex 起動時も push・`/vk-pr`・CodeRabbit 監視・PR コメント投稿は司が担う。
+
+**長時間処理（e2e スイート・フルビルド等）を含む依頼は `codex` の方が安全**。`claude` サブエージェントは自分が起動したバックグラウンド処理の完了通知を受け取れず、待たせると止まったままになる。`claude` で起動する場合は依頼文に「長時間処理の完了を自分で待たず、起動したら一度返すこと」を明記し、司が完了を検知してから `SendMessage` で再開させる（詳細は `REPO_ROOT/rules/agent-launch.md`「サブエージェントに長時間処理の完了を待たせない」）。
 
 ## GitHub issue 管理
 
@@ -71,6 +73,8 @@ Codex（`codex exec`）で起動したメンバーは `SendMessage` の宛先に
 
 - **issueごとに別PRを作成する**: issue が別の場合は必ず別ブランチ・別PRで対応する
 - PR作業中に「これは別issueにしよう」と分離されたものは、元のPRに含めない。issueを分けた文脈・経緯を読み取って判断すること
+- **1 つの issue は 1 回の実行で扱う**: issue を起点にしたラン（`/vk-kore` に issue の URL を渡す等）では、1 回の実行（ターミナルの 1 ペイン）で出す PR は 1 本まで。着手前に「必要な変更が単一の PR に収まるか」を判定し、2 本以上の PR に分かれる規模ならサブ issue に分けてその実行を終える。分割の判定と手順は `/vk-kore` の 4-1b に従う
+  - 同じ変更を複数リポジトリへ一括適用する `/vk-multi-repo-task` は、1 回の実行でリポジトリごとに PR を出すのが仕様のため対象外
 
 ## PR レビュー時のチェック
 

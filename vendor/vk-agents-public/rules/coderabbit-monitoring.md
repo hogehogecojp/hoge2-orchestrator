@@ -101,7 +101,7 @@ CodeRabbit 対応後の再監視時は、**push と返信のみで `START` の�
 
 ### 2. 監視ループの起動
 
-`Bash` ツールを **`run_in_background: true`** で起動し、補助スクリプトを until-loop で叩く。**`Monitor` ツールは使わないこと**（再開導線が弱く、push 後の再監視ループに乗せづらいため、必ず `Bash` の `run_in_background` を使う）。
+`Bash` ツールを **`run_in_background: true`** で起動し、補助スクリプトを until-loop で叩く。**`Monitor` ツールは使わないこと**（理由は [agent-launch.md](agent-launch.md)「長時間処理の完了はメインが `Bash` の `run_in_background` で待つ」を参照）。
 
 ```bash
 START="<SINCE_ISO8601>"
