@@ -37,7 +37,11 @@ import {
   vkAgentsSkillsManifestPath,
   resolveVkAgentsCanonicalConfigPath,
   getGitHubTokenFromGh,
+  readVendoredVkAgentsVersion,
+  readVkAgentsManifestSource,
 } from './config.js';
+import { evaluateAgentsVersionState } from './engine/agents-redeploy.js';
+import { formatAgentsVersionRequirement } from './engine/update-messages.js';
 
 const DEFAULT_OWNER = 'vektor-inc';
 const DEFAULT_REPO = 'task-queue';
@@ -237,6 +241,38 @@ export function runDoctor(options = {}) {
     ok: agentsSetupOk,
     current: agentsSetupOk ? '展開済み' : '未展開',
     hint: '`npm run setup:agents` で skills/rules を ~/.claude へ展開してください（未展開だと /vk-kore が存在しません）。',
+  });
+
+  // 展開済みエージェント定義の版（任意）。
+  //
+  // manifest の有無しか見ていなかったため「古い版が展開済み」を検知できなかった。
+  // ここは required: false にする。required にすると、この機能より前から使っている環境
+  // （記録に版が入っていない）の `up` が一斉に警告塗れになるため。
+  //
+  // 判定と文言は起動時の再展開と同じものを使う（ログと診断で結論が食い違わないようにする）。
+  // ok は「展開済みが同梱より古くないか」で見る。同梱が利用者の clone より古いのは
+  // 通常の定常状態なので、そこを警告にはしない。
+  const vendoredAgentsVersion = options.vendoredVkAgentsVersion !== undefined
+    ? options.vendoredVkAgentsVersion
+    : readVendoredVkAgentsVersion();
+  const deployedAgentsRecord = options.vkAgentsManifestSource !== undefined
+    ? options.vkAgentsManifestSource
+    : readVkAgentsManifestSource({ homeDir });
+  const agentsVersionState = evaluateAgentsVersionState({
+    vendorVersion: vendoredAgentsVersion,
+    recordedVersion: deployedAgentsRecord?.sourceVersion ?? null,
+    manifestExists: agentsSetupOk,
+  });
+  const agentsVersionView = formatAgentsVersionRequirement(agentsVersionState);
+  requirements.push({
+    id: 'vk-agents-version',
+    group: '前提',
+    label: '展開済みエージェント定義の版',
+    required: false,
+    target: 'manifest',
+    ok: agentsVersionView.ok,
+    current: agentsVersionView.current,
+    hint: agentsVersionView.hint,
   });
 
   // 1-1 queue.backend（モード選択）

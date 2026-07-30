@@ -17,8 +17,10 @@ import {
   getLabelsConfig,
   getTaskConfig,
   getTaskCwd,
+  getUpdateConfig,
   loadCoderabbitFeatureConfig,
   loadUnifiedConfig,
+  readUpdateSnapshot,
   resolveVkAgentsConfigPath,
   resolveVkTerminalsApiHost,
   resolveVkTerminalsApiPort,
@@ -490,10 +492,61 @@ const scanWaitingInputIssues = createReplyForwardScanner({
 // 何度呼んでも重複しない。送信失敗は警告のみで握りつぶし、dispatch を止めない。
 async function syncOrchestratorMenu() {
   try {
-    const section = buildOrchestratorMenu();
+    const section = buildOrchestratorMenu({ updateSnapshot: readUpdateSnapshot() });
     await postMenu(VK_PORT, section);
   } catch (err) {
     console.log(`[warn] VK Terminals サイドバーメニューの更新に失敗しました: ${err.message}`);
+  }
+}
+
+// -------------------------------------------------------
+// 常駐中の新しい版の再確認
+//
+// 常駐中は「知らせるだけ」で、切り替えは行わない（実行中のタスクとターミナルを
+// 巻き込まないため。切り替えは起動時の静止点だけで行う）。
+// 一定間隔で確認し直し、設定画面の定義ファイルとサイドバーの項目を最新にする。
+// GUI は設定パネルを開くたびに定義ファイルを読み直すので、書き換えれば開き直すだけで反映される。
+//
+// 確認はディスパッチループを待たせない。git 経路ではリモート照会（最大 15 秒）と
+// ローカルの状態確認が入るため、ループの中で待つとタスクの起動や状態監視が止まる。
+// そこで「ループでは開始するだけ」にして、結果は次のループのサイドバー再投稿で拾う。
+// -------------------------------------------------------
+let lastUpdateCheckAt = 0;
+let updateCheckInFlight = false;
+
+// ループから呼ぶ入口。条件を満たしたら確認を開始し、完了を待たずに戻る。
+function scheduleUpdateStatusRefresh() {
+  if (updateCheckInFlight) return;
+
+  const intervalMs = Math.max(1, getUpdateConfig().checkIntervalHours) * 60 * 60 * 1000;
+  if (lastUpdateCheckAt !== 0 && Date.now() - lastUpdateCheckAt < intervalMs) return;
+  lastUpdateCheckAt = Date.now();
+  updateCheckInFlight = true;
+
+  refreshUpdateStatus()
+    .catch((err) => console.log(`[warn] 新しい版の確認に失敗しました（処理は継続）: ${err.message}`))
+    .finally(() => {
+      updateCheckInFlight = false;
+    });
+}
+
+async function refreshUpdateStatus() {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const { runUpdateCheck, saveUpdateSnapshot } = await import('./update-runner.js');
+  // busy: true … 常駐中は当てないので、判定にも「稼働中」であることを伝える。
+  const report = await runUpdateCheck({ repoRoot, busy: true });
+  saveUpdateSnapshot(report);
+  if (report.updateAvailable) {
+    console.log(`[update] ${report.summary}`);
+  }
+
+  // 設定画面の定義ファイルを書き直す（GUI は開くたびに読み直すため、本体側の改修は不要）。
+  try {
+    const { writeSettingsDescriptor } = await import('../config.js');
+    writeSettingsDescriptor();
+  } catch (err) {
+    // tmux モードなど GUI が無い構成では書き出し先が解決できない。知らせるだけで続行する。
+    console.log(`[warn] 設定画面の定義ファイルの更新に失敗しました（処理は継続）: ${err.message}`);
   }
 }
 
@@ -2215,21 +2268,25 @@ async function loopBody() {
     return;
   }
 
-  // 8. VK Terminals の再起動で消える注入メニューを、接続確立後に毎回冪等に再投稿する
+  // 8. 新しい版があるかを一定間隔で確認し直す（常駐中は当てず、知らせるだけ）。
+  //    確認はループを待たせずに走らせ、結果は次のループのサイドバー再投稿で反映される。
+  scheduleUpdateStatusRefresh();
+
+  // 9. VK Terminals の再起動で消える注入メニューを、接続確立後に毎回冪等に再投稿する
   await syncOrchestratorMenu();
 
-  // 9. 指示待ちスキャン: ユーザー返信を pane に転送して in-progress に戻す
+  // 10. 指示待ちスキャン: ユーザー返信を pane に転送して in-progress に戻す
   await scanWaitingInputIssues();
 
-  // 10. issue 連動ペインの入力待ちマーカーを push（waiting-input ラベルへの完全鏡写し）。
+  // 11. issue 連動ペインの入力待ちマーカーを push（waiting-input ラベルへの完全鏡写し）。
   //    VK Terminals states の生存ペインへ反映するため checkHealth 後ろ
   await scanWaitingMarkers();
 
-  // 11. ウォッチドッグ（安全網）: 無言で死んだ/ハングした in-progress タスクを failed に倒す
+  // 12. ウォッチドッグ（安全網）: 無言で死んだ/ハングした in-progress タスクを failed に倒す
   //    （VK Terminals states で pane の生死・無反応を見るため checkHealth 後ろ）
   await scanWatchdog();
 
-  // 12. 先回りクローズ済み + PR マージ済みの state 残骸を後始末
+  // 13. 先回りクローズ済み + PR マージ済みの state 残骸を後始末
   //     VK Terminals が到達不能な間は prMerged 通知を送れないため、
   //     health 確認済みのループでのみ通知してから state を消し込む。
   //     PR マージ検知が前提のため GitHub 連携無効時はスキップ。
@@ -2237,7 +2294,7 @@ async function loopBody() {
     await reconcileOrphanedMergedTasks();
   }
 
-  // 13. ready をディスパッチ
+  // 14. ready をディスパッチ
   const issues = await github.fetchPendingIssues();
   if (issues.length === 0) {
     console.log('[poll] 実行待ちタスクなし');

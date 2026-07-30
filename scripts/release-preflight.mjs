@@ -29,7 +29,7 @@
  */
 
 import { execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -129,6 +129,50 @@ function latestLocalTag(repo) {
   return latestSemverTag(tags);
 }
 
+const VENDOR_VERSION_REL = `${VENDOR_AGENTS_REL}/.vendor-version.json`;
+
+/**
+ * 同梱側に「どの版を同梱しているか」を記録する。
+ *
+ * この記録が無いと、アプリを新しくしたのに ~/.claude 側は古いスキルのままという状態を
+ * 検知できない（起動時の再展開判定がこれを読む）。export-public.sh は同梱ディレクトリを
+ * 作り直すため、export の「後」に書く。
+ *
+ * 版が変わっていないときは、コミット済みの内容をそのまま書き戻す。毎回新しい時刻を
+ * 書き込むと git 差分が必ず出てしまい、「同梱は既に最新（差分なし＝exit 0）」という
+ * このスクリプトの終了コードの意味が壊れる。
+ * @param {string} tag
+ */
+function writeVendorVersion(tag) {
+  const target = join(ROOT, VENDOR_VERSION_REL);
+  let committed = null;
+  try {
+    committed = execFileSync('git', ['-C', ROOT, 'show', `HEAD:${VENDOR_VERSION_REL}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    committed = null; // まだコミットされていない（この仕組みの導入直後）
+  }
+
+  if (committed !== null) {
+    try {
+      const parsed = JSON.parse(committed);
+      if (String(parsed?.tag ?? '') === tag) {
+        writeFileSync(target, committed);
+        return;
+      }
+    } catch {
+      // コミット済みの内容が壊れていれば作り直す。
+    }
+  }
+
+  writeFileSync(
+    target,
+    `${JSON.stringify({ product: 'vk-agents', tag, exportedAt: new Date().toISOString() }, null, 2)}\n`
+  );
+}
+
 function syncVkAgents() {
   log('\n▶ vk-agents 同梱を最新タグから再 export します...');
   const repo = resolveAgentsSourceRepo();
@@ -169,6 +213,8 @@ function syncVkAgents() {
     }
     rmSync(work, { recursive: true, force: true });
   }
+
+  writeVendorVersion(tag);
 
   const changed = gitStatus(VENDOR_AGENTS_REL) !== '';
   if (changed) {

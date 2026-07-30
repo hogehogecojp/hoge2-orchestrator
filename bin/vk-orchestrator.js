@@ -44,19 +44,26 @@ migrateLegacyVkAgentsGuiKeys();
 // 統合設定の読み込み・env 反映は、config.json の不正 JSON などで例外を投げうる。
 // doctor は「設定が壊れている人を助ける」診断ツールなので、ここで生スタックで落とさず、
 // doctor case（下の try/catch）に委ねて分かりやすいメッセージへ変換させる。
+// update も同じ扱いにする。設定が壊れている状態を直す手段が「新しい版に入れ替える」こと
+// なのに、その入れ替え自体が設定の破損で止まってしまうと詰んでしまうため、既定値で続行する。
 // それ以外のサブコマンドは有効な設定が前提のため、従来どおり要約を出して終了する
 // （main の catch と同じ formatErrorSummary で、生スタックは見せない）。
+const CONFIG_ERROR_TOLERANT_SUBCOMMANDS = new Set(['doctor', 'update']);
 let unifiedConfig = {};
 try {
   unifiedConfig = loadUnifiedConfig();
   applyConfigToEnv(unifiedConfig);
   ensureGitHubToken();
 } catch (err) {
-  if (sub !== 'doctor') {
+  if (!CONFIG_ERROR_TOLERANT_SUBCOMMANDS.has(sub)) {
     console.error(formatErrorSummary(err));
     process.exit(1);
   }
   // doctor はフォールスルー：runDoctor が config を読み直して例外を投げ、case 側で友好的に扱う。
+  // update は既定値（unifiedConfig = {}）のまま進み、設定が壊れていても入れ替えを実行できる。
+  if (sub === 'update') {
+    console.warn(`[update] 設定ファイルを読めなかったため既定値で続行します: ${err.message}`);
+  }
 }
 
 // 同梱の VK Terminals のインストールディレクトリを解決する。未導入なら分かりやすく終了。
@@ -121,58 +128,155 @@ async function warnIfNotReady() {
   }
 }
 
-const ORCHESTRATOR_REPO_URL = 'https://github.com/vektor-inc/vk-orchestrator.git';
-
 // up 起動時に vk-orchestrator 自身を最新リリースへ追従させる。
 //
-// リモートの最新 semver タグは「更新要否の判定材料」としてだけ使い、実際の更新は
-// main ブランチ上で `git pull --ff-only` に限定する。dirty / 非 main / ff 不可など、
-// 開発者の作業や履歴を壊しうる状況では警告して現行プロセスのまま起動を続行する。
+// 入手経路（git clone した作業ツリー / 配布 zip の展開）を判定し、経路ごとの手順で更新する。
+//   - git … main ブランチ上で `git pull --ff-only` に限定。dirty / 非 main / ff 不可など、
+//           開発者の作業や履歴を壊しうる状況では警告して現行プロセスのまま起動を続行する。
+//   - zip … 新しい配布 zip を取得して展開・検証し、インストールディレクトリを入れ替える。
+//
+// 自動で当てるのは「起動時のみ」。GUI もタスクもまだ動いていないこの位置だけが、
+// 走行中のターミナルを巻き込まずに入れ替えられる静止点になる（常駐中は知らせるだけ）。
 async function reconcileOrchestratorVersion() {
   const repoRoot = resolve(__dirname, '..');
   const alreadyUpdated = process.env.VK_ORCHESTRATOR_SELF_UPDATED === '1';
-  const optOut = process.env.VK_ORCHESTRATOR_NO_AUTO_UPDATE === '1';
+
+  const {
+    performZipUpdate,
+    pruneStaleStagingDirs,
+    recoverPendingUpdate,
+    refreshSnapshotAfterUpdate,
+    runUpdateCheck,
+    saveUpdateSnapshot,
+  } = await import('../src/engine/update-runner.js');
+  const { formatNoticeForLog } = await import('../src/engine/update-messages.js');
+
+  // 前回の入れ替えが途中で終わっていたら、続行するか元へ戻す。必ず毎起動で通す
+  // （ここを通さないと「install が無い」状態のまま起動しようとして何も動かなくなる）。
+  // repoRoot を渡すのは、作業記録が「このインストール」のものかを確かめさせるため。
+  try {
+    recoverPendingUpdate({ repoRoot, logger: console });
+  } catch (err) {
+    console.warn(`[up] 中断したアップデートの確認に失敗しました（処理は継続）: ${err.message}`);
+  }
 
   if (alreadyUpdated) {
-    console.log('[up] vk-orchestrator は再起動後のため自己更新チェックをスキップします。');
-    return;
-  }
-  if (optOut) {
-    console.log('[up] VK_ORCHESTRATOR_NO_AUTO_UPDATE=1 のため vk-orchestrator の自己更新をスキップします。');
-    return;
-  }
-
-  const { readFileSync } = await import('fs');
-  let current = null;
-  try {
-    current = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).version;
-  } catch {
-    console.warn('[up] vk-orchestrator の package.json を読めませんでした。自己更新をスキップします。');
-    return;
-  }
-
-  console.log('[up] vk-orchestrator の自己更新を確認します...');
-
-  let latest = null;
-  try {
-    const { fetchTags, latestSemverTag } = await import('../scripts/vk-terminals-tags.mjs');
-    latest = latestSemverTag(fetchTags(ORCHESTRATOR_REPO_URL, { cwd: repoRoot }));
-  } catch {
-    console.warn('[up] vk-orchestrator のリモート照会に失敗しました（オフライン等）。現行版で起動します。');
-    return;
-  }
-
-  const { orchestratorUpdateDecision } = await import('../src/engine/self-update.js');
-  const versionDecision = orchestratorUpdateDecision({ current, latest, branch: 'main' });
-  if (versionDecision.action === 'skip') {
-    if (versionDecision.reason === 'up-to-date') {
-      console.log(`[up] vk-orchestrator は最新です（現在: ${current}, 最新: ${latest}）。`);
-    } else {
-      console.warn('[up] vk-orchestrator の更新対象タグを判定できませんでした。現行版で起動します。');
+    console.log('[up] アップデート後の起動のため、新しい版の確認をスキップします。');
+    // 確認はスキップするが、記録の「お使いの版」だけは通信せずに今の版へ直す。
+    // ここを省くと、切り替え直後に設定画面を開いたときに旧版が表示されてしまう。
+    try {
+      refreshSnapshotAfterUpdate({ repoRoot });
+    } catch (err) {
+      console.warn(`[up] 確認結果の記録の更新に失敗しました（処理は継続）: ${err.message}`);
     }
+    // 展開先の片付けはここでは行わない。展開先はもう install へ rename されていて
+    // 片付ける対象が無く、かつこの時点では入れ替えを行った親プロセスがまだ更新ロックを
+    // 保持している（--apply から返るまで解放されない）。呼ぶと「ほかのアップデート処理が
+    // 実行中」という案内が、切り替え成功の直後に毎回出てしまう。
     return;
   }
 
+  // 過去に失敗した更新の展開先を片付ける。展開先には利用者の資産（.env / config.json）の
+  // 複製と node_modules が入るため、放っておくと版が変わるたびに溜まり続ける。
+  // 復旧に必要な展開先（作業記録が入れ替え中を示している間）は残す。
+  try {
+    pruneStaleStagingDirs(repoRoot, { logger: console });
+  } catch (err) {
+    console.warn(`[up] 使われていない展開先の片付けに失敗しました（処理は継続）: ${err.message}`);
+  }
+
+  // 実行可否を測る。自動経路にもガードが必要で、これが無いと「もう 1 つ起動した npm start」が
+  // 動いている GUI と engine の足元でインストールディレクトリを差し替えてしまう
+  // （走行中プロセスは古い実体を掴み続けるため、書き込みが控え側へ落ちて黙って失われる）。
+  const blockers = await measureCurrentUpdateBlockers(repoRoot);
+  const busy = blockers.some((b) => b.code === 'busy-gui' || b.code === 'busy-engine');
+
+  console.log('[up] 新しい版があるかを確認します...');
+  let report;
+  try {
+    report = await runUpdateCheck({ repoRoot, cfg: unifiedConfig, busy });
+  } catch (err) {
+    console.warn(`[up] 新しい版の確認に失敗しました（処理は継続）: ${err.message}`);
+    return;
+  }
+
+  // 設定画面・サイドバーが同じ内容を出せるよう、確認結果を作業記録へ残す。
+  try {
+    saveUpdateSnapshot(report);
+  } catch (err) {
+    console.warn(`[up] 確認結果の記録に失敗しました（処理は継続）: ${err.message}`);
+  }
+
+  // 起動時ログと設定画面のお知らせに同じ文字列を流す（文言カタログが唯一の正）。
+  console.log(`[up] ${report.summary}`);
+  const noticeLog = formatNoticeForLog(report.notice);
+  if (noticeLog) {
+    if (report.notice.tone === 'warning') console.warn(`[up] ${noticeLog}`);
+    else console.log(`[up] ${noticeLog}`);
+  }
+
+  if (report.decision.action !== 'update') return;
+
+  if (blockers.length > 0) {
+    console.warn(
+      '[up] すでに VK Orchestrator が動作しているため、アップデートを見送りました（現行版のまま起動します）。\n' +
+      blockers.map((b) => `  - ${b.message}\n    → ${b.hint}`).join('\n')
+    );
+    return;
+  }
+
+  if (report.channel === 'git') {
+    await applyGitUpdate(repoRoot, report);
+    return;
+  }
+
+  if (report.channel === 'zip') {
+    const updateConfig = (await import('../src/config.js')).getUpdateConfig(unifiedConfig);
+    const result = await performZipUpdate({
+      repoRoot,
+      manifest: report.manifest,
+      allowedHosts: updateConfig.allowedHosts,
+      // 入れ替え後は、いま実行しようとしていたコマンドをそのまま新しい版で実行し直す。
+      argv: process.argv.slice(2),
+      logger: console,
+    });
+    if (!result.ok) {
+      console.warn(
+        `[up] アップデートを適用できませんでした（現行版のまま起動します）: ${result.message}`
+      );
+      return;
+    }
+    process.exit(result.exitCode);
+  }
+}
+
+// 「今アップデートしてよいか」を実環境から測る。自動経路（up 起動時）と
+// 明示経路（update コマンド）と入れ替え直前の再確認で、同じ測り方を共有する。
+async function measureCurrentUpdateBlockers(repoRoot) {
+  const { checkHealth } = await import('../src/terminals/index.js');
+  const { defaultStartLockFile } = await import('../src/engine/start-lock.js');
+  const { detectUpdateChannel, measureUpdateBlockers } = await import('../src/engine/update-runner.js');
+  const { resolveVkTerminalsApiPort } = await import('../src/config.js');
+
+  let healthResponding = false;
+  try {
+    healthResponding = await checkHealth(resolveVkTerminalsApiPort(), { timeoutMs: 1_500 });
+  } catch {
+    // 疎通確認そのものが失敗した場合は「動いていない」とみなす（起動を止めない）。
+  }
+  return measureUpdateBlockers({
+    channel: detectUpdateChannel(repoRoot).channel,
+    healthResponding,
+    lockFile: defaultStartLockFile(),
+  });
+}
+
+// git clone した作業ツリーでの更新（main の ff 追従 → 必要なら npm install → 起動し直し）。
+//
+// relaunch は「元の起動処理へ戻すかどうか」。up 起動時の追従では true（新しいコードで
+// 起動し直す）。明示的な `vk-orchestrator update` では false（更新するだけが目的で、
+// 起動し直すと同じ update をもう一度走らせることになる）。
+async function applyGitUpdate(repoRoot, report, { relaunch = true } = {}) {
   const { spawnSync } = await import('child_process');
   const gitOutput = (args) => {
     const r = spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
@@ -181,47 +285,17 @@ async function reconcileOrchestratorVersion() {
   };
   const gitBlobHash = (path) => gitOutput(['rev-parse', `HEAD:${path}`]);
 
-  const status = gitOutput(['status', '--porcelain']);
-  if (status == null) {
-    console.warn('[up] vk-orchestrator の git 状態を確認できませんでした。自己更新をスキップします。');
-    return;
-  }
-  const branch = gitOutput(['branch', '--show-current']);
-  if (branch == null) {
-    console.warn('[up] vk-orchestrator の現在ブランチを確認できませんでした。自己更新をスキップします。');
-    return;
-  }
-
-  const decision = orchestratorUpdateDecision({
-    current,
-    latest,
-    dirty: status !== '',
-    branch,
-    optOut,
-    alreadyUpdated,
-  });
-  if (decision.action === 'skip') {
-    if (decision.reason === 'dirty') {
-      console.warn('[up] 未コミット変更を守るため vk-orchestrator の自己更新をスキップします。現行版で起動します。');
-    } else if (decision.reason === 'non-main-branch') {
-      console.warn(`[up] 現在のブランチが main ではないため vk-orchestrator の自己更新をスキップします（現在: ${branch || '(detached)'}）。`);
-    } else {
-      console.warn('[up] vk-orchestrator の自己更新条件を満たさないためスキップします。現行版で起動します。');
-    }
-    return;
-  }
-
   const beforeLock = gitBlobHash('package-lock.json');
-  console.log(`[up] vk-orchestrator ${current} → ${latest} が見つかりました。main を ff 追従します...`);
+  console.log(`[up] ${report.current} → ${report.latest} へ更新します（main を ff 追従）...`);
   const pull = spawnSync('git', ['pull', '--ff-only'], { cwd: repoRoot, stdio: 'inherit' });
   if (pull.status !== 0) {
-    console.warn('[up] vk-orchestrator の git pull --ff-only に失敗しました。現行版で起動します。');
+    console.warn('[up] git pull --ff-only に失敗しました。現行版で起動します。');
     return;
   }
 
   const afterLock = gitBlobHash('package-lock.json');
   if (beforeLock !== afterLock) {
-    console.log('[up] package-lock.json が更新されたため npm install を実行します...');
+    console.log('[up] 依存関係が変わったため npm install を実行します...');
     const install = spawnSync('npm', ['install'], { cwd: repoRoot, stdio: 'inherit' });
     if (install.status !== 0) {
       console.warn(
@@ -232,16 +306,100 @@ async function reconcileOrchestratorVersion() {
     }
   }
 
-  console.log('[up] vk-orchestrator の自己更新が完了しました。新しいコードで再起動します...');
+  if (!relaunch) {
+    console.log(`[update] ${report.latest} へのアップデートが完了しました。次の起動から新しいコードで動きます。`);
+    return;
+  }
+
+  console.log('[up] アップデートが完了しました。新しいコードで起動し直します...');
   const child = spawnSync(process.execPath, process.argv.slice(1), {
     stdio: 'inherit',
     env: { ...process.env, VK_ORCHESTRATOR_SELF_UPDATED: '1' },
   });
   if (child.error) {
-    console.warn(`[up] vk-orchestrator の再起動に失敗しました。現行プロセスのまま起動を続行します: ${child.error.message}`);
+    console.warn(
+      `[up] 新しい版で起動し直せませんでした。現行プロセスのまま起動を続行します: ${child.error.message}\n` +
+      '  もう一度 `npm start` を実行してください。'
+    );
     return;
   }
   process.exit(child.status ?? 1);
+}
+
+// up 起動時に、同梱している vk-agents（スキル・ルール）の版ズレを解消する。
+//
+// フックを「更新完了時」ではなく起動時の版ズレ解消フェーズに置くのが要点。更新経路にだけ
+// 付けると、git 経路での pull 後・手動での zip 上書き・別マシンからの同期を取りこぼす。
+// ~/.claude を書き換える処理なので、版が変わったときだけ走らせる。
+async function reconcileVkAgentsDeployment() {
+  const {
+    DEFAULT_VENDORED_VK_AGENTS_DIR,
+    isVkAgentsSetup,
+    readVendoredVkAgentsVersion,
+    readVkAgentsManifestSource,
+    writeVkAgentsManifestSource,
+    writeVkAgentsSettings,
+    vkAgentsGlobalSettingsPath,
+  } = await import('../src/config.js');
+  const { evaluateAgentsVersionState, resolveAgentsSyncAction } =
+    await import('../src/engine/agents-redeploy.js');
+  const { formatAgentsVersionNotice } = await import('../src/engine/update-messages.js');
+
+  const agentsDir = DEFAULT_VENDORED_VK_AGENTS_DIR;
+  const vendorVersion = readVendoredVkAgentsVersion(agentsDir);
+  const recorded = readVkAgentsManifestSource();
+  const input = {
+    vendorVersion,
+    recordedVersion: recorded?.sourceVersion ?? null,
+    manifestExists: isVkAgentsSetup(),
+  };
+  // sync.sh は ~/.claude を書き換えるため、同梱のほうが新しいと確かに分かるときだけ走らせる
+  // （判定は純粋関数側。同梱が古い状態で走らせると利用者の ~/.claude を巻き戻す）。
+  const state = evaluateAgentsVersionState(input);
+  const { run } = resolveAgentsSyncAction(input);
+
+  // 展開する・しないに関わらず、伝えるべきことがあれば 1 行知らせる。
+  // とくに「同梱のほうが古い」は利用者が自分で新しくしている通常の状態なので、
+  // 黙っていると「なぜ展開されないのか」が分からない。
+  const notice = formatAgentsVersionNotice(state);
+  if (notice) {
+    if (notice.level === 'warn') console.warn(`[up] ${notice.text}`);
+    else console.log(`[up] ${notice.text}`);
+  }
+
+  if (!run) return;
+
+  const { spawnSync } = await import('child_process');
+  const { evaluateSyncExit } = await import('../src/setup/sync-exit.js');
+  const syncPath = resolve(agentsDir, 'scripts', 'sync.sh');
+
+  try {
+    writeVkAgentsSettings(unifiedConfig, { globalSettingsPath: vkAgentsGlobalSettingsPath(), force: true });
+  } catch (err) {
+    console.warn(`[up] vk-agents 設定の書き出しに失敗しました（展開は続行）: ${err.message}`);
+  }
+
+  const r = spawnSync('bash', [syncPath, '--claude-global'], {
+    cwd: agentsDir,
+    stdio: 'inherit',
+    env: process.env,
+  });
+  const outcome = evaluateSyncExit(r.status);
+  if (!outcome.proceed) {
+    console.warn(
+      '[up] エージェント定義の展開に失敗しました（処理は継続）。\n' +
+      '  手動で `npm run setup:agents` を実行してください。'
+    );
+    return;
+  }
+  if (outcome.warning) console.warn(outcome.warning);
+
+  try {
+    const recordPath = writeVkAgentsManifestSource(agentsDir, { sourceVersion: vendorVersion });
+    console.log(`[up] エージェント定義の展開元を記録しました → ${recordPath}`);
+  } catch (err) {
+    console.warn(`[up] 展開元の記録に失敗しました（処理は継続）: ${err.message}`);
+  }
 }
 
 // up 起動時に vk-terminals を最新へ追従させる。
@@ -332,6 +490,173 @@ async function reconcileVkTerminalsVersion() {
   }
 }
 
+// `vk-orchestrator update [--check]` の実装。
+//
+// --check      … 副作用なしの確認だけ。診断コマンドと同じ流儀で、更新があっても exit 0 を返す
+//                （更新有無の判定は --json の updateAvailable を読む）。
+// （引数なし）  … 展開 → 照合 → 展開先の動作確認 → 入れ替え → 起動し直し。
+//                アプリやオーケストレーターが動いていれば実行せず拒否する。
+// --apply      … 内部用。展開先から起動されて実際の入れ替えだけを行う。
+async function runUpdateSubcommand(args) {
+  const repoRoot = resolve(__dirname, '..');
+  const asJson = args.includes('--json');
+  const {
+    applyStagedUpdate,
+    performZipUpdate,
+    runUpdateCheck,
+    saveUpdateSnapshot,
+  } = await import('../src/engine/update-runner.js');
+  const { formatUpdateReport } = await import('../src/engine/update-messages.js');
+
+  // --- 内部用: 展開先から起動され、入れ替えだけを行う ---
+  if (args.includes('--apply')) {
+    process.exit(await runUpdateApply(args, repoRoot, applyStagedUpdate));
+  }
+
+  const checkOnly = args.includes('--check');
+  const { getUpdateConfig } = await import('../src/config.js');
+  const updateConfig = getUpdateConfig(unifiedConfig);
+
+  // 稼働中かどうかは実行系だけが気にする（--check は副作用なしなのでいつでも通す）。
+  const blockers = checkOnly ? [] : await measureCurrentUpdateBlockers(repoRoot);
+  const busy = blockers.some((b) => b.code === 'busy-gui' || b.code === 'busy-engine');
+
+  const report = await runUpdateCheck({
+    repoRoot,
+    cfg: unifiedConfig,
+    busy,
+  });
+  report.blockers = [...blockers, ...report.blockers];
+
+  try {
+    saveUpdateSnapshot(report);
+  } catch {
+    // 表示用の記録なので、残せなくても確認結果は返す。
+  }
+
+  if (checkOnly) {
+    if (asJson) {
+      console.log(JSON.stringify(buildUpdateJson(report), null, 2));
+    } else {
+      console.log(formatUpdateReport(report));
+    }
+    return; // 診断系なので exit 0 固定
+  }
+
+  if (report.blockers.length) {
+    if (asJson) console.error(JSON.stringify(buildUpdateJson(report), null, 2));
+    else console.error(formatUpdateReport(report));
+    process.exit(1);
+  }
+
+  if (report.decision.action !== 'update') {
+    if (asJson) console.log(JSON.stringify(buildUpdateJson(report), null, 2));
+    else console.log(formatUpdateReport(report));
+    return;
+  }
+
+  // 非対話（ログへのリダイレクト・CI 等）では確認が取れないため、明示の --yes を要求する。
+  if (!process.stdin.isTTY && !args.includes('--yes')) {
+    console.error(
+      '[update] 対話端末ではないため、アップデートを実行しません。\n' +
+      '  意図した実行であれば `vk-orchestrator update --yes` を指定してください。'
+    );
+    process.exit(1);
+  }
+
+  if (report.channel === 'git') {
+    await applyGitUpdate(repoRoot, report, { relaunch: false });
+    return;
+  }
+
+  // zip の入れ替えは新しい側から起動したプロセスが行う。argv を空にして、入れ替え後の
+  // 起動し直しでは何も実行しない（`update` は「更新するだけ」が目的）。
+  const result = await performZipUpdate({
+    repoRoot,
+    manifest: report.manifest,
+    allowedHosts: updateConfig.allowedHosts,
+    argv: [],
+    logger: console,
+  });
+  if (!result.ok) {
+    console.error(`[update] アップデートを適用できませんでした: ${result.message}`);
+    process.exit(1);
+  }
+  process.exit(result.exitCode);
+}
+
+// 内部モード `update --apply --from <展開先> --target <入れ替え先>` の実装。
+//
+// 受理条件の検証は update-runner.js の validateApplyArguments に集約している
+// （引数をそのまま信じると、任意のディレクトリが rename と再帰削除の対象になる）。
+// このモードは展開先から起動されるので、ここでの「自分自身」は展開先になる。
+async function runUpdateApply(args, selfRoot, applyStagedUpdate) {
+  const { validateApplyArguments } = await import('../src/engine/update-runner.js');
+
+  const valueOf = (flag) => {
+    const i = args.indexOf(flag);
+    return i >= 0 ? args[i + 1] : null;
+  };
+  const from = valueOf('--from');
+  const target = valueOf('--target');
+  if (!from || !target) {
+    console.error('[update] --apply には --from <展開先> と --target <入れ替え先> が必要です（内部用）。');
+    return 1;
+  }
+
+  const validated = validateApplyArguments({ from, target, selfRoot });
+  if (!validated.ok) {
+    console.error(`[update] 入れ替えを行いません: ${validated.message}`);
+    return 1;
+  }
+
+  let forwardedArgv = [];
+  const rawArgv = valueOf('--argv');
+  if (rawArgv) {
+    try {
+      const parsed = JSON.parse(rawArgv);
+      if (Array.isArray(parsed)) forwardedArgv = parsed.map((a) => String(a));
+    } catch {
+      console.warn('[update] 起動し直すときの引数を読めませんでした。引数なしで起動し直します。');
+    }
+  }
+
+  // 入れ替えの直前にもう一度、稼働していないことを確かめる。展開・依存の入れ直し・
+  // 動作確認で数分かかるため、入口で測った結果はここでは古くなっている。
+  const blockers = await measureCurrentUpdateBlockers(validated.installDir);
+
+  return applyStagedUpdate({
+    stagedDir: validated.stagedDir,
+    installDir: validated.installDir,
+    argv: forwardedArgv,
+    logger: console,
+    blockers,
+  });
+}
+
+// `update --json` の出力形。スクリプトからはこの形だけを読めばよい。
+function buildUpdateJson(report) {
+  return {
+    channel: report.channel,
+    current: report.current ?? null,
+    latest: report.latest ?? null,
+    updateAvailable: report.updateAvailable === true,
+    decision: report.decision ?? null,
+    blockers: report.blockers ?? [],
+    manifest: report.manifest
+      ? {
+          version: report.manifest.version,
+          releasedAt: report.manifest.releasedAt,
+          bundled: report.manifest.bundled,
+          changelogUrl: report.manifest.changelogUrl,
+        }
+      : null,
+    lastCheckedAt: report.lastCheckedAt ?? null,
+    backupPath: report.backupPath ?? null,
+    preserved: report.preserved ?? [],
+  };
+}
+
 // 移設した engine 側スクリプトは import しただけで自走する（副作用実行）。
 // --once / --assignee 等のフラグは各スクリプトが process.argv を直接読むため、
 // ここではサブコマンド名の分岐だけを行い、対応スクリプトを動的 import する。
@@ -378,6 +703,10 @@ async function main() {
       }
       break;
     }
+    case 'update': {
+      await runUpdateSubcommand(process.argv.slice(3));
+      break;
+    }
     case 'apply': {
       // vk-agents 共通設定は従来どおり apply/up タイミングで派生設定へ投影する。
       const { writeVkAgentsSettings } = await import('../src/config.js');
@@ -416,6 +745,7 @@ async function main() {
           // 自己更新が走ると子プロセスで再実行して exit するため、doctor はその後に置く
           // （更新前コードの診断を利用者に見せないため）。
           await reconcileOrchestratorVersion();
+          await reconcileVkAgentsDeployment();
           // doctor ベースの起動時案内（未定義関数を呼んでいて ReferenceError になっていた箇所）。
           // doctor は terminals.mode を見てモード別に required を計算するので、tmux モードでも
           // 「VK Terminals 未導入」を必須欠損にせず正しくゲートできる。
@@ -505,6 +835,7 @@ async function main() {
       // GUI 起動前に、orchestrator 自身と固定タグ・実際に入っている版のズレを解消しておく。
       await reconcileOrchestratorVersion();
       await reconcileVkTerminalsVersion();
+      await reconcileVkAgentsDeployment();
       await warnIfNotReady();
 
       const vkDir = await resolveVkDirOrExit();
@@ -784,6 +1115,11 @@ commands:
                                         （--no-orchestrator で GUI のみ起動）
   start [--once] [--assignee <login>]   キューを監視して実行（--once で 1 周のみ）
   doctor [--json]                       初回セットアップの充足状況を診断（✅/❌ と次にやるコマンド。--json で要件配列を出力）
+  update [--check] [--json] [--yes]     新しい版があるかを確認し、あれば切り替える
+                                        （--check は確認のみで何も変更しない。切り替えはアプリを終了してから実行）
+  update --apply --from <展開先> --target <入れ替え先>
+                                        内部用。展開先から起動されて入れ替えだけを行う（手動実行は不要。
+                                        展開先の記録と一致する組み合わせでなければ実行しません）
   check-status                          現在のキュー／pane 状態を表示
   unblock                               waiting-input の issue を status:ready に戻す
   task add|list|set-status              queue.backend: local 専用の純ローカルタスク操作

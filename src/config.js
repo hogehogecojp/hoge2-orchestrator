@@ -15,6 +15,17 @@ import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { execFileSync } from 'child_process';
+// 利用者へ見せるアップデート関連の文言は 1 か所（update-messages.js）を唯一の正にする。
+// 起動時のログと設定画面のお知らせで文が食い違うと、サポート時に別の問題として扱われるため。
+import {
+  AUTO_UPDATE_FIELD_HELP,
+  DIAGNOSTICS_HELP_TEXT,
+  MANUAL_COMMAND_PREFACE,
+  formatDiagnostics,
+  formatVersionLine,
+  resolveDisplayState,
+  resolveManualCommand,
+} from './engine/update-messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -70,6 +81,21 @@ export const DEFAULT_TASK = {
  */
 export const DEFAULT_QUEUE = {
   backend: 'local',
+};
+
+/**
+ * update セクションの既定値。
+ * アプリ自身のアップデート（新しい版があるかの確認と切り替え）の挙動を決める。
+ *
+ * autoUpdate は既定 ON。起動時（まだタスクも GUI も動いていない静止点）にだけ切り替え、
+ * 常駐中は知らせるだけにする（実行中のタスクとターミナルを巻き込まないため）。
+ */
+export const DEFAULT_UPDATE = {
+  autoUpdate: true,
+  manifestUrl: 'https://license.vektor-inc.co.jp/check/packages/vk-orchestrator-latest.json',
+  // 更新情報ファイルが指す配布 zip を取りに行ってよいホスト。完全一致で判定する。
+  allowedHosts: ['license.vektor-inc.co.jp'],
+  checkIntervalHours: 6,
 };
 
 /**
@@ -1115,20 +1141,75 @@ export function isVkAgentsSetup(options = {}) {
 }
 
 /**
+ * 同梱している vk-agents の版を記録したファイル。
+ *
+ * 同梱ディレクトリ（vendor/vk-agents-public）は export の生成物で、これまで版を示すものが
+ * 1 つも無かった。そのため「アプリを新しくしたのに ~/.claude 側は古いスキルのまま」を
+ * 検知できなかった。リリース準備（scripts/release-preflight.mjs）で export 直後に書き出す。
+ * @param {string} [vendorDir]
+ * @returns {string}
+ */
+export function vendoredVkAgentsVersionPath(vendorDir = DEFAULT_VENDORED_VK_AGENTS_DIR) {
+  return join(vendorDir, '.vendor-version.json');
+}
+
+/**
+ * 同梱している vk-agents の版（タグ文字列）を読む。無ければ null。
+ * @param {string} [vendorDir]
+ * @returns {string|null}
+ */
+export function readVendoredVkAgentsVersion(vendorDir = DEFAULT_VENDORED_VK_AGENTS_DIR) {
+  let parsed;
+  try {
+    parsed = readJsonObject(vendoredVkAgentsVersionPath(vendorDir));
+  } catch {
+    // 壊れた記録は「版が分からない」と同じ扱い。起動処理を落とさない。
+    return null;
+  }
+  const tag = String(parsed?.tag ?? '').trim();
+  return tag === '' ? null : tag;
+}
+
+/**
  * setup:agents 実行後に、sync.sh に消されないサイドカーへ展開元を記録する。
+ *
+ * sourceVersion（展開した同梱 vk-agents の版）も一緒に残す。次回起動時に同梱側の版と
+ * 突き合わせ、ズレていれば再展開するために使う。旧形式（sourceVersion 無し）の記録は
+ * 「版が分からない」＝再展開が必要とみなす。
  * @param {string} sourcePath
- * @param {{ sourceRecordPath?: string, homeDir?: string, now?: Date }} [options]
+ * @param {{ sourceRecordPath?: string, homeDir?: string, now?: Date, sourceVersion?: string|null }} [options]
  * @returns {string}
  */
 export function writeVkAgentsManifestSource(sourcePath, options = {}) {
   const sourceRecordPath =
     options.sourceRecordPath ?? vkAgentsSkillsManifestSourcePath(options.homeDir);
+  const sourceVersion =
+    options.sourceVersion !== undefined
+      ? options.sourceVersion
+      : readVendoredVkAgentsVersion(sourcePath);
   const payload = {
     sourcePath: resolve(sourcePath),
     writtenAt: (options.now ?? new Date()).toISOString(),
   };
+  if (sourceVersion) payload.sourceVersion = String(sourceVersion).trim();
   writeJsonAtomic(sourceRecordPath, payload);
   return sourceRecordPath;
+}
+
+/**
+ * 展開元の記録（サイドカー）を読む。無ければ null。
+ * @param {{ sourceRecordPath?: string, homeDir?: string }} [options]
+ * @returns {{ sourcePath?: string, writtenAt?: string, sourceVersion?: string }} 記録が無ければ空オブジェクト
+ */
+export function readVkAgentsManifestSource(options = {}) {
+  const sourceRecordPath =
+    options.sourceRecordPath ?? vkAgentsSkillsManifestSourcePath(options.homeDir);
+  try {
+    return readJsonObject(sourceRecordPath);
+  } catch {
+    // 壊れた記録は「記録なし」と同じ扱い（再展開へ倒れる）。
+    return {};
+  }
 }
 
 function normalizedStringArray(value) {
@@ -1496,6 +1577,187 @@ export function buildVkTerminalsContentTabs(schema, ownTabIds) {
 }
 
 /**
+ * 設定パネルの Orchestrator タブ先頭へ置く「アップデートの状況」欄を組み立てる。
+ *
+ * 表示ブロック（content）は、同じタブの入力欄グループより必ず前に描かれ、グループの
+ * 間に差し込むことはできない。つまりここが長くなるほど既存の設定項目が下へ押し下がる。
+ * そのため平常時（最新で問題なし）は「見出し＋1 行」の 2 行で終わらせ、
+ * お知らせ・コマンド・変更履歴は必要なときだけ足す。
+ *
+ * 問い合わせ用の版一覧はここには置かず、専用タブ（buildVersionInfoContentBlocks）へ常設する。
+ * 利用者が問い合わせるのはアップデートとは無関係な不具合のときが大半で、そのとき
+ * 「新しい版がある」条件は成立しないため、この欄に置くと一番必要な場面で消えてしまう。
+ *
+ * 文言は src/engine/update-messages.js のカタログを唯一の正とし、起動時のログと
+ * 同じ文字列をここへ流す。
+ *
+ * @param {object|null} snapshot readUpdateSnapshot() の戻り値
+ * @returns {object[]} content ブロックの配列
+ */
+export function buildUpdateContentBlocks(snapshot = null, { now = new Date() } = {}) {
+  const channel = snapshot?.channel ?? 'unknown';
+  const current = snapshot?.current ?? readOwnPackageVersion();
+  const latest = snapshot?.latest ?? null;
+  const updateAvailable = snapshot?.updateAvailable === true;
+  // 経過時間は「見た瞬間」の性質なので、記録に焼いたお知らせをそのまま出さず、
+  // 表示するこの時点で「長く確認できていない」かを評価し直す。
+  // 記録は確認したときの値で止まっているため、確認が走らない構成（オーケストレーターを
+  // 起動しない GUI セッションなど）では、記録だけを信じると 1 か月前の確認結果で
+  // 「最新です」と出し続けてしまう。
+  //
+  // staleCheck はお知らせの勝敗とは別に受け取る。記録された warning（未コミット変更など）が
+  // 勝った場合も「確認から長く経っている」ことは成り立つので、バージョン行はそちらにも従う。
+  const { notice, staleCheck } = resolveDisplayState({
+    notice: snapshot?.notice ?? null,
+    lastCheckedAt: snapshot?.lastCheckedAt ?? null,
+    now,
+  });
+
+  const blocks = [{ type: 'heading', text: 'アップデートの状況', level: 3 }];
+
+  // 確認から長く経っているときだけ、記録の 1 行を使わずに組み直す。
+  // 記録の文は確認できた時点のもので「最新です」と言い切っているため、そのまま出すと
+  // 裏付けの無い断言になる。時刻に依存する判定は resolveDisplayState の 1 か所に閉じたまま、
+  // その結果（staleCheck）だけを見て組み直す。
+  blocks.push({
+    type: 'paragraph',
+    text: staleCheck || !snapshot?.summary
+      ? formatVersionLine({
+          current,
+          latest,
+          updateAvailable,
+          lastCheckedAt: snapshot?.lastCheckedAt ?? null,
+          // 記録が無いときは版の比較そのものが無い。長く未確認のときは版と時刻だけを伝える。
+          checkFailed: !staleCheck,
+          staleCheck,
+        })
+      : snapshot.summary,
+  });
+
+  // お知らせは 1 つだけ。最新で問題も無いときは出さない（平常時の高さを最小に保つ）。
+  if (notice && Array.isArray(notice.lines) && notice.lines.length) {
+    blocks.push({
+      type: 'callout',
+      tone: notice.tone === 'warning' ? 'warning' : 'info',
+      // 起動時ログ（formatNoticeForLog）と同じ 1 本の文字列にする。
+      text: notice.lines.join(' '),
+    });
+  }
+
+  // コマンドを出すのは「自動で切り替わる道が無い／塞がっている」ときだけにする。
+  //
+  // 自動更新 ON の git 環境では、お知らせが既に「次の起動で自動的に切り替わる」「今すぐなら
+  // 終了して起動し直す」と案内している。そこへコマンドを足すと、同じ結果に至る手順が 3 つ並び、
+  // しかもコマンドは「終了して起動し直す」より手数が多いだけになる（終了するならそのまま
+  // 起動すれば自動で切り替わるので、コマンドを打つ理由がない）。
+  //
+  // CLI 側（formatUpdateReport）では利用者がすでに端末にいるため常に出してよい。
+  // この出し分けは表示層の判断なので resolveManualCommand 自体は変えない。
+  const COMMAND_WORTH_SHOWING = new Set(['auto-update-off', 'dirty']);
+  const command = COMMAND_WORTH_SHOWING.has(notice?.code)
+    ? resolveManualCommand({ channel, updateAvailable, noticeCode: notice?.code ?? '' })
+    : null;
+  if (command) {
+    // 裸のコマンドだけを置かない。設定パネルはアプリが動いている間しか開けないため、
+    // 前置きが無いと「動かしたまま入れ替える」操作を誘ってしまう。
+    // 未コミット変更のお知らせは本文に「下のコマンドで…」を含むので、そのときだけ前置きを省く。
+    if (notice?.code !== 'dirty') {
+      blocks.push({ type: 'paragraph', text: MANUAL_COMMAND_PREFACE });
+    }
+    blocks.push({ type: 'code', text: command, copy: true });
+  }
+
+  return blocks;
+}
+
+/**
+ * 「バージョン情報」タブの content を組み立てる。
+ *
+ * 各コンポーネントの版と変更履歴へのリンクをまとめて常設する。問い合わせが発生するのは
+ * タスクが着手されない・ターミナルが開かないなどアップデートと無関係な不具合のときが
+ * 大半なので、アップデートの状況に関係なく常にここから取れるようにしておく。
+ *
+ * 変更履歴のリンクもここに置く。「お使いの版・関連コンポーネントの版・変更履歴」は
+ * 同じ性質の情報で、アップデートの状況欄に置くと、更新情報ファイルが常に
+ * 変更履歴の URL を持つ zip 環境では平常時が 2 行に収まらなくなる。
+ *
+ * 保存対象（field）を持たないタブなので、設定ディスクリプタの検証には影響しない
+ * （検証は field ごとに保存先が解決できるかを見るため、field が無ければ何も要求されない）。
+ *
+ * @param {object|null} snapshot readUpdateSnapshot() の戻り値
+ * @param {{ vkTerminalsVersion?: string|null, vendoredVkAgentsVersion?: string|null,
+ *          nodeVersion?: string, platform?: string }} [context]
+ * @returns {object[]} content ブロックの配列
+ */
+export function buildVersionInfoContentBlocks(snapshot = null, context = {}) {
+  const blocks = [
+    // 見出しはタブ名と同じ語にしない（タブボタンと直下の見出しで同じ語が 2 回立つのを避ける）。
+    // タブパネルはタブボタンと関連付けられているため、読み上げ上もタブ名が見出しとして働く。
+    { type: 'heading', text: 'お使いのバージョン', level: 3 },
+    // 説明を先、内容を後ろに置く（「下の内容」で位置を指せるので、読む順と一致する）。
+    { type: 'paragraph', text: DIAGNOSTICS_HELP_TEXT },
+    {
+      type: 'code',
+      text: formatDiagnostics({
+        current: snapshot?.current ?? readOwnPackageVersion(),
+        latest: snapshot?.latest ?? null,
+        channel: snapshot?.channel ?? 'unknown',
+        vkTerminals: context.vkTerminalsVersion ?? null,
+        vkAgents: context.vendoredVkAgentsVersion ?? null,
+        node: context.nodeVersion ?? process.versions.node,
+        platform: context.platform ?? process.platform,
+      }),
+      copy: true,
+    },
+  ];
+
+  const changelogUrl = safeHttpsUrl(snapshot?.changelogUrl);
+  if (changelogUrl) {
+    blocks.push({ type: 'links', items: [{ label: '変更履歴', url: changelogUrl }] });
+  }
+
+  return blocks;
+}
+
+/**
+ * 表示に使う URL を https のものだけに絞る。
+ *
+ * 更新情報ファイルは配布サーバー上の外部データで、そこに書かれた URL がそのまま
+ * 設定パネルのリンクへ流れる。GUI 側が危険な scheme を弾くことに依存せず、
+ * 出す前にこちら側で落とす（通らないものは表示しない＝安全側）。
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function safeHttpsUrl(value) {
+  const raw = String(value ?? '').trim();
+  if (raw === '') return null;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 自分自身（インストール）の package.json の version。読めなければ null。 */
+function readOwnPackageVersion() {
+  try {
+    return JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** 導入済み VK Terminals の version。未導入なら null。 */
+function readInstalledVkTerminalsVersion() {
+  try {
+    return JSON.parse(readFileSync(join(resolveVkTerminalsDir(), 'package.json'), 'utf8')).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * VK Terminals の設定パネル用「設定ディスクリプタ」を組み立てる。
  *
  * VK Terminals 側は特定ツールの設定内容を知らない汎用パネルで、env
@@ -1511,20 +1773,65 @@ export function buildSettingsDescriptor(targetPath = resolveConfigPath(), option
   // スキーマの読み込みはここで 1 回だけ行い、入力欄（groups）と説明専用タブの引き継ぎで
   // 使い回す。それぞれが読み直すと、読めなかったときの警告が二重に出てしまう。
   const vkTerminalsSchema = resolveVkTerminalsSettingsSchemaForDescriptor(options);
+  // アップデートの状況は、確認した側（起動時・常駐中の再確認）が残した記録から読む。
+  // ここは同期処理でネットワークに出られないため、記録が無ければ「未確認」として描く。
+  const updateSnapshot = options.updateSnapshot !== undefined ? options.updateSnapshot : readUpdateSnapshot();
+  const versionContext = {
+    vkTerminalsVersion: readInstalledVkTerminalsVersion(),
+    vendoredVkAgentsVersion: readVendoredVkAgentsVersion(),
+  };
   const ownTabs = [
-    { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+    {
+      id: 'orchestrator',
+      label: 'Orchestrator',
+      note: '保存した設定は次回起動時以降に反映されます。',
+      // content は同じタブの入力欄グループより前に描かれる（グループ間には差し込めない）。
+      // 平常時は 2 行で終わるように組み立て、既存の設定項目を押し下げないようにしている。
+      content: buildUpdateContentBlocks(updateSnapshot),
+    },
     { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
     { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
   ];
+  // 保存対象を持たない説明専用タブ。版一覧は問い合わせのときに必要なものなので、
+  // アップデートの状況に関係なく常にここから取れるようにする。
+  // バージョン情報のような「製品について」のタブは末尾に置く慣例に合わせ、
+  // vk-terminals 由来の引き継ぎタブより後ろへ回す。
+  const versionTab = {
+    id: 'version',
+    label: 'バージョン情報',
+    content: buildVersionInfoContentBlocks(updateSnapshot, versionContext),
+  };
+  // ID の衝突判定には自前タブ全部（バージョン情報を含む）を渡す。
+  // 渡し漏れると、同じ ID の引き継ぎタブが先勝ちして自前タブが中身の無い空タブになる。
+  const ownTabIds = [...ownTabs.map((tab) => tab.id), versionTab.id];
   return {
     title: 'VK Orchestrator 設定',
     targetPath,
-    // 自前タブの後ろに、vk-terminals 由来の説明専用タブ（例:「外出先から確認」）を並べる。
+    // 自前タブ → vk-terminals 由来の説明専用タブ（例:「外出先から確認」）→ バージョン情報 の順。
     tabs: [
       ...ownTabs,
-      ...buildVkTerminalsContentTabs(vkTerminalsSchema, ownTabs.map((tab) => tab.id)),
+      ...buildVkTerminalsContentTabs(vkTerminalsSchema, ownTabIds),
+      versionTab,
     ],
     groups: [
+      {
+        // content 側の見出しは「アップデートの状況」。同じタブで同じ語の見出しが 2 回立たないよう
+        // 入力欄グループ側は「自動アップデート」にして、状況の表示と設定の区別が付くようにする。
+        label: '自動アップデート',
+        tab: 'orchestrator',
+        // 保存先を明示する。既定（descriptor.targetPath）のままだと、config.json の探索が
+        // リポジトリ直下へフォールバックしている環境で作業ツリー内のファイルへ書き込まれてしまう。
+        targetPath: '~/.vk-orchestrator/config.json',
+        fields: [
+          {
+            key: 'update.autoUpdate',
+            label: '起動時に自動でアップデートする',
+            type: 'boolean',
+            default: DEFAULT_UPDATE.autoUpdate,
+            help: AUTO_UPDATE_FIELD_HELP,
+          },
+        ],
+      },
       {
         label: 'オーケストレーター',
         tab: 'orchestrator',
@@ -1648,6 +1955,127 @@ export function getTaskConfig(cfg = loadUnifiedConfig()) {
     merged.wpEnv = { ...merged.wpEnv, enabled: wpEnvEnabled }; // ネスト構造を保つ
   }
   return merged;
+}
+
+/**
+ * update セクションの解決済み設定を返す。
+ * 優先順位: 環境変数 > config.json(cfg.update) > DEFAULT_UPDATE。
+ *
+ * 既存の `VK_ORCHESTRATOR_NO_AUTO_UPDATE=1` は従来どおり最優先で OFF にする
+ * （設定画面で ON にしていても、この環境変数があれば切り替えない）。
+ * @param {object} [cfg] loadUnifiedConfig() の戻り値
+ * @returns {typeof DEFAULT_UPDATE}
+ */
+export function getUpdateConfig(cfg = loadUnifiedConfig()) {
+  const merged = deepMerge(DEFAULT_UPDATE, pruneEmpty(cfg?.update) ?? {});
+
+  // GUI の boolean 保存値が文字列になる古い設定も受け入れる。
+  if (typeof merged.autoUpdate === 'string') {
+    merged.autoUpdate = parseEnvBool(merged.autoUpdate) ?? DEFAULT_UPDATE.autoUpdate;
+  }
+  merged.autoUpdate = merged.autoUpdate !== false;
+
+  const env = process.env;
+  const envAuto = parseEnvBool(env.VK_ORCHESTRATOR_AUTO_UPDATE);
+  if (envAuto !== undefined) merged.autoUpdate = envAuto;
+  // 旧来の脱出ハッチ。設定より強い（サポート時に「環境変数を見れば必ず止まる」を維持する）。
+  if (env.VK_ORCHESTRATOR_NO_AUTO_UPDATE === '1') merged.autoUpdate = false;
+
+  if (env.VK_ORCHESTRATOR_UPDATE_MANIFEST_URL) merged.manifestUrl = env.VK_ORCHESTRATOR_UPDATE_MANIFEST_URL;
+  if (env.VK_ORCHESTRATOR_UPDATE_ALLOWED_HOSTS) {
+    const hosts = String(env.VK_ORCHESTRATOR_UPDATE_ALLOWED_HOSTS)
+      .split(',')
+      .map((h) => h.trim())
+      .filter((h) => h !== '');
+    if (hosts.length) merged.allowedHosts = hosts;
+  }
+  if (env.VK_ORCHESTRATOR_UPDATE_CHECK_INTERVAL_HOURS) {
+    merged.checkIntervalHours = Number(env.VK_ORCHESTRATOR_UPDATE_CHECK_INTERVAL_HOURS);
+  }
+
+  merged.allowedHosts = normalizedStringArray(merged.allowedHosts) ?? [...DEFAULT_UPDATE.allowedHosts];
+  const hours = Number(merged.checkIntervalHours);
+  // 0 以下や数値でない値は「常に確認」になって配布サーバーへ叩き続けるので既定へ戻す。
+  merged.checkIntervalHours = Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_UPDATE.checkIntervalHours;
+
+  // 更新情報ファイルの URL にも、配布 zip と同じ受理条件（https のみ・許可ホストと完全一致）を
+  // 掛ける。ここを素通しにすると、設定 1 つで任意のホストへ問い合わせに行かせられてしまう。
+  merged.manifestUrl = resolveManifestUrl(merged.manifestUrl, merged.allowedHosts);
+
+  return merged;
+}
+
+let warnedManifestUrl = false;
+
+/**
+ * 更新情報ファイルの URL を検証する。受理できなければ既定値へ戻す。
+ * @param {unknown} rawUrl
+ * @param {string[]} allowedHosts
+ * @returns {string}
+ */
+function resolveManifestUrl(rawUrl, allowedHosts) {
+  const raw = String(rawUrl ?? '').trim();
+  const hosts = (Array.isArray(allowedHosts) ? allowedHosts : []).map((h) => String(h).toLowerCase());
+  const reject = (reason) => {
+    if (!warnedManifestUrl) {
+      warnedManifestUrl = true;
+      console.warn(`[Config] update.manifestUrl を受理できないため既定値を使用します（${reason}）: ${raw}`);
+    }
+    return DEFAULT_UPDATE.manifestUrl;
+  };
+
+  if (raw === '') return DEFAULT_UPDATE.manifestUrl;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return reject('URL として解釈できません');
+  }
+  if (parsed.protocol !== 'https:') return reject('https ではありません');
+  if (!hosts.includes(parsed.hostname.toLowerCase())) return reject('update.allowedHosts に含まれないホストです');
+  return parsed.toString();
+}
+
+/**
+ * 更新の作業記録・確認時刻を保存するファイル。
+ *
+ * インストールディレクトリの外（ホーム配下）に置く。インストールごと入れ替える処理の
+ * 途中経過を記録する場所なので、入れ替え対象の中にあってはならない。
+ * @param {string} [homeDir]
+ * @returns {string}
+ */
+export function updateStatePath(homeDir = homedir()) {
+  return join(homeDir, '.vk-orchestrator', 'update-state.json');
+}
+
+/**
+ * 配布 zip の展開・退避に使う作業ディレクトリの親（インストール外の退避先）。
+ * @param {string} [homeDir]
+ * @returns {string}
+ */
+export function updateWorkDir(homeDir = homedir()) {
+  return join(homeDir, '.vk-orchestrator', 'updates');
+}
+
+/**
+ * 最後に確認した結果（設定画面・サイドバーの表示に使う）を読む。
+ *
+ * 設定画面の定義とサイドバーの組み立ては同期処理でネットワークに出られないため、
+ * 確認した側（起動時・常駐中の再確認）が残した記録をここから読む。
+ * @param {{ statePath?: string, homeDir?: string }} [options]
+ * @returns {object|null} 記録が無ければ null
+ */
+export function readUpdateSnapshot(options = {}) {
+  const statePath = options.statePath ?? updateStatePath(options.homeDir);
+  let state;
+  try {
+    state = readJsonObject(statePath);
+  } catch {
+    return null;
+  }
+  const report = state?.lastReport;
+  if (!report || typeof report !== 'object' || Array.isArray(report)) return null;
+  return { ...report, lastCheckedAt: state.lastCheckedAt ?? null };
 }
 
 /**

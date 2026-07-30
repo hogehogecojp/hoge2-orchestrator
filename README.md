@@ -252,9 +252,59 @@ npx vk-orchestrator start          # タスク登録リポジトリのキュー�
 npx vk-orchestrator start --once   # 1 周だけ実行
 npx vk-orchestrator check-status   # 現在の状態を表示（GitHub モード専用）
 npx vk-orchestrator doctor         # 初回セットアップの充足状況を診断（--json で要件配列）
+npx vk-orchestrator update --check # 新しい版があるかを確認（何も変更しない。詳細は下記「アップデート」）
 ```
 
 > **補助スクリプトは GitHub モード専用**: `check-status`（`src/engine/check-status.mjs`）・`src/engine/unblock.mjs`・`src/engine/ensure-task-queue-label.mjs` は GitHub 上の Issue を前提とするため、`queue.backend = github` のときだけ使えます。ローカルモードでは対象がなく、キューの確認・状態変更は下記「純ローカルタスク CLI」の `vk-orchestrator task list` / `task set-status` を使ってください（MVP ではローカルモード向けの相当スクリプトは提供しません）。
+
+## アップデート
+
+新しい版があるかの確認と切り替えは、次の方針で動きます。
+
+- **切り替えるのは起動時だけ** — `up`（`npm start`）の最初、GUI もタスクもまだ動いていない位置でのみ入れ替えます。ここが唯一の静止点で、実行中のターミナルやタスクを巻き込まずに入れ替えられるためです。
+- **すでに動いているときは切り替えません** — 起動時でも、VK Terminals が応答している／オーケストレーターが動作中（起動ロックを保持）のときは見送って現行版のまま起動します。2 つ目のインスタンスを起動しても、動いているプロセスの足元でインストールが差し替わることはありません。入れ替えの直前にもう一度確認するため、展開中にアプリが起動された場合も中断します。
+- **常駐中は知らせるだけ** — オーケストレーターが動いている間は `update.checkIntervalHours` ごとに確認し直し、設定パネルの「アップデート」欄とサイドバーに状況を出します。切り替えは行いません。
+- **切り替えたら自動で起動し直します** — 端末をそのまま引き継いで起動し直すので、利用者からは「起動が 1 回長かった」ように見えます。起動し直せなかった場合だけ「もう一度 `npm start` を実行してください」と案内します。
+- **既定は ON** — 設定パネルの「起動時に自動でアップデートする」で OFF にできます。OFF のときは新しい版が出ても設定パネルにお知らせを出すだけで、切り替えません。
+- **お使いの版と各コンポーネントの版は、設定パネルの「バージョン情報」タブにいつでもあります** — 問い合わせのときにそのままコピーできる形で、変更履歴へのリンクと一緒に置いています。アップデートの状況（新しい版があるか等）は Orchestrator タブの先頭に出ます。
+- **長く確認できていないと注意を出します** — 最後に確認できてから 7 日以上経っていると、設定パネルとサイドバーに「新しい版を確認できていません」と表示します。これは表示した時点で判定するため、`up --no-orchestrator` のようにオーケストレーターを起動していない構成でも出ます。
+
+コマンドから確認・実行することもできます。
+
+```bash
+npx vk-orchestrator update --check          # 確認のみ（何も変更しない。--json で機械判定用の出力）
+npx vk-orchestrator update                  # 新しい版があれば切り替える（アプリを終了してから実行）
+```
+
+`update --check` は診断コマンドと同じ流儀で、新しい版があっても終了コードは 0 です。スクリプトから判定する場合は `--json` の `updateAvailable` を読んでください。`update`（実行系）は、GUI が応答している・オーケストレーターが動作中のときは切り替えずに拒否します。
+
+### 入手経路（clone 環境と zip 環境の違い）
+
+アプリの入れ方によって手順が変わるため、起動時に入手経路を自動判定します。
+
+| 入手経路 | 判定条件 | 更新方法 |
+|---|---|---|
+| **zip（配布パッケージ）** | インストール直下に `release.json` がある（配布 zip に同梱） | 配布サーバーの更新情報ファイルを読み、新しい配布 zip を取得・検証してインストールディレクトリを入れ替える |
+| **git（clone した作業ツリー）** | `.git` があり、かつ `git rev-parse --show-toplevel` の結果がインストールディレクトリと**一致する** | `main` ブランチ上で `git pull --ff-only`。依存関係が変わっていれば `npm install` |
+| **不明** | 上のどちらでもない | 何も実行しません（設定パネルに「入れ直してください」と案内を出します） |
+
+git と判定する条件に「最上位ディレクトリが一致すること」を含めているのは、配布 zip を別のリポジトリの配下へ展開されたときに、親リポジトリを自分だと誤認して親に対して `git pull` を実行してしまうのを防ぐためです。
+
+zip 環境での入れ替えは次の順で行い、失敗しても元の版へ戻せるようにしています。
+
+1. 配布 zip をダウンロードし、更新情報ファイルの `sha256` と一致するか照合する（照合を通るまでディスクへ書きません。宣言サイズと食い違う応答や大きすぎる応答は途中で打ち切ります）
+2. インストールディレクトリの兄弟へ展開し、**中身の版が更新情報ファイルの版と一致するか**を確かめる（`sha256` だけでは「実在の旧版を新しい版として配る」ことを防げないため）
+3. 利用者の資産（`.env` / `config.json` / `vendor/vk-agents-public/config.json` / `.claude/settings.local.json`）を展開先へ写す
+4. 展開先に対して `doctor --json` を実行し、起動できる状態か確かめる（ここで落ちたら入れ替えずに展開先を破棄する）
+5. 作業記録（`~/.vk-orchestrator/update-state.json`）を書いてから、`rename` 2 回で入れ替える（旧インストールは `<インストール先>.backup-<旧版>` として 1 世代だけ残す）
+
+この一連の処理にはインストールごとの排他ロックが掛かるため、同時に 2 つのアップデートが走ることはありません。
+
+途中で電源が落ちた場合も、次回起動時に作業記録を読んで「続行」か「元の版へ戻す」かを自動で判断します。このとき、作業記録が**いま動いているインストールのもので、控えと展開先が規定の場所と名前である**ことを確認してから処理します（clone した環境と zip の環境を併用している場合に、片方の起動が他方のディレクトリへ影響しないようにするため）。
+
+> **同梱エージェント定義の追従** — アプリを新しくすると、同梱している vk-agents（スキル・ルール）も新しくなります。`up` 起動時に同梱側の版（`vendor/vk-agents-public/.vendor-version.json`）と `~/.claude` へ展開済みの版を突き合わせ、**同梱のほうが新しいときだけ** `~/.claude` へ展開し直します。`vk-orchestrator doctor` にも展開済みの版が任意項目として出ます。
+>
+> 逆向き（同梱のほうが古い）では何もしません。`~/.claude` は利用者のグローバル設定で、上書きは取り返しがつかないためです。**vk-agents を自分で clone して同期している場合、同梱よりそちらが新しいのが通常の状態**なので、自動展開でそれを巻き戻すことはありません。同じ理由で、展開済みの版が分からない環境（この仕組みより前から使っている場合）でも自動では展開せず、`doctor` で案内するだけにしています。同梱のものへそろえたいときは `npm run setup:agents` を実行してください（この操作は無条件に `~/.claude` を上書きします）。
 
 ### 純ローカルタスク CLI
 
@@ -301,6 +351,11 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 | なし | `CLAUDE_SUBMIT_DELAY_MS` | 本文送信後の基準待機時間（linear backoff の 1 単位）。再送のたびに待機が伸びる | `1000` |
 | なし | `CLAUDE_SUBMIT_MAX_RETRIES` | 本文・Enter それぞれの最大再送回数（初回と合わせて最大 +1 回まで送信） | `3` |
 | `orchestrator.assigneeFilter` | `ASSIGNEE_FILTER` | 担当者フィルタ。空/未設定は一切取り込まず、全件対象は `all` を明示 | `null`（拾わない） |
+| `update.autoUpdate` | `VK_ORCHESTRATOR_AUTO_UPDATE` / `VK_ORCHESTRATOR_NO_AUTO_UPDATE` | 起動時に新しい版へ自動で切り替えるか（下記「アップデート」）。設定パネルの「自動アップデート」から編集可。`VK_ORCHESTRATOR_NO_AUTO_UPDATE=1` は設定より強く、常に OFF にする。**OFF でも「新しい版があるか」の確認は続けます**（設定パネルにお知らせを出すため）。確認そのものを止めるには `VK_ORCHESTRATOR_UPDATE_CHANNEL=off` を使ってください | `true` |
+| `update.manifestUrl` | `VK_ORCHESTRATOR_UPDATE_MANIFEST_URL` | 更新情報ファイル（配布サーバー上の JSON）の URL。`https` で、かつ `update.allowedHosts` に含まれるホストである必要があり、外れた指定は既定値へ戻します | `https://license.vektor-inc.co.jp/check/packages/vk-orchestrator-latest.json` |
+| `update.allowedHosts` | `VK_ORCHESTRATOR_UPDATE_ALLOWED_HOSTS` | 更新情報ファイルと配布 zip を取得してよいホスト（完全一致・カンマ区切り）。更新情報ファイルがこれ以外のホストを指していても取りに行かず、転送（リダイレクト）先も 1 段ごとに同じ条件で確認します | `["license.vektor-inc.co.jp"]` |
+| `update.checkIntervalHours` | `VK_ORCHESTRATOR_UPDATE_CHECK_INTERVAL_HOURS` | 常駐中に新しい版があるかを確認し直す間隔（時間） | `6` |
+| なし | `VK_ORCHESTRATOR_UPDATE_CHANNEL` | アップデートの入手経路を明示上書き（`git` / `zip` / `off`）。通常は自動判定なので指定不要。`off` は仕組み全体を止める脱出ハッチで、**配布サーバーへの確認も行いません** | 自動判定 |
 | `workspace.search_paths`（vk-agents config） | なし | 作業対象リポジトリのローカルクローン探索起点。タスク用ペインの起点決定にも使用 | 未設定時は `~/vk-orchestrator-tasks`（無ければ自動作成） |
 | なし | `TASK_CWD` | タスク用ペインの Claude Code 起点ディレクトリの緊急上書き | 未設定 |
 | `vkTerminals.timeoutScale` | `VK_TERMINALS_TIMEOUT_SCALE` | VK Terminals API の応答を待つ時間へ掛ける全体倍率（0.1〜60 倍、範囲外は上下限へ丸める）。Tailscale 越しなどで状態表示や入力待ち検知が更新されない場合は `2`〜`3` を指定。設定パネルの「VK Terminals との通信」から編集可。大きすぎる値では起動時の疎通待ち（最大 3 秒 × 倍率）も同じだけ延長 | `1` |

@@ -39,11 +39,25 @@ jobs:
 
       - name: Build release package
         run: |
-          rm -rf dist/vk-orchestrator dist/vk-orchestrator.zip
+          rm -rf dist
           mkdir -p dist/vk-orchestrator
 
           cp -R bin src scripts vendor node_modules dist/vk-orchestrator/
           cp package.json package-lock.json README.md .node-version dist/vk-orchestrator/
+
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+          # zip を展開した環境の目印。これがあるとアプリは「配布 zip の環境」として扱い、
+          # git ではなく新しい zip の取得でアップデートする（親リポジトリ誤認の防止も兼ねる）。
+          cat > dist/vk-orchestrator/release.json <<EOF
+          {
+            "product": "vk-orchestrator",
+            "version": "${VERSION}",
+            "tag": "${GITHUB_REF_NAME}",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
 
           cat > dist/vk-orchestrator/HOW-TO-RUN.md <<'EOF'
           # VK Orchestrator release package
@@ -60,20 +74,87 @@ jobs:
           設定は `~/.vk-orchestrator/config.json` / `~/.vk-agents/config.json` 等に保存されます。詳細は `README.md` を参照してください。
           EOF
 
-          (cd dist && zip -r vk-orchestrator.zip vk-orchestrator)
+          # 固定名（従来どおり）と、版名付き（前の版へ戻せるようにする）の 2 つを作る。
+          # 中身は同一で、名前だけが違う。
+          (cd dist && zip -qr vk-orchestrator.zip vk-orchestrator)
+          cp dist/vk-orchestrator.zip "dist/vk-orchestrator-${VERSION}.zip"
 
       - name: Smoke test release package
         run: |
           cd dist/vk-orchestrator
           node bin/vk-orchestrator.js doctor --json
 
+      # アプリが「今の最新は何版か・どの zip をどのハッシュで取ればよいか」を読むための
+      # 更新情報ファイル。zip と同じディレクトリへ置く（WordPress のプラグイン更新 API は
+      # zip がプラグインでもテーマでもないため使えない）。
+      # sha256 は版名付き zip の実ハッシュを計算して埋める。
+      - name: Build update manifest
+        run: |
+          VERSIONED="dist/vk-orchestrator-${VERSION}.zip"
+          # node -e から読むため、値はすべて export して環境変数として渡す。
+          export SHA256="$(shasum -a 256 "${VERSIONED}" | cut -d' ' -f1)"
+          export SIZE="$(wc -c < "${VERSIONED}" | tr -d ' ')"
+          export VK_TERMINALS="$(node -p "(require('./package.json').optionalDependencies['vk-terminals']||'').split('#')[1]||''")"
+          export VK_AGENTS="$(node -p "try{require('./vendor/vk-agents-public/.vendor-version.json').tag}catch(e){''}")"
+          export LOCK_SHA256="$(shasum -a 256 package-lock.json | cut -d' ' -f1)"
+
+          node -e '
+            const fs = require("fs");
+            const manifest = {
+              schemaVersion: 1,
+              product: "vk-orchestrator",
+              version: process.env.VERSION,
+              tag: process.env.GITHUB_REF_NAME,
+              releasedAt: new Date().toISOString(),
+              download: {
+                url: `${process.env.BASE_URL}/vk-orchestrator-${process.env.VERSION}.zip`,
+                size: Number(process.env.SIZE),
+                sha256: process.env.SHA256,
+              },
+              downloadLatest: { url: `${process.env.BASE_URL}/vk-orchestrator.zip` },
+              minNode: "20.0.0",
+              bundled: {
+                vkTerminals: process.env.VK_TERMINALS || null,
+                vkAgents: process.env.VK_AGENTS || null,
+              },
+              lockSha256: process.env.LOCK_SHA256,
+              requiresSetupAgents: true,
+              // これ未満の版からは自動で切り替えず、手動での再インストールを案内する。
+              minUpgradableFrom: "0.25.0",
+              changelogUrl: "https://github.com/vektor-inc/vk-orchestrator/blob/main/CHANGELOG.md",
+            };
+            fs.writeFileSync("dist/vk-orchestrator-latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          '
+          cat dist/vk-orchestrator-latest.json
+        env:
+          BASE_URL: https://license.vektor-inc.co.jp/check/packages
+
       # DEPLOY_PATH_VWS はディレクトリ想定（vk-blocks-pro と同じ場所に `vk-orchestrator.zip` を置く）。
       # ファイルパス指定だった場合は要調整。
-      - name: Deploy release package to VWS
+      #
+      # 3 ファイルを配置する:
+      #   - vk-orchestrator.zip            … 固定名（従来どおり。手動ダウンロード用）
+      #   - vk-orchestrator-<version>.zip  … 版名付き（前の版へ戻せるようにする）
+      #   - vk-orchestrator-latest.json    … 更新情報ファイル（アプリが読む）
+      #
+      # 更新情報ファイルは zip より後に置く（先に置くと、まだ無い zip を指す状態が生まれる）。
+      - name: Deploy release zips to VWS
         uses: burnett01/rsync-deployments@2651e3eecb4ea772cbe952695d04952e92027b4f # v5.2.1
         with:
           switches: -avzr
-          path: dist/vk-orchestrator.zip
+          path: dist/vk-orchestrator.zip dist/vk-orchestrator-${{ env.VERSION }}.zip
+          remote_path: ${{ secrets.DEPLOY_PATH_VWS }}
+          remote_host: ${{ secrets.DEPLOY_HOST_VWS }}
+          remote_port: ${{ secrets.DEPLOY_PORT_VWS }}
+          remote_user: ${{ secrets.DEPLOY_USER_VWS }}
+          remote_key: ${{ secrets.DEPLOY_KEY_VWS }}
+          remote_key_pass: ${{ secrets.DEPLOY_KEYPASS_VWS }}
+
+      - name: Deploy update manifest to VWS
+        uses: burnett01/rsync-deployments@2651e3eecb4ea772cbe952695d04952e92027b4f # v5.2.1
+        with:
+          switches: -avzr
+          path: dist/vk-orchestrator-latest.json
           remote_path: ${{ secrets.DEPLOY_PATH_VWS }}
           remote_host: ${{ secrets.DEPLOY_HOST_VWS }}
           remote_port: ${{ secrets.DEPLOY_PORT_VWS }}

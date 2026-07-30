@@ -46,7 +46,9 @@ npm run release:preflight
 `scripts/release-preflight.mjs` が次を行う（詳細はスクリプト冒頭コメント参照。ロジックはここに再実装しない）：
 
 - **vk-terminals** … `optionalDependencies` のピンをリモート最新 semver タグへ追従（`bump-vk-terminals.mjs latest` を再利用。package.json / package-lock.json を書き換え）。
-- **vk-agents** … 実体リポの最新タグの一時 worktree から `export-public.sh` を実行し、`vendor/vk-agents-public` を再生成（元リポの作業ツリーは汚さない）。
+- **vk-agents** … 実体リポの最新タグの一時 worktree から `export-public.sh` を実行し、`vendor/vk-agents-public` を再生成（元リポの作業ツリーは汚さない）。再生成の直後に、同梱した版を記録する `vendor/vk-agents-public/.vendor-version.json`（`{product, tag, exportedAt}`）を書き出す。
+
+**`.vendor-version.json` がコミットに含まれているか確認する**：`git status --porcelain -- vendor/vk-agents-public/.vendor-version.json` で差分を確認し、リリースコミットに含める。このファイルは「同梱しているエージェント定義の版」を示す唯一の記録で、`up` 起動時に `~/.claude` へ展開済みの版と突き合わせて再展開の要否を決めるために使う。コミットから漏らすと、利用者の環境で古いスキルが展開されたままになっても検知できない。
 
 **終了コードで分岐する**：
 
@@ -97,7 +99,7 @@ npm version X.Y.Z --no-git-tag-version
 
 ## Phase 3: コミット・タグ・push
 
-リリースコミットに含めるもの：`CHANGELOG.md` / `package.json` / `package-lock.json`、および Phase 1 で差分が出ていれば `vendor/vk-agents-public`。
+リリースコミットに含めるもの：`CHANGELOG.md` / `package.json` / `package-lock.json`、および Phase 1 で差分が出ていれば `vendor/vk-agents-public`（`.vendor-version.json` を含む）。
 
 ```
 git add CHANGELOG.md package.json package-lock.json vendor/vk-agents-public
@@ -127,3 +129,5 @@ git ls-remote --tags origin vX.Y.Z
 - リリースは破壊的（push・タグは巻き戻しづらい）。バージョン番号の確定だけは必ずユーザー合意を取る。
 - CHANGELOG の記法・分類・並び順は `rules/changelog.md` / `change-title.md` が単一ソース。このスキルに再実装せず、必ず参照する。
 - vk-terminals は日次同期ワークフロー（`.github/workflows/sync-vk-terminals.yml`）と `up` 起動時追従でも最新化されるが、**リリース時点での最新保証は Phase 1 が担う**（同期ワークフローの取りこぼしをここで吸収する）。
+- タグ push 後、`.github/workflows/deploy-release-vws.yml` が配布サーバーへ 3 ファイル（固定名 zip・版名付き zip・更新情報ファイル `vk-orchestrator-latest.json`）を配置する。**利用者の自動アップデートはこの更新情報ファイルを読む**ため、ワークフローの成功を必ず確認する。更新情報ファイルだけが古いまま残ると、利用者は新しい版に気づけない。
+- 更新情報ファイルの `minUpgradableFrom`（これ未満の版からは自動で切り替えず手動での再インストールを案内する下限）はワークフロー内に固定値で持っている。互換性を壊す変更を入れたリリースでは、この値の見直しが必要かを検討する。

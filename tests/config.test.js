@@ -2430,12 +2430,26 @@ test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ',
   // 明示的に渡す。vkTerminalsDir を省略すると実インストール先の settings-schema.json を読み、
   // そこに説明専用タブがあると tabs が増えて deepEqual が環境依存で壊れる。
   withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
-    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-    assert.deepEqual(desc.tabs, [
-      { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
-      { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
-      { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
-    ]);
+    // updateSnapshot を明示して、実環境の確認記録（~/.vk-orchestrator/update-state.json）に
+    // 引きずられないようにする。アップデート欄の中身は updateSettingsContent.test.js で検証する。
+    const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir, updateSnapshot: null });
+    assert.deepEqual(
+      desc.tabs.map(({ id, label, note }) => ({ id, label, note })),
+      [
+        { id: 'orchestrator', label: 'Orchestrator', note: '保存した設定は次回起動時以降に反映されます。' },
+        { id: 'terminals', label: 'Terminals', note: '保存した設定は次回起動時以降に反映されます。' },
+        { id: 'agents', label: 'VK Agents', note: '保存した設定は次回セッション以降に反映されます。' },
+        { id: 'version', label: 'バージョン情報', note: undefined },
+      ]
+    );
+    // 表示ブロックを持つのは Orchestrator タブ（アップデートの状況）と
+    // バージョン情報タブ（保存対象を持たない説明専用）の 2 つ。
+    assert.ok(Array.isArray(desc.tabs[0].content) && desc.tabs[0].content.length > 0);
+    assert.equal(desc.tabs[1].content, undefined);
+    assert.equal(desc.tabs[2].content, undefined);
+    assert.ok(Array.isArray(desc.tabs[3].content) && desc.tabs[3].content.length > 0);
+    // バージョン情報タブに紐づく入力欄グループは存在しない（説明専用のため）。
+    assert.equal(desc.groups.some((g) => g.tab === 'version'), false);
     const tabsByLabel = Object.fromEntries(desc.groups.map((group) => [group.label, group.tab]));
     assert.equal(tabsByLabel.GitHub, 'orchestrator');
     assert.equal(tabsByLabel['オーケストレーター'], 'orchestrator');
@@ -2446,9 +2460,9 @@ test('buildSettingsDescriptor: tabs と各 group の tab 割り当てを持つ',
     assert.equal(tabsByLabel['issue を処理する Claude のコマンド'], undefined);
     assert.equal(tabsByLabel['vk-agents（エージェント共通設定）'], 'agents');
 
-    // Orchestrator タブ内は「オーケストレーター」→「GitHub」の順。
+    // Orchestrator タブ内は「自動アップデート」→「オーケストレーター」→「GitHub」の順。
     const orchestratorLabels = desc.groups.filter((g) => g.tab === 'orchestrator').map((g) => g.label);
-    assert.deepEqual(orchestratorLabels, ['オーケストレーター', 'GitHub']);
+    assert.deepEqual(orchestratorLabels, ['自動アップデート', 'オーケストレーター', 'GitHub']);
   });
 });
 
@@ -2835,7 +2849,7 @@ function vkTerminalsSchemaWithContentTabFixture(tabs) {
   };
 }
 
-test('buildSettingsDescriptor: VK Terminals の content 専用タブを自前 3 タブの後ろへ引き継ぐ', () => {
+test('buildSettingsDescriptor: VK Terminals の content 専用タブを自前タブの後ろ・バージョン情報の前へ引き継ぐ', () => {
   const schema = vkTerminalsSchemaWithContentTabFixture([
     { id: 'general', label: '設定' },
     {
@@ -2851,9 +2865,10 @@ test('buildSettingsDescriptor: VK Terminals の content 専用タブを自前 3 
   ]);
   withVkTerminalsSchema(schema, (vkTerminalsDir) => {
     const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile']);
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile', 'version']);
 
-    const mobile = desc.tabs.at(-1);
+    // バージョン情報タブは末尾固定なので、引き継いだタブは最後から 2 番目になる。
+    const mobile = desc.tabs.find((tab) => tab.id === 'mobile');
     assert.equal(mobile.label, '外出先から確認');
     assert.equal(mobile.note, 'スマートフォンから確認できます。');
     assert.deepEqual(mobile.content, [
@@ -2914,7 +2929,7 @@ test('buildVkTerminalsContentTabs: 読み替えは元スキーマのオブジェ
   ]);
   const snapshot = structuredClone(schema);
 
-  const tabs = buildVkTerminalsContentTabs(schema, ['orchestrator', 'terminals', 'agents']);
+  const tabs = buildVkTerminalsContentTabs(schema, ['orchestrator', 'terminals', 'agents', 'version']);
   assert.equal(tabs[0].content[1].tab, 'terminals', '読み替え自体は効いていること');
 
   // 渡したオブジェクトが（配列・ブロックの中身まで）一切変わっていないこと。
@@ -2952,15 +2967,39 @@ test('buildSettingsDescriptor: 自前タブと ID が衝突する content 専用
     try {
       console.warn = (message) => warnings.push(message);
       const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile']);
+      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'mobile', 'version']);
       assert.equal(desc.tabs.find((tab) => tab.id === 'terminals').label, 'Terminals');
-      assert.deepEqual(desc.tabs.at(-1).content, [{ type: 'paragraph', text: '引き継ぐ' }]);
+      assert.deepEqual(
+        desc.tabs.find((tab) => tab.id === 'mobile').content,
+        [{ type: 'paragraph', text: '引き継ぐ' }]
+      );
       // 黙って捨てると原因を追えないため、捨てたタブごとに警告を出す
       // （自前タブとの衝突 1 件＋スキーマ内での ID 重複 1 件）。
       const skipped = warnings.filter((message) => /重複するため引き継ぎません/.test(message));
       assert.equal(skipped.length, 2);
       assert.ok(skipped.some((message) => message.includes('「terminals」')));
       assert.ok(skipped.some((message) => message.includes('「mobile」')));
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+test('buildSettingsDescriptor: バージョン情報タブと ID が衝突する content 専用タブは引き継がない', () => {
+  // バージョン情報タブは他の自前タブより後ろに並べるが、ID の衝突判定には含める必要がある。
+  // 含め忘れると、同じ ID の引き継ぎタブが先勝ちしてバージョン情報が中身の無い空タブになる。
+  const schema = vkTerminalsSchemaWithContentTabFixture([
+    { id: 'version', label: '衝突するタブ', content: [{ type: 'paragraph', text: '衝突' }] },
+  ]);
+  withVkTerminalsSchema(schema, (vkTerminalsDir) => {
+    const savedWarn = console.warn;
+    try {
+      console.warn = () => {};
+      const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir, updateSnapshot: null });
+      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'version']);
+      const version = desc.tabs.find((tab) => tab.id === 'version');
+      assert.equal(version.label, 'バージョン情報');
+      assert.ok(version.content.some((block) => block.type === 'code'), '中身が残っている');
     } finally {
       console.warn = savedWarn;
     }
@@ -2976,25 +3015,25 @@ test('buildSettingsDescriptor: id / label が空、content が空のタブは引
   ]);
   withVkTerminalsSchema(schema, (vkTerminalsDir) => {
     const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'version']);
   });
 });
 
-test('buildSettingsDescriptor: tabs を持たないスキーマでは自前 3 タブのままにする', () => {
+test('buildSettingsDescriptor: tabs を持たないスキーマでは自前 4 タブのままにする', () => {
   withVkTerminalsSchema(vkTerminalsSchemaFixture(), (vkTerminalsDir) => {
     const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+    assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'version']);
   });
 });
 
-test('buildSettingsDescriptor: スキーマを読めない場合は自前 3 タブのまま、読み込み警告も 1 回だけ', () => {
+test('buildSettingsDescriptor: スキーマを読めない場合は自前 4 タブのまま、読み込み警告も 1 回だけ', () => {
   withTmpDir('vko-vk-terminals-no-schema-', (vkTerminalsDir) => {
     const savedWarn = console.warn;
     const warnings = [];
     try {
       console.warn = (message) => warnings.push(message);
       const desc = buildSettingsDescriptor('/tmp/config.json', { vkTerminalsDir });
-      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents']);
+      assert.deepEqual(desc.tabs.map((tab) => tab.id), ['orchestrator', 'terminals', 'agents', 'version']);
       // スキーマ読み込みは 1 回だけ（groups とタブ引き継ぎで読み直すと警告が二重に出る）。
       assert.equal(warnings.filter((message) => /settings-schema\.json を読み込めませんでした/.test(message)).length, 1);
     } finally {
