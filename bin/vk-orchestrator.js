@@ -698,6 +698,7 @@ async function main() {
         writeVkAgentsSettings,
         writeVkAgentsManifestSource,
       } = await import('../src/config.js');
+      const { evaluateSyncExit } = await import('../src/setup/sync-exit.js');
 
       const agentsDir = DEFAULT_VENDORED_VK_AGENTS_DIR;
       const syncPath = resolve(agentsDir, 'scripts', 'sync.sh');
@@ -720,9 +721,16 @@ async function main() {
         stdio: 'inherit',
         env: process.env,
       });
-      if (r.status !== 0) {
+      // sync.sh は部分成功（一部の書き込みを見送った）を終了コード 2 で通知する。
+      // 配布が完了している可能性があるため中断はせず、警告を出したうえで展開元の
+      // 記録まで続行する（2 は異常終了でも起こり得るので警告側で断定はしない）。
+      const syncOutcome = evaluateSyncExit(r.status);
+      if (!syncOutcome.proceed) {
         console.error(`[setup:agents] sync.sh の実行に失敗しました: ${syncPath}`);
-        process.exit(r.status ?? 1);
+        process.exit(syncOutcome.exitCode);
+      }
+      if (syncOutcome.warning) {
+        console.warn(syncOutcome.warning);
       }
 
       const sourceRecordPath = writeVkAgentsManifestSource(agentsDir);
