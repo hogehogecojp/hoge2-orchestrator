@@ -568,6 +568,180 @@ test('runDoctor: assigneeFilter は空だと ok=false、値があると ok=true'
   });
 });
 
+// ---------------------------------------------------------------------------
+// 設定値の表示サニタイズ（issue #248）
+//
+// config から読んだ値をそのままレポートへ載せると、改行入りの値で行構造が崩れ、
+// 「✅ ○○（必須） … 充足」のような存在しない行を混ぜ込める（読んだ人が「必須項目は
+// 足りている」と誤読しうる）。表示だけをサニタイズし、合否判定は生の値のまま行う。
+// ---------------------------------------------------------------------------
+
+// C0/C1 制御文字（src/engine/build-command.js の stripControlChars と同じ範囲）が
+// 含まれていないかをコードポイントで判定する。テスト側に文字クラスを複製せず、
+// テストソースへ生の制御文字を書かないための書き方。
+function hasControlChars(value) {
+  return [...String(value)].some((ch) => {
+    const code = ch.codePointAt(0);
+    return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+  });
+}
+
+// ANSI エスケープ／BEL も同じ理由でコードポイントから作る。
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+
+// レポート中の要件行（`  ✅ ラベル（必須） … 値`）の数。
+// 偽の行が混ざれば要件数と合わなくなるので、行構造そのものの検証に使う。
+function countRequirementLines(report) {
+  return report.split('\n').filter((line) => /^ {2}(?:✅|❌|⚠️) /.test(line)).length;
+}
+
+// 改行で行を割り、その先に「充足済みの必須項目」を装う 1 行を足す注入文字列。
+const FAKE_LINE = '  ✅ 偽の必須項目（必須） … 充足';
+
+test('runDoctor: 制御文字入りの設定値は current / label / hint から除去する（issue #248）', () => {
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: {
+        github: { owner: `acme\n${FAKE_LINE}`, repo: `queue\r${BEL}${FAKE_LINE}` },
+        orchestrator: { assigneeFilter: `me${ESC}[31m\n${FAKE_LINE}` },
+      },
+      allowedOwners: [`acme\n${FAKE_LINE}`, 'other-owner'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      for (const r of reqs) {
+        for (const field of ['current', 'label', 'hint']) {
+          assert.ok(!hasControlChars(r[field]), `${r.id} の ${field} に制御文字が残らないこと`);
+        }
+      }
+      // ANSI の残骸（ESC を落としただけの `[31m`）も表示に残さない。
+      assert.doesNotMatch(byId(reqs, 'orchestrator.assigneeFilter').current, /\[31m/);
+      // 値そのものは（切り詰めずに）残っていること。
+      assert.match(byId(reqs, 'github.owner').current, /^acme/);
+      assert.match(byId(reqs, 'github.repo').current, /^queue/);
+      assert.match(byId(reqs, 'orchestrator.assigneeFilter').current, /^me/);
+    },
+  );
+});
+
+test('formatDoctorReport: 制御文字入りの設定値でも偽の要件行が現れない（issue #248）', () => {
+  // 同じ構成をクリーンな値でも作り、行数・要件行数が一致することで
+  // 「レポートの行構造が変わっていない」を検証する（文字列除去だけの確認で終わらせない）。
+  const buildReport = (injected) =>
+    withDoctorEnv(
+      {
+        queueBackend: 'github',
+        config: {
+          github: {
+            owner: injected ? `acme\n${FAKE_LINE}` : 'acme',
+            repo: injected ? `queue\n${FAKE_LINE}` : 'queue',
+          },
+          orchestrator: { assigneeFilter: injected ? `me\n${FAKE_LINE}` : 'me' },
+        },
+        // owner は allowed_owners に含めない（未充足にして label / hint も
+        // `- ${label}: ${hint}` としてレポートに出す経路を通す）。
+        allowedOwners: injected ? [`other\n${FAKE_LINE}`] : ['other'],
+      },
+      (options) => {
+        const reqs = runDoctor(options);
+        const summary = summarizeDoctor(reqs);
+        return {
+          report: formatDoctorReport(reqs, summary),
+          requirementCount: reqs.length,
+          missingCount: summary.missingRequired.length,
+        };
+      },
+    );
+
+  const clean = buildReport(false);
+  const injected = buildReport(true);
+
+  // 未充足の必須項目（org.allowed_owners）があり、label / hint の経路も通っていること。
+  assert.ok(injected.missingCount > 0, '前提: 未充足の必須項目があること');
+  assert.equal(injected.missingCount, clean.missingCount);
+
+  // 行構造が注入前と変わらない＝偽の行が増えていない。
+  assert.equal(injected.report.split('\n').length, clean.report.split('\n').length);
+  assert.equal(countRequirementLines(injected.report), injected.requirementCount);
+  assert.equal(countRequirementLines(clean.report), clean.requirementCount);
+
+  // 注入文字列が独立した行になっていないこと（実値の後ろに続く 1 行の一部なら可）。
+  for (const line of injected.report.split('\n')) {
+    assert.doesNotMatch(line, /^\s*✅ 偽の必須項目/, `偽の行が独立して現れないこと: ${line}`);
+  }
+  // 「必須項目はすべて充足しています」の締めに化けていないこと。
+  assert.match(injected.report, /❌ 未充足の必須項目が/);
+});
+
+test('formatDoctorReport: U+2028 / U+2029 入りの設定値も除去する（ブラウザ表示で行が割れる）', () => {
+  // この 2 文字は C0/C1 の範囲外なので stripControlChars では落ちない。端末では行が割れないが、
+  // CSS は強制改行として扱うため、診断結果を GitHub の issue へ貼るとブラウザ上で行が割れ、
+  // 偽の要件行が独立して見えてしまう。
+  const LS = String.fromCharCode(0x2028); // LINE SEPARATOR
+  const PS = String.fromCharCode(0x2029); // PARAGRAPH SEPARATOR
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: {
+        github: { owner: `acme${LS}${FAKE_LINE}`, repo: `queue${PS}${FAKE_LINE}` },
+        orchestrator: { assigneeFilter: `me${LS}${FAKE_LINE}` },
+      },
+      // owner を含めず未充足にして、label / hint がレポートに出る経路も通す。
+      allowedOwners: [`other${PS}${FAKE_LINE}`],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      for (const r of reqs) {
+        for (const field of ['current', 'label', 'hint']) {
+          assert.ok(!r[field].includes(LS), `${r.id} の ${field} に U+2028 が残らないこと`);
+          assert.ok(!r[field].includes(PS), `${r.id} の ${field} に U+2029 が残らないこと`);
+        }
+      }
+      const report = formatDoctorReport(reqs);
+      assert.ok(!report.includes(LS), 'レポートに U+2028 が残らないこと');
+      assert.ok(!report.includes(PS), 'レポートに U+2029 が残らないこと');
+      // 値そのものは（切り詰めずに）残っていること。
+      assert.match(byId(reqs, 'github.owner').current, /^acme/);
+      assert.match(byId(reqs, 'github.repo').current, /^queue/);
+    },
+  );
+});
+
+test('runDoctor: 許可オーナー一覧は長さで切り詰めない（issue #248 完了条件 2）', () => {
+  // 外部コマンド出力用の 64 文字制限を流用すると、オーナー数が増えた環境で
+  // 「自分のオーナー名が入っているのに見えない」という別の混乱になる。
+  const owners = Array.from({ length: 10 }, (_, i) => `owner-${String(i).padStart(2, '0')}-organization`);
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: owners[0] } }, allowedOwners: owners },
+    (options) => {
+      const current = byId(runDoctor(options), 'org.allowed_owners').current;
+      assert.ok(current.length > 64, '前提: 検証には 64 文字超の一覧を使う');
+      assert.equal(current, owners.join(', '));
+    },
+  );
+});
+
+test('runDoctor: 制御文字入り owner は allowed_owners に一致させない（fail-close を維持）', () => {
+  // 表示用にサニタイズした値（"vektor-inc"）で比較すると許可ゲートが通ってしまう。
+  // 判定は生の値で行い、ok=false のまま（fail-close）であること。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: 'vek\ntor-inc' } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const owners = byId(reqs, 'org.allowed_owners');
+      assert.equal(owners.ok, false);
+      // 表示は 1 行へ整えられる（判定と表示が別物であることの確認）。
+      assert.match(owners.label, /"vektor-inc"/);
+      assert.ok(!hasControlChars(owners.hint));
+      // github.owner 側の充足判定（hasNonEmpty）も従来どおり生の値で行う。
+      assert.equal(byId(reqs, 'github.owner').ok, true);
+      assert.equal(byId(reqs, 'github.owner').current, 'vektor-inc');
+    },
+  );
+});
+
 test('summarizeDoctor: 全 required 充足で allRequiredOk=true（ローカルモード最小構成）', () => {
   withDoctorEnv({ queueBackend: 'local', config: {}, allowedOwners: ['vektor-inc'] }, (options) => {
     const summary = summarizeDoctor(runDoctor(options));

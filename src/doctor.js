@@ -86,21 +86,68 @@ function readAllowedOwners(canonicalConfigPath) {
 }
 
 /**
- * 外部由来の文字列（コマンド出力・config の設定値）を、レポート／--json に載せても
- * 安全な 1 行の値へ整える。
+ * 表示値から ANSI エスケープ・制御文字・行区切り文字（U+2028 / U+2029）を落とす
+ * （長さは変えない）。
+ *
+ * sanitizeReportValue（外部コマンド出力用）と sanitizeConfigDisplayValue（設定値用）の
+ * 共通部分。両者の違いは「先頭行に切るか」「長さを制限するか」だけなので、除去ロジックは
+ * ここ 1 か所に持つ。
+ *
+ * ANSI CSI シーケンスは ESC ごと先に落とす。ESC 単体は次段の stripControlChars で消えるが、
+ * 先に消さないと `[0m` のような残骸が表示に残って値が読みにくくなるため。ESC を伴わない
+ * `[0m` のような文字列は消えないので、正当な設定値を削ってしまうことはない。
+ * @param {*} value
+ * @returns {string} ANSI と制御文字を除いた文字列
+ */
+function stripAnsiAndControlChars(value) {
+  const withoutAnsi = String(value ?? '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, ''); // ANSI CSI シーケンス（ESC 自体は次段で落ちる）
+  // 残った C0/C1 制御文字は共通ヘルパで落とす（文字クラスを複製しない）。
+  // U+2028 / U+2029 は C0/C1 の範囲外なので stripControlChars では落ちない。端末では行が
+  // 割れないが、CSS はこの 2 文字を強制改行として扱うため、診断結果を GitHub の issue へ
+  // 貼るとブラウザ上では行が割れ、偽の要件行が独立して見えてしまう（診断結果を issue へ
+  // 貼る運用があるので現実的な経路）。表示経路を守るため、C0/C1 とは別にここで落とす。
+  return stripControlChars(withoutAnsi).replace(/[\u2028\u2029]/g, '');
+}
+
+/**
+ * 外部コマンドの出力を、レポート／--json に載せても安全な 1 行の値へ整える。
  *
  * 先頭行のみ・ANSI エスケープと制御文字を除去・長さを制限する。改行入りの値をそのまま
  * 載せるとレポートの行構造が崩れ、偽の ✅/❌ 行を混ぜ込めてしまうため
  * （利用者は「必須項目が充足している」と誤読しうる）。
- * @param {*} value 外部由来の値
+ *
+ * **設定ファイル由来の値には使わない**（sanitizeConfigDisplayValue を使う）。想定値が
+ * "tmux 3.4" 程度のコマンド出力と違い、設定値は許可オーナー一覧のように長くなるのが
+ * 正常なので、64 文字で切ると「自分が設定した値が見えない」という別の混乱を生む。
+ * @param {*} value 外部コマンドの出力
  * @returns {string} 表示に使える 1 行の値（空なら空文字）
  */
 function sanitizeReportValue(value) {
-  const firstLine = String(value ?? '')
-    .split('\n')[0]
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, ''); // ANSI CSI シーケンス（ESC 自体は次段で落ちる）
-  // 残った C0/C1 制御文字は共通ヘルパで落とす（文字クラスを複製しない）。
-  return stripControlChars(firstLine).trim().slice(0, 64);
+  return stripAnsiAndControlChars(String(value ?? '').split('\n')[0])
+    .trim()
+    .slice(0, 64);
+}
+
+/**
+ * 設定ファイル由来の値を、レポート／--json に載せても安全な形へ整える（表示専用）。
+ *
+ * 改行や制御文字入りの設定値をそのまま載せると、レポートの行構造が崩れて
+ * 「✅ ○○（必須） … 充足」のような**存在しない行**を混ぜ込めてしまい、読んだ人が
+ * 「必須項目は足りている」と誤読しうる。それを防ぐのがこの関数の役割（issue #248）。
+ *
+ * sanitizeReportValue と違い、**先頭行で切らず・長さも制限しない**。許可オーナー一覧
+ * （org.allowed_owners）のように項目数が多くなる値を途中で切ると、「自分のオーナー名が
+ * 入っているのに見えない」という別の混乱になるため。改行は除去して 1 行にまとめる。
+ *
+ * **合否（ok）の判定には絶対に使わない。** 例えば "vek\ntor-inc" は除去後に "vektor-inc"
+ * になるため、この値で allowed_owners との一致を見ると許可ゲートが通ってしまう
+ * （fail-open）。比較は生の値のまま行い、この関数は表示だけに使う。
+ * @param {*} value 設定ファイルから読んだ値
+ * @returns {string} 表示に使える値（空なら空文字）
+ */
+function sanitizeConfigDisplayValue(value) {
+  return stripAnsiAndControlChars(value).trim();
 }
 
 /**
@@ -281,7 +328,10 @@ export function runDoctor(options = {}) {
     required: !tmuxMode,
     target: 'external',
     ok: vkTerminalsOk,
-    current: vkTerminalsOk ? vkTerminalsDir : '未導入',
+    // config 由来ではなく require.resolve のパスだが、外から来る表示値であることは同じなので、
+    // 行崩しの経路を残さないよう同じ整形（長さ制限なし）を通す。パスは長くなるのが正常なため
+    // sanitizeReportValue（64 文字）は使わない。
+    current: vkTerminalsOk ? sanitizeConfigDisplayValue(vkTerminalsDir) : '未導入',
     hint: tmuxMode
       ? 'tmux モードでは VK Terminals(GUI) は不要です（vk-terminals モードに切り替えるときだけ `npm run setup:terminals` で導入してください）。'
       : '`npm run setup:terminals` で導入してください（GUI は macOS 専用。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
@@ -399,8 +449,10 @@ export function runDoctor(options = {}) {
     required: false,
     target: 'manifest',
     ok: agentsVersionView.ok,
-    current: agentsVersionView.current,
-    hint: agentsVersionView.hint,
+    // 版の文字列は同梱ファイルと ~/.claude の記録ファイル（どちらも手編集できる JSON）由来で、
+    // config.json と同じく利用者の手元のファイルから来る表示値なので同じ整形を通す。
+    current: sanitizeConfigDisplayValue(agentsVersionView.current),
+    hint: sanitizeConfigDisplayValue(agentsVersionView.hint),
   });
 
   // 1-1 queue.backend（モード選択）
@@ -434,8 +486,13 @@ export function runDoctor(options = {}) {
   });
 
   // 2-1 github.owner（GitHub モードで必須。既定 vektor-inc のままは危険）
+  //
+  // owner は「表示」と「org.allowed_owners との一致判定」の両方に使う。判定には**生の値**を
+  // 使い続け、表示にだけ ownerDisplay を使う。制御文字を除去した値で比較すると
+  // "vek\ntor-inc" が "vektor-inc" に化けて許可ゲートを通ってしまう（fail-open）ため。
   const ownerSet = hasNonEmpty(cfg, 'github.owner');
   const owner = ownerSet ? String(getPath(cfg, 'github.owner')).trim() : DEFAULT_OWNER;
+  const ownerDisplay = sanitizeConfigDisplayValue(owner);
   requirements.push({
     id: 'github.owner',
     group: 'GitHub',
@@ -443,7 +500,7 @@ export function runDoctor(options = {}) {
     required: githubMode,
     target: 'A',
     ok: ownerSet,
-    current: ownerSet ? owner : `（未設定・既定 ${DEFAULT_OWNER}）`,
+    current: ownerSet ? ownerDisplay : `（未設定・既定 ${DEFAULT_OWNER}）`,
     hint: 'config.json の github.owner に自分のユーザー／組織名を設定してください（既定 vektor-inc のままだと他組織のキューを見に行きます）。',
   });
 
@@ -458,7 +515,7 @@ export function runDoctor(options = {}) {
     target: 'A',
     // 既定 task-queue も有効な値なので、名前が解決できていれば ok（実在確認はネットワーク検知のため行わない）。
     ok: true,
-    current: repoSet ? repo : `${DEFAULT_REPO}（既定）`,
+    current: repoSet ? sanitizeConfigDisplayValue(repo) : `${DEFAULT_REPO}（既定）`,
     hint: 'config.json の github.repo に task-queue の Issue を登録するリポジトリ名を設定してください（既定 task-queue で可）。',
   });
 
@@ -471,22 +528,32 @@ export function runDoctor(options = {}) {
     required: githubMode,
     target: 'A',
     ok: assigneeSet,
-    current: assigneeSet ? String(getPath(cfg, 'orchestrator.assigneeFilter')).trim() : '（未設定・一切取り込まない）',
+    // ok は hasNonEmpty（生の値）で判定済み。ここは表示だけを整える。
+    current: assigneeSet
+      ? sanitizeConfigDisplayValue(getPath(cfg, 'orchestrator.assigneeFilter'))
+      : '（未設定・一切取り込まない）',
     hint: 'config.json の orchestrator.assigneeFilter に GitHub ログイン名（自分だけなら自分の login）か all を設定してください（空＝一切取り込まない安全側既定）。',
   });
 
   // 3-1 org.allowed_owners に owner を含める（両モードで必須。硬ゲート通過用）
+  //
+  // 一致判定は生の owner と readAllowedOwners の生の値で行う（サニタイズ済みの値で比較すると
+  // 制御文字入りの owner が正規化されて許可ゲートを通る＝ fail-open になる）。
+  // label / hint にも owner を埋め込んでおり、未充足時は `- ${label}: ${hint}` の形で
+  // レポートに出るため、current と同じく表示は必ずサニタイズ済みの値を使う。
   const allowedOwners = readAllowedOwners(canonicalConfigPath);
   const allowedOwnersOk = allowedOwners.includes(owner);
   requirements.push({
     id: 'org.allowed_owners',
     group: 'vk-agents',
-    label: `org.allowed_owners に "${owner}" を含む`,
+    label: `org.allowed_owners に "${ownerDisplay}" を含む`,
     required: true,
     target: 'C',
     ok: allowedOwnersOk,
-    current: allowedOwners.length ? allowedOwners.join(', ') : '（未設定）',
-    hint: `vk-agents 正本 config の org.allowed_owners に "${owner}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影。未追加だと staff 系スキル／vk-kore の硬ゲートで弾かれます）。`,
+    // 一覧は項目数が多くなるのが正常なので、長さでは切らない（途中で切ると
+    // 「自分のオーナー名が入っているのに見えない」という別の混乱になる）。
+    current: allowedOwners.length ? sanitizeConfigDisplayValue(allowedOwners.join(', ')) : '（未設定）',
+    hint: `vk-agents 正本 config の org.allowed_owners に "${ownerDisplay}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影。未追加だと staff 系スキル／vk-kore の硬ゲートで弾かれます）。`,
   });
 
   return requirements;
