@@ -79,6 +79,9 @@ const QUEUE_REPO_LABELS = [
   { name: 'priority:medium',         color: 'fbca04', description: '優先度：中' },
   { name: 'priority:low',            color: 'd4c5f9', description: '優先度：低' },
   { name: 'blocked:conflict',         color: 'b60205', description: '人手によるコンフリクト解消が必要' },
+  // 停止理由（blocked:*）は赤〜橙で系統をそろえる。優先度（priority:*）の黄色と同色にすると
+  // issue 一覧で優先度ラベルと見分けが付かなくなるため、medium と同じ fbca04 は使わない。
+  { name: 'blocked:review-incomplete', color: 'd93f0b', description: 'レビュー完了マーカーが無く自動マージが保留中（人のレビュー待ち）' },
   { name: 'sequential',              color: 'c5def5', description: '順番に実行（デフォルト）' },
   { name: 'parallel',                color: 'bfd4f2', description: '並列実行可能' },
   { name: 'automerge',               color: '6d1e95', description: 'マージ手順を事前承認（orchestrator が自動マージ）' },

@@ -88,10 +88,14 @@ import { isLocalMachineHost } from './local-machine-host.js';
 import { hasGitHubIntegration, disabledGitHubFeatures } from './github-capability.js';
 import {
   BLOCKED_REASON_CONFLICT,
+  BLOCKED_REASON_REVIEW_INCOMPLETE,
   createStaleBlockedLabelReconciler,
   decideBlockedLabelForConflict,
+  issueHasLabel,
   requiresConflictBlockedLabel,
+  shouldDisplayBlockedReason,
 } from './blocked-reason.js';
+import { createReviewIncompleteBlockedSync } from './review-gate-blocked.js';
 // コマンド組み立て・ポート割り当て・テンプレート展開は副作用の無い純粋関数として
 // build-command.js に分離してある（テストから安全に import するため）。ここでは
 // 内部利用のために import しつつ、後段で再 export して index.js からも参照可能にする。
@@ -200,12 +204,6 @@ const reconcileStaleBlockedLabels = createStaleBlockedLabelReconciler({
   logger: console,
 });
 
-function issueHasLabel(issue, expected) {
-  return (issue?.labels ?? []).some(
-    (label) => (typeof label === 'string' ? label : label?.name) === expected
-  );
-}
-
 async function syncConflictBlockedLabel(issue, prState, humanActionRequired, tag) {
   const blockedConflictLabel = getLabelsConfig().blocked?.conflict ??
     DEFAULT_LABELS.blocked.conflict;
@@ -224,6 +222,18 @@ async function syncConflictBlockedLabel(issue, prState, humanActionRequired, tag
     console.warn(`  ${tag}: ${blockedConflictLabel} の${decision.action === 'add' ? '付与' : '除去'}失敗（次ループで再試行）: ${err.message}`);
   }
 }
+
+// レビュー完了マーカー未付与で自動マージが保留されていることを、メタ issue のコメントと
+// blocked:review-incomplete ラベル（タスクカードの要対応バッジ）で可視化する（#251）。
+// 付与時だけ 1 回通知し、マーカーが付く / PR がマージ・close されたらラベルを外す。
+const syncReviewIncompleteBlockedLabel = createReviewIncompleteBlockedSync({
+  addBlockedReasonLabel: (issueNumber, reason) => github.addBlockedReasonLabel(issueNumber, reason),
+  removeBlockedReasonLabel: (issueNumber, reason) => github.removeBlockedReasonLabel(issueNumber, reason),
+  addComment: (issueNumber, body) => github.addComment(issueNumber, body),
+  getBlockedLabel: () => getLabelsConfig().blocked?.[BLOCKED_REASON_REVIEW_INCOMPLETE] ??
+    DEFAULT_LABELS.blocked[BLOCKED_REASON_REVIEW_INCOMPLETE],
+  logger: console,
+});
 
 function formatAssigneeMode(client) {
   if (!client.pickupEnabled) return '(なし・拾わない)';
@@ -1387,6 +1397,14 @@ async function checkWaitingMergeIssues() {
       humanActionRequired,
       `[merge-watch] issue #${issue.number}`
     );
+    // PR がマージ・close された時点で「レビュー未完了」の要対応バッジは意味を持たないため外す
+    // （issue が close されると取り残し掃除の対象から外れるので、閉じる前のここで落とす）。
+    // reviewPassed は渡さない＝マーカーの有無を見ていないので、open PR では何も操作しない。
+    await syncReviewIncompleteBlockedLabel({
+      issue,
+      prState,
+      tag: `[merge-watch] issue #${issue.number}`,
+    });
 
     // merged 判定を source 分岐より前に共通化する（#209）。
     // prState.merged なら source（waiting-merge / waiting-input）を問わず完了ルートへ流す。
@@ -1794,9 +1812,29 @@ async function tryAutoMerge(issue, prRef, prState, prUrl, source) {
   try {
     reviewPassed = await github.hasReviewGateMarker(prRef.owner, prRef.repo, prRef.number, completion.headSha);
   } catch (err) {
+    // マーカーの有無を判定できていないので、停止理由ラベルは付けも外しもしない（fail-closed）。
+    // mergeable=null を保留する扱いと同じ思想（誤ったバッジ・通知を出さない）。
     console.warn(`  ${tag}: agent-review-passed マーカー確認に失敗（次ループで再試行）: ${err.message}`);
     return;
   }
+  // マーカーが無ければ「要対応: レビュー未完了」バッジを付けて 1 回だけ通知し、
+  // マーカーが付いたらバッジを外す（次に同じ状態になれば再通知できる）。
+  // source（この issue を拾った status。waiting-merge / waiting-input）がバッジ表示対象の
+  // ステータスのときだけラベルを付ける。表示対象外に付けると取り残し掃除が毎ループ外し、
+  // 付与→掃除→再付与でコメントが毎ループ増えてしまうため。
+  await syncReviewIncompleteBlockedLabel({
+    issue,
+    prState,
+    reviewPassed: reviewPassed === true,
+    statusAllowsBlockedLabel: shouldDisplayBlockedReason({
+      status: source,
+      blockedReason: BLOCKED_REASON_REVIEW_INCOMPLETE,
+    }),
+    prUrl,
+    prRef,
+    headSha: completion.headSha,
+    tag,
+  });
   if (!reviewPassed) {
     console.log(`  ${tag}: PR #${prRef.number} は agent-review-passed マーカー（現 head SHA 一致）が無いため自動マージ保留`);
     return;

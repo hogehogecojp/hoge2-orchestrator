@@ -134,8 +134,13 @@ export const DEFAULT_LABELS = {
     medium: 'priority:medium',
     low: 'priority:low',
   },
+  // 停止理由ラベル。キーは停止理由の bare 名（＝ラベル名から `blocked:` を落としたもの）で、
+  // 表示語彙（task-domain.js の BLOCKED_REASON_*）や API 呼び出し
+  // （addBlockedReasonLabel(reason)）のキーも兼ねるため、他セクションのような
+  // camelCase ではなくラベル綴りそのままにする。値だけ config.json で改名できる。
   blocked: {
     conflict: 'blocked:conflict',
+    'review-incomplete': 'blocked:review-incomplete',
   },
   automerge: 'automerge',
   sequential: 'sequential',

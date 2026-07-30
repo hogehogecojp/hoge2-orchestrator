@@ -117,15 +117,33 @@ export const STATUS_EMPHASIS = Object.freeze({
 
 export const BLOCKED_REASON_DISPLAY_LABELS = Object.freeze({
   conflict: '要対応: コンフリクト',
+  'review-incomplete': '要対応: レビュー未完了',
 });
 
+// 停止理由バッジの tone は理由によらず danger で統一する。
+// 緊急度のトリアージは優先度バッジ（high=danger / medium=warning / low=success）が既に
+// 担っており、停止理由まで色で緊急度を語ると 1 枚のカードに物差しが 2 本走る。
+// 停止理由バッジの役目は「自力では進まない・人の手が要る」を一貫した一色で言い切ること。
+// （warning にすると出現頻度の高い優先度「中」と同色で隣り合い、先頭に置いた意味も薄れる。）
 export const BLOCKED_REASON_TONES = Object.freeze({
   conflict: 'danger',
+  'review-incomplete': 'danger',
 });
 
+// どちらも「気づかれずに止まり続ける」ことが問題なので、強調（点滅相当）は両方に付ける。
 export const BLOCKED_REASON_EMPHASIS = Object.freeze({
   conflict: 'attention',
+  'review-incomplete': 'attention',
 });
+
+// 停止理由が同時に複数立ったときに、どれをバッジとして出すかの優先順（先頭が最優先）。
+// バッジは 1 件しか出せないため、より深刻＝人が先に手を動かすべき理由を先に置く。
+// コンフリクトは解消しない限りマージ自体ができず、その過程でレビューもやり直しになるので
+// レビュー未完了より前に出す。config.json のキー記述順で表示が揺れないよう、ここを正本にする。
+export const BLOCKED_REASON_PRIORITY = Object.freeze([
+  'conflict',
+  'review-incomplete',
+]);
 
 // 操作可能（編集 UI を出す）ステータス集合。done は操作不可（false）。
 export const EDITABLE_STATUSES = new Set([
@@ -324,6 +342,7 @@ export const TASK_DOMAIN = Object.freeze({
   blockedReasonDisplayLabels: BLOCKED_REASON_DISPLAY_LABELS,
   blockedReasonTones: BLOCKED_REASON_TONES,
   blockedReasonEmphasis: BLOCKED_REASON_EMPHASIS,
+  blockedReasonPriority: BLOCKED_REASON_PRIORITY,
   editableStatuses: EDITABLE_STATUSES,
   priorityOptions: PRIORITY_OPTIONS,
   priorityBadgeValues: PRIORITY_BADGE_VALUES,

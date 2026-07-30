@@ -62,8 +62,11 @@ waiting-merge → failed → done`）。既知ステータスをこの順に並�
 
 ### バッジ（`badges[]`）
 
-- ブロック理由: `status` が `waiting-merge` / `waiting-input` のときだけ先頭に表示する。
-  コンフリクトで人手対応が必要な場合は「要対応: コンフリクト」・tone `danger`。
+- ブロック理由: `status` が `waiting-merge` のときだけ先頭に表示する。
+  コンフリクトで人手対応が必要な場合は「要対応: コンフリクト」、レビュー完了マーカーが無く
+  自動マージが保留されている場合は「要対応: レビュー未完了」。tone は理由によらず `danger` で統一する
+  （緊急度は優先度バッジが担うため、停止理由バッジは「人の手が要る」を一色で言い切る）。
+  複数の停止理由が同時に立った場合は `blockedReasonPriority` の順（`conflict` → `review-incomplete`）で 1 件だけ表示する。
   取り残された `blocked:*` ラベルが待機系以外のステータスに存在しても表示しない。
 - 優先度: `high` / `medium` / `low` のみバッジ化する（`none` はバッジにしない＝選択肢集合とバッジ集合は別）。
   tone は `high=danger` / `medium=warning` / `low=success`。

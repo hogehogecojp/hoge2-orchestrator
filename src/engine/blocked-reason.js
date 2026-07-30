@@ -1,5 +1,5 @@
 import { isPRConflicted } from './conflict-handback.js';
-import { BLOCKED_REASON_DISPLAY_LABELS } from './task-domain.js';
+import { BLOCKED_REASON_DISPLAY_LABELS, BLOCKED_REASON_PRIORITY } from './task-domain.js';
 
 /**
  * ワークフロー上の位置（status）とは別に、タスクが人手待ちで止まっている理由を扱う純関数群。
@@ -11,12 +11,22 @@ import { BLOCKED_REASON_DISPLAY_LABELS } from './task-domain.js';
  */
 
 export const BLOCKED_REASON_CONFLICT = 'conflict';
+export const BLOCKED_REASON_REVIEW_INCOMPLETE = 'review-incomplete';
 
 const BLOCKED_PREFIX = 'blocked:';
 const DISPLAYABLE_BLOCKED_STATUSES = new Set(['waiting-merge']);
 
-function labelName(label) {
+/**
+ * ラベル要素（文字列 or `{ name }` オブジェクト）からラベル名を取り出す。
+ * GitHub API・ローカルキュー・GUI 由来で表現が混在するため、判定側はこれを通す。
+ */
+export function labelName(label) {
   return typeof label === 'string' ? label : label?.name;
+}
+
+/** issue に指定名のラベルが付いているか判定する。 */
+export function issueHasLabel(issue, expected) {
+  return (issue?.labels ?? []).some((label) => labelName(label) === expected);
 }
 
 function isDisplayableBlockedStatus(labelsConfig, label) {
@@ -79,13 +89,62 @@ export function decideBlockedLabelForConflict({
   return { action: 'none' };
 }
 
-/** issue の labels から設定済み blocked reason の bare 名を返す。未知の blocked:* も保持する。 */
+/**
+ * レビュー完了マーカー（PR の `agent-review-passed` ラベル＋現 head SHA と一致する
+ * `agent-review-passed-sha:` コメント）の有無から blocked:review-incomplete の操作を決める。
+ *
+ * decideBlockedLabelForConflict と同じく、ラベルの有無を冪等性の唯一の真実にする。
+ * ラベルが無い状態でマーカーが無いと分かったときだけ「付与＋通知」を返し、既にラベルが
+ * 付いていれば何もしない（毎ループ通知しない）。
+ *
+ * reviewPassed に true / false 以外（null・undefined＝マーカー確認 API が失敗して
+ * 有無を判定できなかった場合）が来たときは、付与も除去もしない fail-closed。
+ * mergeable=null を保留する conflict 側と同じ思想で、観測できていない状態を根拠に
+ * バッジや通知を点滅させない。
+ * PR が既にマージ／close 済みの場合は、レビュー待ちの意味が無くなるのでラベルを外す。
+ *
+ * statusAllowsBlockedLabel=false（バッジを出さないステータス。例: 後付け automerge で
+ * status:waiting-input に居るタスク）のときは新規付与しない。付けても
+ * collectStaleBlockedIssues の取り残し掃除が毎ループ外すため、付与→掃除→再付与で
+ * 通知が繰り返されてしまう。除去だけは行う。
+ */
+export function decideBlockedLabelForReviewIncomplete({
+  prState = null,
+  reviewPassed = null,
+  hasBlockedLabel = false,
+  statusAllowsBlockedLabel = true,
+} = {}) {
+  if (isPRFinished(prState)) {
+    return { action: hasBlockedLabel ? 'remove' : 'none', notify: false };
+  }
+  if (reviewPassed === true) {
+    return { action: hasBlockedLabel ? 'remove' : 'none', notify: false };
+  }
+  if (reviewPassed === false && statusAllowsBlockedLabel === true) {
+    return hasBlockedLabel
+      ? { action: 'none', notify: false }
+      : { action: 'add', notify: true };
+  }
+  return { action: 'none', notify: false };
+}
+
+/**
+ * issue の labels から設定済み blocked reason の bare 名を返す。未知の blocked:* も保持する。
+ *
+ * バッジは 1 件しか出せないため、複数の blocked:* が同時に付いている場合は
+ * BLOCKED_REASON_PRIORITY（task-domain.js）の順で選ぶ。config.json の
+ * labels.blocked のキー記述順で表示が変わらないよう、優先順は設定と切り離して持つ。
+ * 優先順に載っていない reason 同士は、従来どおり設定の記述順で先勝ちする。
+ */
 export function blockedReasonFromLabels(labels, { labelsConfig } = {}) {
   const names = (labels ?? [])
     .map(labelName)
     .filter((name) => typeof name === 'string' && name !== '');
-  for (const [reason, configuredLabel] of Object.entries(labelsConfig?.blocked ?? {})) {
-    if (names.includes(configuredLabel)) return reason;
+  const matched = Object.entries(labelsConfig?.blocked ?? {})
+    .filter(([, configuredLabel]) => names.includes(configuredLabel))
+    .map(([reason]) => reason);
+  if (matched.length > 0) {
+    return BLOCKED_REASON_PRIORITY.find((reason) => matched.includes(reason)) ?? matched[0];
   }
   const blockedLabel = names.find((name) => name.startsWith(BLOCKED_PREFIX));
   return blockedLabel?.slice(BLOCKED_PREFIX.length) ?? null;

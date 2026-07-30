@@ -4,8 +4,9 @@ import { DEFAULT_LABELS, getLabelsConfig } from '../config.js';
 // エージェントレビュー完了マーカーのラベル名 / SHA コメント接頭辞。
 // automerge を使うタスクコマンドがレビュー完了時に付ける公開規約として固定し、
 // マーカー名自体は config 化しない（config.js の DEFAULT_LABELS からは撤去済み）。
-const REVIEW_PASSED_LABEL = 'agent-review-passed';
-const REVIEW_PASSED_SHA_PREFIX = 'agent-review-passed-sha:';
+// 保留通知の文面でも同じ綴りを使うため export する（規約の綴りを二重に持たない）。
+export const REVIEW_PASSED_LABEL = 'agent-review-passed';
+export const REVIEW_PASSED_SHA_PREFIX = 'agent-review-passed-sha:';
 
 // エージェントレビュー完了マーカー判定で使う、呼び出し引数に依存しない固定値。
 // hasReviewGateMarker が毎回組み立て直さないようモジュールスコープへホイストする。
