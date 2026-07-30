@@ -96,7 +96,8 @@ async function resolveVkDirOrExit() {
 // 全 required が ok なら A（統合 config）に setup.completedAt を記録し、次回以降の案内を省く
 // （真実はあくまで毎回の doctor。フラグは案内スキップ用のヒントに過ぎない）。
 async function warnIfNotReady() {
-  const { runDoctor, summarizeDoctor, formatSetupEntryGuidance } = await import('../src/doctor.js');
+  const { runDoctor, summarizeDoctor, formatSetupEntryGuidance, formatDisplaySanitizedWarning } =
+    await import('../src/doctor.js');
   let requirements;
   try {
     requirements = runDoctor();
@@ -112,11 +113,19 @@ async function warnIfNotReady() {
     // 自分の話ではないと読み飛ばされ、そのまま起動して元の詰まりが再現する。
     // 締めの案内（/vk-orchestrator-setup へ誘導するか、先に Claude Code の導入を促すか）は
     // doctor 側の formatSetupEntryGuidance を唯一の正とし、レポートと文言を一致させる。
+    //
+    // 表示のために値を加工したときの警告も doctor のレポートと同じものを出す。ここに出さないと
+    // 「制御文字が混ざっている」ことは要件の hint から分かっても、**それが改竄の痕跡でありうる**
+    // （＝設定ファイルの出所を疑うべき）という #252 の主眼が up 経路だけ落ちる。加工時の hint は
+    // このブロックが出ることを前提に重複を削っているので、文言の共有ごと揃える。
+    const sanitizedWarning = formatDisplaySanitizedWarning(requirements, { indent: 2 });
     console.warn(
       `[up] 起動に必要な項目が未充足です（${summary.missingRequired.length} 件）。このまま起動しますが、タスクは進みません。\n` +
       // 締めの前で 1 行空ける。長い hint が折り返すと、同じインデントの締めが箇条書きの
       // 続きに見えて階層が潰れるため（doctor のレポートは空行で切っている）。
       summary.missingRequired.map((r) => `  - ${r.label}: ${r.hint}`).join('\n') + '\n\n' +
+      // 加工が起きていなければ空文字。行を増やさない。
+      (sanitizedWarning ? `${sanitizedWarning}\n\n` : '') +
       // doctor のレポートと同じく requirements も渡す（別マシン構成では claude が任意に
       // 落ちて missingRequired に入らず、summary だけでは締めの分岐を選べないため）。
       `  ${formatSetupEntryGuidance(summary, requirements)}\n` +

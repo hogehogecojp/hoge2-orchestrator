@@ -20,6 +20,7 @@ import {
   summarizeDoctor,
   formatDoctorReport,
   formatSetupEntryGuidance,
+  formatDisplaySanitizedWarning,
   isLocalVkTerminalsApiHost,
 } from '../src/doctor.js';
 
@@ -943,8 +944,9 @@ test('formatDoctorReport: 制御文字入りの設定値でも偽の要件行が
   assert.ok(injected.missingCount > 0, '前提: 未充足の必須項目があること');
   assert.equal(injected.missingCount, clean.missingCount);
 
-  // 行構造が注入前と変わらない＝偽の行が増えていない。
-  assert.equal(injected.report.split('\n').length, clean.report.split('\n').length);
+  // 行構造が注入前と変わらない＝偽の行が増えていない。増えてよいのは、加工が起きたことを
+  // 知らせる固定の警告ブロック（空行 + 2 行。issue #252）だけ。
+  assert.equal(injected.report.split('\n').length, clean.report.split('\n').length + 3);
   assert.equal(countRequirementLines(injected.report), injected.requirementCount);
   assert.equal(countRequirementLines(clean.report), clean.requirementCount);
 
@@ -1018,7 +1020,307 @@ test('runDoctor: 制御文字入り owner は allowed_owners に一致させな�
       assert.ok(!hasControlChars(owners.hint));
       // github.owner 側の充足判定（hasNonEmpty）も従来どおり生の値で行う。
       assert.equal(byId(reqs, 'github.owner').ok, true);
-      assert.equal(byId(reqs, 'github.owner').current, 'vektor-inc');
+      // 表示は整形済みの値 ＋ 加工したことの注記（issue #252。注記の中身はそちらのテストで検証）。
+      assert.match(byId(reqs, 'github.owner').current, /^vektor-inc（/);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 表示のために加工したことの明示（issue #252）
+//
+// #248 で表示値のサニタイズは入ったが、加工したことが利用者に一切伝わらないため、
+// 「表示は一致しているのに ❌」という自己矛盾したレポートに見え、実際の原因
+// （設定ファイルに制御文字が混入している）へ辿り着けない。
+// 加工が起きたときだけ、その旨をレポート／要件オブジェクトから読めるようにする。
+// 合否（ok）は従来どおり生の値で判定する（加工後の値で判定すると fail-open）。
+// ---------------------------------------------------------------------------
+
+test('runDoctor: 表示のために加工した設定値には注記と displaySanitized が付く（issue #252）', () => {
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: 'vek\ntor-inc' } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const owner = byId(reqs, 'github.owner');
+      // 表示は従来どおり 1 行に整えたうえで、加工したことが分かる注記を添える。
+      assert.match(owner.current, /^vektor-inc/);
+      assert.match(owner.current, /制御文字を除去/);
+      assert.ok(!hasControlChars(owner.current));
+      // --json の消費側が文字列を読まずに判定できる真偽値。
+      assert.equal(owner.displaySanitized, true);
+      // 合否は生の値のまま（fail-close を維持）。
+      assert.equal(owner.ok, true);
+      assert.equal(byId(reqs, 'org.allowed_owners').ok, false);
+    },
+  );
+});
+
+test('runDoctor: 制御文字入り owner のとき org.allowed_owners が「表示は一致でも未充足」を説明する（issue #252）', () => {
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: 'vek\ntor-inc' } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const owners = byId(reqs, 'org.allowed_owners');
+      // 引用符の中は値だけに保ちつつ（注記を値の一部に読ませない）、
+      // 行だけを見ても加工が分かるよう label の末尾に注記を出す。
+      assert.match(owners.label, /"vektor-inc"/);
+      assert.match(owners.label, /制御文字を除去/);
+      assert.equal(owners.displaySanitized, true);
+      // 未充足リストに出る hint で、表示と判定が食い違う理由まで説明する。
+      assert.match(owners.hint, /制御文字/);
+      assert.match(owners.hint, /github\.owner/);
+      assert.ok(!hasControlChars(owners.hint));
+      // レポート本体（未充足リスト）からも読み取れること。
+      const report = formatDoctorReport(reqs);
+      assert.match(report, /制御文字/);
+      // 注記を足しても行構造は崩さない。
+      assert.equal(countRequirementLines(report), reqs.length);
+    },
+  );
+});
+
+test('runDoctor: 許可オーナー一覧側が加工されたときも注記が付く（判定は素通しのまま）', () => {
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { owner: 'acme' } },
+      allowedOwners: ['acme', `other${BEL}`],
+    },
+    (options) => {
+      const owners = byId(runDoctor(options), 'org.allowed_owners');
+      // owner 自体はそのまま一致するので ok は true のまま。
+      assert.equal(owners.ok, true);
+      assert.equal(owners.displaySanitized, true);
+      assert.match(owners.current, /制御文字を除去/);
+    },
+  );
+});
+
+test('runDoctor: vk-terminals のパスと展開済み定義の版にも注記が付く（#248 の加工対象を網羅）', () => {
+  withDoctorEnv({ queueBackend: 'local', config: {}, allowedOwners: ['vektor-inc'] }, (options) => {
+    const reqs = runDoctor({
+      ...options,
+      resolveVkTerminalsDir: () => `/path/to/vk${BEL}-terminals`,
+      // semver として読めない版になるので current / hint に両方の版が載る経路を通る。
+      vendoredVkAgentsVersion: `1.2${BEL}.3`,
+      vkAgentsManifestSource: { sourceVersion: '1.0.0' },
+    });
+    const terminals = byId(reqs, 'vk-terminals');
+    assert.equal(terminals.displaySanitized, true);
+    assert.match(terminals.current, /制御文字を除去/);
+    assert.ok(!hasControlChars(terminals.current));
+
+    const agentsVersion = byId(reqs, 'vk-agents-version');
+    assert.equal(agentsVersion.displaySanitized, true);
+    assert.match(agentsVersion.current, /制御文字を除去/);
+    assert.ok(!hasControlChars(agentsVersion.current));
+  });
+});
+
+// オーナー名として見せられない owner を引用符に入れると、`org.allowed_owners に "" を
+// 追加してください`（`{}` なら `"[object Object]" を追加してください`）という
+// 「許可オーナー一覧（セキュリティ境界）へ無意味な項目を足せ」という指示になる。
+// **その状態に落ちる経路は制御文字だけではない**ので、入力の型も振って不変条件を固定する。
+// - 文字列以外の値は String() を通した結果が空になるとは限らない（[] は '' だが {} は
+//   '[object Object]'）。「加工されたか」でも「空か」でも拾い切れないため型自体を見る。
+for (const { name, owner, sanitized, ok = false } of [
+  { name: '制御文字のみ', owner: BEL, sanitized: true },
+  // 以下は加工が起きない（＝ ownerAltered が false になる）経路。
+  { name: '空配列', owner: [] },
+  { name: 'オブジェクト', owner: {} },
+  { name: '数値', owner: 123 },
+  { name: '真偽値', owner: true },
+  {
+    // String(['vektor-inc']) は 'vektor-inc' に化けるため ok は true になる一方、label は
+    // 「値を見せられない」側に落ちる。この食い違い（✅ なのに値を見せない）は判定側
+    // （hasNonEmpty が非文字列を「値あり」と数える）の話で #261 で扱う。ここでは現状が
+    // 意図的であることを記録に残すために pin する。
+    // 値は既定オーナー名（vektor-inc）を避ける。hint 中の「書き方の例」と同じ文字列だと、
+    // 「設定値を見せた」のか「例示」なのかを検査が区別できず、除外フラグが必要になるため。
+    name: '要素が 1 つの配列（#261 で扱う組み合わせ）',
+    owner: ['acme'],
+    ok: true,
+  },
+]) {
+  test(`runDoctor: owner が${name}のとき値を引用符で見せず、一覧への追加も案内しない（issue #252 レビュー指摘）`, () => {
+    withDoctorEnv(
+      // 一覧に 'acme' を含める（配列ケースだけ ok: true になる経路を通すため）。
+      { queueBackend: 'github', config: { github: { owner } }, allowedOwners: ['vektor-inc', 'acme'] },
+      (options) => {
+        const reqs = runDoctor(options);
+        const owners = byId(reqs, 'org.allowed_owners');
+        // label には引用符を一切出さない（オーナー名として見せられる値が無いため）。
+        assert.doesNotMatch(owners.label, /"/);
+        // hint に引用符が出るのは「書き方の例示」だけ。**設定値そのものは引用符に入れない**
+        // （`"[object Object]" を追加してください` を出さない）。生の値で確認する。
+        assert.ok(
+          !owners.hint.includes(`"${String(owner)}"`),
+          `設定値を引用符で見せないこと: ${owners.hint}`,
+        );
+        // 空の引用符は書き方の例示としても出ない＝常に「設定値をそのまま見せた」痕跡。
+        // 生の値を見る上の鍵では、除去後の値（制御文字のみ → 空文字）を入れた場合に当たらない。
+        assert.doesNotMatch(owners.hint, /""/);
+        // 引用符で見せる代わりに、どの設定値の話かを名前で示す。
+        assert.match(owners.label, /^org\.allowed_owners に github\.owner の値を含む$/);
+        // 一覧への追加ではなく、まず owner を直すことだけを案内する。
+        assert.doesNotMatch(owners.hint, /追加してください/);
+        assert.match(owners.hint, /github\.owner を/);
+        // 原因が「制御文字だけ」か「文字列でない」かで言い分ける。文字列以外は typeof で
+        // 確定して分かっているので断定し、直し方は引用符付きの形を見せる。
+        if (sanitized) {
+          assert.match(owners.hint, /制御文字（画面に表示できない文字）だけの値/);
+        } else {
+          assert.match(owners.hint, /文字列のオーナー名になっていません/);
+          assert.match(owners.hint, /のように引用符で囲んだユーザー／組織名へ直して/);
+        }
+        // 判定は従来どおり（生の値をそのまま一覧と突き合わせる）。
+        assert.equal(owners.ok, ok);
+        // 加工が起きたときだけフラグが立つ（見せられないことと、加工したことは別）。
+        assert.equal(owners.displaySanitized, sanitized || undefined);
+      },
+    );
+  });
+}
+
+test('runDoctor: 制御文字だけの owner は current で「表示できません」まで言い切る', () => {
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: BEL } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      // 「状態・結果」の 2 段構え（他の空値表示 `（未設定・一切取り込まない）` と揃える）。
+      assert.equal(
+        byId(runDoctor(options), 'github.owner').current,
+        '（値が制御文字のみで表示できません）',
+      );
+    },
+  );
+});
+
+test('runDoctor: 加工時の hint は原因から始まり、一覧への追加は後段に置く（issue #252 レビュー指摘）', () => {
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: 'vek\ntor-inc' } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const hint = byId(runDoctor(options), 'org.allowed_owners').hint;
+      // 1 文目が原因の説明であること（従来の「一覧に追加してください」で始まらない）。
+      assert.match(hint, /^config\.json の github\.owner に/);
+      // 「まず直す」が「そのうえで追加」より前に来ていること。
+      const fixAt = hint.indexOf('まず github.owner を制御文字の無い値へ直して');
+      const addAt = hint.indexOf('org.allowed_owners に "vektor-inc" を追加');
+      assert.ok(fixAt >= 0, '対処（owner を直す）が含まれること');
+      assert.ok(addAt > fixAt, '一覧への追加は対処より後ろに置くこと');
+      // #252 の核心（表示は一致して見えるのに未充足）は削らない。
+      assert.match(hint, /一覧と同じ名前に見えますが/);
+      // ⚠️ ブロックと重複する記述は持たない（用語の言い換え・出所を疑う一文）。
+      assert.doesNotMatch(hint, /画面には表示されない文字/);
+      assert.doesNotMatch(hint, /出所そのものを疑って/);
+      // 句点直後に半角スペースを入れない（末尾追記をやめたので発生しない）。
+      assert.doesNotMatch(hint, /。 /);
+    },
+  );
+});
+
+test('formatDoctorReport: 加工があれば必須充足でも締めに警告を出す（issue #252 レビュー指摘）', () => {
+  // 許可オーナー一覧の側だけに制御文字がある構成。必須項目はすべて充足するので、
+  // 要件ごとの hint はどこにも出ない＝この警告が無いと注記の意味が誰にも伝わらない。
+  withDoctorEnv(
+    {
+      queueBackend: 'local',
+      config: {},
+      allowedOwners: ['vektor-inc', `other${BEL}`],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      const summary = summarizeDoctor(reqs);
+      assert.equal(summary.allRequiredOk, true, '前提: 必須項目はすべて充足していること');
+      const report = formatDoctorReport(reqs, summary);
+      assert.match(report, /画面には表示されない文字（制御文字）が含まれていた/);
+      assert.match(report, /設定ファイルの出所そのものを疑って/);
+      // 参照先はファイル名の列挙ではなく「注記が付いた項目」。加工は config.json 以外
+      // （VK Terminals のパス・版の記録ファイル）でも起きるので、列挙すると漏れが嘘になる。
+      // 参照先は「doctor の一覧」。`up` は要件一覧を出さないので「上の一覧」だと
+      // 加工が充足済みの行だけで起きたとき、どこにも無いものを指すことになる。
+      assert.match(report, /doctor の一覧で注記が付いた項目の値を/);
+      // 利用者が開いて直せるファイルとは限らない（VK Terminals のパスなど）ので言い切らない。
+      assert.doesNotMatch(report, /その設定元のファイル/);
+      // 充足時の締め（up 案内）も従来どおり出ること。ただし ⚠️ を出したまま全面 GO にしない
+      // （端末では最終行が最後の印象になる）。条件を先に置いた 1 文にする。
+      assert.match(report, /vk-orchestrator up/);
+      assert.equal(
+        report.trimEnd().split('\n').at(-1),
+        '   上の ⚠️ を確認してから `vk-orchestrator up` で起動してください。',
+      );
+      // 警告を足しても要件行の本数は変わらない。
+      assert.equal(countRequirementLines(report), reqs.length);
+    },
+  );
+});
+
+test('formatDisplaySanitizedWarning: doctor と up で同じ文言を共有する（字下げだけ変わる）', () => {
+  // up の未充足警告は formatDoctorReport を通らない。文言を別々に持つと、同じ状態なのに
+  // 経路で伝わる情報が食い違い、加工時の hint が寄りかかっている前提（このブロックが必ず出る）
+  // も崩れる。共有していること自体をテストで固定する。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: 'vek\ntor-inc' } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const plain = formatDisplaySanitizedWarning(reqs);
+      // 字下げは空白の個数（数値）で受ける。任意の文字列を許すと、後から変数を繋いだときに
+      // 改行入りの値で固定文言の中へ行を生やせてしまうため。
+      const indented = formatDisplaySanitizedWarning(reqs, { indent: 2 });
+      assert.equal(indented, plain.split('\n').map((line) => `  ${line}`).join('\n'));
+      // 数値で受けている＝改行を混ぜられない（行数は常に 2 行のまま）。
+      assert.equal(indented.split('\n').length, 2);
+      // #252 の主眼（加工は改竄の痕跡でありうる）を伝える一文は、どちらの経路にも載る。
+      assert.match(plain, /設定ファイルの出所そのものを疑って/);
+      // doctor のレポートは同じ文言をそのまま埋め込む（二重管理にしない）。
+      assert.ok(formatDoctorReport(reqs).includes(plain));
+    },
+  );
+});
+
+test('formatDisplaySanitizedWarning: 加工が無ければ空文字（呼び出し側が真偽値で扱える）', () => {
+  withDoctorEnv({ queueBackend: 'local', config: {}, allowedOwners: ['vektor-inc'] }, (options) => {
+    assert.equal(formatDisplaySanitizedWarning(runDoctor(options)), '');
+  });
+});
+
+test('formatDoctorReport: 加工が無ければ制御文字の警告も up 行の但し書きも出さない', () => {
+  withDoctorEnv({ queueBackend: 'local', config: {}, allowedOwners: ['vektor-inc'] }, (options) => {
+    const report = formatDoctorReport(runDoctor(options));
+    assert.doesNotMatch(report, /制御文字/);
+    // 締めは従来の文言のまま（1 文字も変えない）。
+    assert.match(report, /^ {3}`vk-orchestrator up` で起動できます。$/m);
+    assert.doesNotMatch(report, /上の ⚠️ を確認/);
+  });
+});
+
+test('runDoctor: 加工が起きない通常ケースでは表示も要件オブジェクトも従来どおり（ノイズを足さない）', () => {
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: {
+        github: { owner: 'acme', repo: 'queue' },
+        orchestrator: { assigneeFilter: 'me' },
+      },
+      allowedOwners: ['acme', 'other'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      // 加工していない行にはフラグ自体を生やさない（--json の出力を 1 バイトも変えない）。
+      for (const r of reqs) {
+        assert.ok(
+          !Object.hasOwn(r, 'displaySanitized'),
+          `${r.id} に displaySanitized を生やさないこと`,
+        );
+      }
+      // 表示値は #248 以前と同じ（注記が混ざらない）。
+      assert.equal(byId(reqs, 'github.owner').current, 'acme');
+      assert.equal(byId(reqs, 'github.repo').current, 'queue');
+      assert.equal(byId(reqs, 'orchestrator.assigneeFilter').current, 'me');
+      assert.equal(byId(reqs, 'org.allowed_owners').current, 'acme, other');
+      assert.equal(byId(reqs, 'org.allowed_owners').label, 'org.allowed_owners に "acme" を含む');
+      assert.doesNotMatch(byId(reqs, 'org.allowed_owners').hint, /制御文字/);
+      // レポート本文にも注記が現れない。
+      assert.doesNotMatch(formatDoctorReport(reqs), /制御文字/);
     },
   );
 });

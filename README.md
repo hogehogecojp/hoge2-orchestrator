@@ -115,6 +115,10 @@ CLI だけで「自分の環境で何が足りないか」を確認したい場�
 npx vk-orchestrator doctor           # 充足状況の診断（✅/❌ と次にやるコマンド）
 npx vk-orchestrator doctor --json    # 機械可読（{ id, group, label, required, ok, current, hint, target } の配列＋要約）
                                      # ※ claude 項目のみ usesDefaultCommand（検査対象が既定の claude か）を追加で持ちます
+                                     # ※ 設定値に制御文字が含まれ、表示のために除去した項目だけ displaySanitized: true を追加で持ちます
+                                     #    （合否は加工前の値で判定するため、表示が一致していても未充足になることがあります）
+                                     #    対象は設定ファイル由来の項目のみ。外部コマンドの出力由来の項目（tmux / claude の版・
+                                     #    コマンド名 / VK Terminals API のホスト）は 64 文字での切り詰めもあり、このフラグの対象外です
 ```
 
 ## セットアップ（手動）

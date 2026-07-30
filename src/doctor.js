@@ -155,11 +155,114 @@ function sanitizeReportValue(value) {
  * **合否（ok）の判定には絶対に使わない。** 例えば "vek\ntor-inc" は除去後に "vektor-inc"
  * になるため、この値で allowed_owners との一致を見ると許可ゲートが通ってしまう
  * （fail-open）。比較は生の値のまま行い、この関数は表示だけに使う。
+ *
+ * 呼び出しは toDisplayValue に集約する（加工したことを利用者へ伝える注記の付与まで含めて
+ * 1 か所で扱うため。issue #252）。
  * @param {*} value 設定ファイルから読んだ値
  * @returns {string} 表示に使える値（空なら空文字）
  */
 function sanitizeConfigDisplayValue(value) {
   return stripAnsiAndControlChars(value).trim();
+}
+
+/**
+ * 表示のために値を加工したときに添える注記（issue #252）。基本は current の末尾に置き、
+ * その行で加工されたのが label 側の値なら label の末尾に置く（指し示す先を間違えないため）。
+ *
+ * #248 で表示値のサニタイズは入ったが、加工したことが一切伝わらないため
+ * 「✅ … vektor-inc」の下に「❌ org.allowed_owners に "vektor-inc" を含む … vektor-inc」が
+ * 並ぶ、表示上は一致しているのに未充足という自己矛盾したレポートになっていた。
+ * 読んだ人は doctor のバグだと受け取り、真因（設定ファイルに制御文字が混入している＝
+ * 改竄の痕跡でありうる）へ辿り着けない。加工の事実こそが手がかりなので、消さずに見せる。
+ */
+const DISPLAY_SANITIZED_NOTE = '（表示のため制御文字を除去）';
+
+/**
+ * 設定由来の値を表示用に整え、「表示のために加工したか」も併せて返す。
+ *
+ * sanitizeConfigDisplayValue の呼び出し箇所ごとに「加工前後を比べて注記を足す」を書くと
+ * 同じ 2 行が 6 か所へ散るので、判断と文言をここ 1 か所に集約する。
+ *
+ * **返すのは表示用の値だけで、合否（ok）の判定には使わない。** 判定に加工後の値を使うと
+ * "vek\ntor-inc" が "vektor-inc" に化けて許可オーナーのゲートを通る（fail-open）。
+ *
+ * altered の比較相手は「trim 済みの生の値」にする。生の値と直接比べると、前後の空白を
+ * 落としただけで「加工した」と言ってしまうため（合否側も trim 済みの値を見ているので、
+ * 空白の有無で表示と判定が食い違うことはない＝注記を出す理由が無い）。
+ * @param {*} value 設定ファイルなど手元のファイルから読んだ値
+ * @returns {{ text:string, altered:boolean, display:string }} text=注記なしの整形済み値 /
+ *   altered=加工が起きたか / display=注記込みの表示値
+ */
+function toDisplayValue(value) {
+  const text = sanitizeConfigDisplayValue(value);
+  const altered = text !== String(value ?? '').trim();
+  let display = text;
+  if (altered) {
+    // 制御文字しか無い値だと注記だけが残り、注記そのものが値のように読めてしまう。
+    // その場合は「制御文字のみ」という事実だけで止めず、「だから表示できない」まで言い切る
+    // （他の空値表示 `（未設定・一切取り込まない）` と同じ「状態・結果」の 2 段構えに揃える）。
+    display = text === '' ? '（値が制御文字のみで表示できません）' : `${text}${DISPLAY_SANITIZED_NOTE}`;
+  }
+  return { text, altered, display };
+}
+
+/**
+ * 加工が起きた要件にだけ立てるフラグ（`--json` の消費側が文字列を読まずに判定するため）。
+ *
+ * 注記を current の文字列へ混ぜるだけだと機械可読性が落ちる（消費側が日本語の文言に
+ * 依存する）ので、真偽値も併せて持たせる。逆に **加工が起きていないときは
+ * キー自体を生やさない**。`displaySanitized: false` を全行へ足すと、この問題と無縁の
+ * 環境の `--json` 出力まで変わり、既存の消費側の差分を無意味に揺らすため。
+ * claude 要件の usesDefaultCommand と同じく、必要な行だけが持つ追加フィールドとして扱う。
+ * @param {...boolean} flags 各表示値の altered
+ * @returns {{ displaySanitized?: true }} 展開してそのまま要件オブジェクトへ混ぜる
+ */
+function displaySanitizedFlag(...flags) {
+  return flags.some(Boolean) ? { displaySanitized: true } : {};
+}
+
+/**
+ * 表示のために値を加工したときの警告（2 行）。**doctor のレポートと `up` の未充足警告で
+ * 共有する**ため、文言はここ 1 か所に持つ。
+ *
+ * 分けて持つと、同じ状態なのに経路によって伝わる情報が食い違う。とくに
+ * 「覚えのない文字なら、設定ファイルの出所そのものを疑ってください」は #252 の主眼
+ * （加工の事実は改竄の痕跡でありうる）を伝える一文で、片方の経路から落ちると
+ * 「注記は出るが、それが何を意味するかはどこにも書かれていない」状態に戻る。
+ *
+ * 参照先にファイル名を列挙しない。加工は config.json だけでなく vk-agents 正本 config・
+ * require.resolve で解決した VK Terminals のパス・~/.claude の版の記録ファイルでも起きるので、
+ * 列挙は広げても広げ切れず、漏れた経路の利用者には嘘の案内になる。「ファイル」とも言い切らない
+ * （VK Terminals のパスは利用者が開いて直せるファイルではない）。代わりに **注記そのものを
+ * 目印にする**（「注記が付いた項目」なら 6 経路すべてを 1 文でカバーできる）。
+ */
+const DISPLAY_SANITIZED_WARNING_LINES = [
+  '一部の値に、画面には表示されない文字（制御文字）が含まれていたため、表示のみ取り除いています（判定は元の値のまま行っています）。',
+  // 「上の一覧」とは言わない。`up` の未充足警告は要件一覧を出さず未充足項目の箇条書きだけなので、
+  // 加工が充足済みの行だけで起きた場合、`up` の出力のどこにも注記が現れない。「doctor の一覧」なら、
+  // レポート側は一覧がすぐ上にあり、`up` 側は doctor へ正しく誘導できる（両経路で読める言い方）。
+  'doctor の一覧で注記が付いた項目の値を、その出どころ（config.json など）から見直してください。覚えのない文字なら、設定ファイルの出所そのものを疑ってください。',
+];
+
+/**
+ * 加工が起きていれば上記の警告を組み立てる。起きていなければ空文字を返す
+ * （呼び出し側は真偽値として扱える）。
+ *
+ * 要件名も値も埋め込まない固定文言にしている。設定値から偽造できない文字列が 1 か所ある、
+ * というのが警告としての信頼性そのもので、可変値を入れるとその性質を手放すことになる。
+ * 字下げは**空白の個数（数値）で受ける**。任意の文字列を許すと、後から誰かが変数を繋いだ
+ * 瞬間に、改行入りの値で固定文言の中へ行を生やせてしまう（`\n  ✅ 偽の必須項目（必須） … 充足`）。
+ * 本体を固定文言にして「設定値からは偽造できない文字列が 1 か所ある」性質を作っているので、
+ * その性質は引数の型でも守る。柔軟さより、生やせないことを優先する。
+ * @param {ReturnType<typeof runDoctor>} requirements
+ * @param {{ indent?: number }} [options] 行頭に付ける空白の個数（`up` の警告は 2）
+ * @returns {string} 2 行の警告（加工が無ければ空文字）
+ */
+export function formatDisplaySanitizedWarning(requirements, { indent = 0 } = {}) {
+  if (!requirements?.some((r) => r.displaySanitized)) return '';
+  const pad = ' '.repeat(indent);
+  const [cause, action] = DISPLAY_SANITIZED_WARNING_LINES;
+  return `${pad}⚠️ ${cause}\n${pad}   ${action}`;
 }
 
 /**
@@ -380,6 +483,12 @@ export function runDoctor(options = {}) {
   } catch {
     vkTerminalsOk = false;
   }
+  // config 由来ではなく require.resolve のパスだが、外から来る表示値であることは同じなので、
+  // 行崩しの経路を残さないよう同じ整形（長さ制限なし）を通す。パスは長くなるのが正常なため
+  // sanitizeReportValue（64 文字）は使わない。
+  const vkTerminalsView = toDisplayValue(vkTerminalsDir);
+  // 未導入のときは整形前の値を表示しないので、加工の有無も問わない。
+  const vkTerminalsAltered = vkTerminalsOk && vkTerminalsView.altered;
   requirements.push({
     id: 'vk-terminals',
     group: '前提',
@@ -387,13 +496,11 @@ export function runDoctor(options = {}) {
     required: !tmuxMode,
     target: 'external',
     ok: vkTerminalsOk,
-    // config 由来ではなく require.resolve のパスだが、外から来る表示値であることは同じなので、
-    // 行崩しの経路を残さないよう同じ整形（長さ制限なし）を通す。パスは長くなるのが正常なため
-    // sanitizeReportValue（64 文字）は使わない。
-    current: vkTerminalsOk ? sanitizeConfigDisplayValue(vkTerminalsDir) : '未導入',
+    current: vkTerminalsOk ? vkTerminalsView.display : '未導入',
     hint: tmuxMode
       ? 'tmux モードでは VK Terminals(GUI) は不要です（vk-terminals モードに切り替えるときだけ `npm run setup:terminals` で導入してください）。'
       : '`npm run setup:terminals` で導入してください（GUI は macOS 専用。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
+    ...displaySanitizedFlag(vkTerminalsAltered),
   });
 
   // tmux コマンド導入（tmux モードのみ。vk-terminals モードでは行自体を出さない）
@@ -559,6 +666,10 @@ export function runDoctor(options = {}) {
     manifestExists: agentsSetupOk,
   });
   const agentsVersionView = formatAgentsVersionRequirement(agentsVersionState);
+  // 版の文字列は同梱ファイルと ~/.claude の記録ファイル（どちらも手編集できる JSON）由来で、
+  // config.json と同じく利用者の手元のファイルから来る表示値なので同じ整形を通す。
+  const agentsVersionCurrent = toDisplayValue(agentsVersionView.current);
+  const agentsVersionHint = toDisplayValue(agentsVersionView.hint);
   requirements.push({
     id: 'vk-agents-version',
     group: '前提',
@@ -566,10 +677,11 @@ export function runDoctor(options = {}) {
     required: false,
     target: 'manifest',
     ok: agentsVersionView.ok,
-    // 版の文字列は同梱ファイルと ~/.claude の記録ファイル（どちらも手編集できる JSON）由来で、
-    // config.json と同じく利用者の手元のファイルから来る表示値なので同じ整形を通す。
-    current: sanitizeConfigDisplayValue(agentsVersionView.current),
-    hint: sanitizeConfigDisplayValue(agentsVersionView.hint),
+    current: agentsVersionCurrent.display,
+    // 注記は current 側へ一度だけ添える。hint は文章なので、途中に注記を挟むと文が壊れて
+    // 読めなくなる（どの行で加工が起きたかは current と displaySanitized で分かる）。
+    hint: agentsVersionHint.text,
+    ...displaySanitizedFlag(agentsVersionCurrent.altered, agentsVersionHint.altered),
   });
 
   // 1-1 queue.backend（モード選択）
@@ -605,11 +717,17 @@ export function runDoctor(options = {}) {
   // 2-1 github.owner（GitHub モードで必須。既定 vektor-inc のままは危険）
   //
   // owner は「表示」と「org.allowed_owners との一致判定」の両方に使う。判定には**生の値**を
-  // 使い続け、表示にだけ ownerDisplay を使う。制御文字を除去した値で比較すると
+  // 使い続け、表示にだけ ownerView を使う。制御文字を除去した値で比較すると
   // "vek\ntor-inc" が "vektor-inc" に化けて許可ゲートを通ってしまう（fail-open）ため。
   const ownerSet = hasNonEmpty(cfg, 'github.owner');
   const owner = ownerSet ? String(getPath(cfg, 'github.owner')).trim() : DEFAULT_OWNER;
-  const ownerDisplay = sanitizeConfigDisplayValue(owner);
+  const ownerView = toDisplayValue(owner);
+  // 設定値が文字列として書かれているか。オブジェクト・配列・数値・真偽値は String() を通すと
+  // "[object Object]" のような**値の形をした文字列**に化けるだけで、オーナー名としては使えない。
+  // 未設定のときは既定値（文字列）を見るので、文字列として扱う。
+  const ownerIsString = !ownerSet || typeof getPath(cfg, 'github.owner') === 'string';
+  // 未設定なら表示するのは既定値の案内文なので、加工の有無は問わない。
+  const ownerAltered = ownerSet && ownerView.altered;
   requirements.push({
     id: 'github.owner',
     group: 'GitHub',
@@ -617,13 +735,15 @@ export function runDoctor(options = {}) {
     required: githubMode,
     target: 'A',
     ok: ownerSet,
-    current: ownerSet ? ownerDisplay : `（未設定・既定 ${DEFAULT_OWNER}）`,
+    current: ownerSet ? ownerView.display : `（未設定・既定 ${DEFAULT_OWNER}）`,
     hint: 'config.json の github.owner に自分のユーザー／組織名を設定してください（既定 vektor-inc のままだと他組織のキューを見に行きます）。',
+    ...displaySanitizedFlag(ownerAltered),
   });
 
   // 2-2 github.repo（GitHub モードのみ。既定 task-queue で可）
   const repoSet = hasNonEmpty(cfg, 'github.repo');
   const repo = repoSet ? String(getPath(cfg, 'github.repo')).trim() : DEFAULT_REPO;
+  const repoView = toDisplayValue(repo);
   requirements.push({
     id: 'github.repo',
     group: 'GitHub',
@@ -632,12 +752,14 @@ export function runDoctor(options = {}) {
     target: 'A',
     // 既定 task-queue も有効な値なので、名前が解決できていれば ok（実在確認はネットワーク検知のため行わない）。
     ok: true,
-    current: repoSet ? sanitizeConfigDisplayValue(repo) : `${DEFAULT_REPO}（既定）`,
+    current: repoSet ? repoView.display : `${DEFAULT_REPO}（既定）`,
     hint: 'config.json の github.repo に task-queue の Issue を登録するリポジトリ名を設定してください（既定 task-queue で可）。',
+    ...displaySanitizedFlag(repoSet && repoView.altered),
   });
 
   // 2-5 orchestrator.assigneeFilter（GitHub モードで必須。空＝一切取り込まない）
   const assigneeSet = hasNonEmpty(cfg, 'orchestrator.assigneeFilter');
+  const assigneeView = toDisplayValue(getPath(cfg, 'orchestrator.assigneeFilter'));
   requirements.push({
     id: 'orchestrator.assigneeFilter',
     group: 'GitHub',
@@ -646,10 +768,9 @@ export function runDoctor(options = {}) {
     target: 'A',
     ok: assigneeSet,
     // ok は hasNonEmpty（生の値）で判定済み。ここは表示だけを整える。
-    current: assigneeSet
-      ? sanitizeConfigDisplayValue(getPath(cfg, 'orchestrator.assigneeFilter'))
-      : '（未設定・一切取り込まない）',
+    current: assigneeSet ? assigneeView.display : '（未設定・一切取り込まない）',
     hint: 'config.json の orchestrator.assigneeFilter に GitHub ログイン名（自分だけなら自分の login）か all を設定してください（空＝一切取り込まない安全側既定）。',
+    ...displaySanitizedFlag(assigneeSet && assigneeView.altered),
   });
 
   // 3-1 org.allowed_owners に owner を含める（両モードで必須。硬ゲート通過用）
@@ -660,17 +781,78 @@ export function runDoctor(options = {}) {
   // レポートに出るため、current と同じく表示は必ずサニタイズ済みの値を使う。
   const allowedOwners = readAllowedOwners(canonicalConfigPath);
   const allowedOwnersOk = allowedOwners.includes(owner);
+  const allowedOwnersView = toDisplayValue(allowedOwners.join(', '));
+  // この行こそが issue #252 の当事者。owner を加工して表示していると
+  // 「label に出ている名前が current の一覧にも並んでいるのに ❌」という自己矛盾に見え、
+  // doctor のバグだと受け取られて真因（設定ファイルの制御文字）へ辿り着けない。
+  //
+  // label / hint は owner の状態で 3 通りに分ける。**この行の hint は「未充足時に利用者が
+  // 実際に打つ手」なので、加工が起きているときに従来文（一覧へ追加してください）を先に
+  // 読ませてはいけない。** 一覧には既にその名前があるので、言われたとおり開いても直らず、
+  // #252 と同じ袋小路に戻る。しかも前半だけ読んで動くと、許可オーナー一覧
+  // （＝セキュリティ境界）へ不要な項目を足すことになる。だから末尾に足すのではなく、
+  // 「原因 → 最初にやること → それでもダメなら」の順に **hint ごと差し替える**。
+  let allowedOwnersLabel = `org.allowed_owners に "${ownerView.text}" を含む`;
+  let allowedOwnersHint = `vk-agents 正本 config の org.allowed_owners に "${ownerView.text}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影。未追加だと staff 系スキル／vk-kore の硬ゲートで弾かれます）。`;
+  //
+  // 分岐の起点は「加工されたか」ではなく **「オーナー名として見せられる値か」**。
+  // 加工の有無で分岐すると、文字列以外の値が素通りして `"" を追加してください` が復活する。
+  // 拾うべき経路は 2 つあり、どちらも String() の結果を引用符に入れると壊れた案内になる:
+  //   - 表示できる文字が残らない値（制御文字だけの値、`"github.owner": []` など）
+  //   - 文字列として書かれていない値（`{}` なら "[object Object]" に化けるだけで空にならない）
+  // 設定ファイルは手編集でも改竄でも書けるので、どちらも現実の入力として扱う。
+  if (ownerView.text === '' || !ownerIsString) {
+    // オーナー名として見せられる値が無いので、**引用符で見せない**。`"" を含む` /
+    // `"[object Object]" を追加してください` と出すと、そのとおり操作した人が許可オーナー
+    // 一覧へ無意味な項目を足すことになる（セキュリティ境界を無駄に広げる指示）。追加の案内
+    // 自体を出さず、「まず owner を直す」だけに絞る。直せば次の doctor で通常の案内に戻る。
+    allowedOwnersLabel = 'org.allowed_owners に github.owner の値を含む';
+    // 原因が「制御文字だけ」かどうかで、利用者が config.json で探すものが変わるので言い分ける。
+    // 文字列以外の値は `{}` / `[]` / 数値 / 真偽値をまとめて 1 文で扱う（利用者がやることは
+    // どれも同じ「github.owner を正しいユーザー／組織名へ直す」なので、分けても選択肢が増えるだけ）。
+    // 制御文字側で「出所を疑ってください」を繰り返さないのは、加工が起きた＝ ⚠️ ブロックが
+    // 必ず出る側で、同じ一文が数行上に既にあるため。
+    //
+    // 文字列以外の側は「可能性があります」と引かない。typeof で文字列でないことを**確定して
+    // 知っている**ので、断定できる場面で引くと「では他に何が考えられるのか」と余計な探索を
+    // 始めさせる。実態はほぼ引用符の付け忘れなので、直し方は語で説明するより形を 1 つ見せる。
+    // ここに出る `"vektor-inc"` は書き方の例示（固定値）であって設定値の表示ではないので、
+    // 「設定値を引用符で見せない」という上の判断とは衝突しない。
+    allowedOwnersHint = ownerAltered
+      ? 'config.json の github.owner が制御文字（画面に表示できない文字）だけの値になっています。この値では許可オーナーの判定ができないため、まず github.owner を正しいユーザー／組織名へ直してください。'
+      : `config.json の github.owner が、文字列のオーナー名になっていません。この値では許可オーナーの判定ができないため、まず github.owner を \`"${DEFAULT_OWNER}"\` のように引用符で囲んだユーザー／組織名へ直してください。`;
+  } else if (ownerAltered) {
+    // 注記は current ではなく **label の末尾** へ出す。この行で加工されているのは current
+    // （許可オーナー一覧）ではなく label に埋めた owner なので、current に付けると
+    // 「一覧のほうに制御文字がある」という誤った指し示しになる。引用符の中へ入れないのは、
+    // 値の一部に読めてしまうため（引用符の内側に同じ文字列を仕込まれても、本物は外側に出る）。
+    //
+    // 注記は値と「を含む」の区切りも兼ねる。加工時は注記が区切りになるので半角スペースを
+    // 重ねない。加工がなければ従来どおりの `"acme" を含む` で、1 文字も変わらない。
+    allowedOwnersLabel = `org.allowed_owners に "${ownerView.text}"${DISPLAY_SANITIZED_NOTE}を含む`;
+    // この hint が出るのは ownerAltered のときだけで、そのとき ⚠️ ブロック（レポート一覧の
+    // 直後）は必ず出る。用語の言い換え（画面には表示されない文字）と「出所を疑ってください」は
+    // そちらに既にあり、読む順も ⚠️ が先なので、ここでは繰り返さない。
+    //
+    // **この寄りかかりが成立するのは、⚠️ ブロックを描画する経路に限る**
+    // （formatDoctorReport と bin の `up` 未充足警告。どちらも
+    // formatDisplaySanitizedWarning を通す）。hint だけを別の場所へ載せる経路を足すときは、
+    // ブロックも一緒に載せること。さらに削るなら、この前提を先に確認すること。
+    // #252 の核心である「一覧と同じ名前に見えるのに ❌」の一文だけは必ず残す。
+    allowedOwnersHint = `config.json の github.owner に制御文字が混ざっています。上の表示では取り除いてあるので一覧と同じ名前に見えますが、判定は元の値で行うため未充足のままです。まず github.owner を制御文字の無い値へ直してください。直してもなお未充足なら、vk-agents 正本 config の org.allowed_owners に "${ownerView.text}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影）。`;
+  }
   requirements.push({
     id: 'org.allowed_owners',
     group: 'vk-agents',
-    label: `org.allowed_owners に "${ownerDisplay}" を含む`,
+    label: allowedOwnersLabel,
     required: true,
     target: 'C',
     ok: allowedOwnersOk,
     // 一覧は項目数が多くなるのが正常なので、長さでは切らない（途中で切ると
     // 「自分のオーナー名が入っているのに見えない」という別の混乱になる）。
-    current: allowedOwners.length ? sanitizeConfigDisplayValue(allowedOwners.join(', ')) : '（未設定）',
-    hint: `vk-agents 正本 config の org.allowed_owners に "${ownerDisplay}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影。未追加だと staff 系スキル／vk-kore の硬ゲートで弾かれます）。`,
+    current: allowedOwners.length ? allowedOwnersView.display : '（未設定）',
+    hint: allowedOwnersHint,
+    ...displaySanitizedFlag(ownerAltered, allowedOwners.length > 0 && allowedOwnersView.altered),
   });
 
   return requirements;
@@ -759,10 +941,39 @@ export function formatDoctorReport(requirements, summary = summarizeDoctor(requi
     lines.push(`  ${mark} ${r.label}（${kind}） … ${r.current}`);
   }
 
+  // 表示のために値を加工した項目があれば、**未充足の有無にかかわらず** 一度だけ警告する
+  // （issue #252）。加工が許可オーナー一覧の側だけで起きた場合、必須項目はすべて充足して
+  // 終わるため要件ごとの hint はどこにも出ず、正体不明の注記だけが残って「何をすればよいか」
+  // が一切書かれない状態になる。制御文字の混入は改竄の痕跡でありうるので、✅ で終わるとき
+  // こそ次の一手を示す必要がある。
+  //
+  // 位置は一覧の直後（締めのブロックの前）。「上の一覧は表示だけ加工されている」という
+  // 一覧の読み方についての注意なので、一覧の直後に置くのが情報の順序として自然で、
+  // ✅／❌ のどちらでも同じ位置に出せる（条件で位置が動かない）。
+  // 固定文言・行頭インデント無しなので、要件行（`  ✅ …`）と混ざることもない。
+  // 文言は `up` の未充足警告と共有する（formatDisplaySanitizedWarning）。
+  const sanitizedWarning = formatDisplaySanitizedWarning(requirements);
+  const hasDisplaySanitized = sanitizedWarning !== '';
+  if (hasDisplaySanitized) {
+    lines.push('');
+    lines.push(...sanitizedWarning.split('\n'));
+  }
+
   lines.push('');
   if (summary.allRequiredOk) {
     lines.push(`✅ 必須項目はすべて充足しています（${summary.requiredOkCount}/${summary.requiredCount}）。`);
-    lines.push('   `vk-orchestrator up` で起動できます。');
+    // 全充足のときはここがレポートの最終行になる。端末では画面下端に残った文字列が最後の
+    // 印象になるので、⚠️ を出しておきながら締めを全面 GO にすると、警告が「起動していいですよ」で
+    // 上書きされてしまう（注記が出るのは値が細工されている可能性を含む状況）。
+    //
+    // 但し書きを括弧で後から足すと「起動できます」と「起動してください」が同居して、
+    // 読み終えてから前提に戻される。条件を先に置いた 1 文へ丸ごと差し替える。
+    // 注記が無いときは従来の文言のまま 1 文字も変えない。
+    lines.push(
+      hasDisplaySanitized
+        ? '   上の ⚠️ を確認してから `vk-orchestrator up` で起動してください。'
+        : '   `vk-orchestrator up` で起動できます。',
+    );
   } else {
     lines.push(`❌ 未充足の必須項目が ${summary.missingRequired.length} 件あります。次のことをしてください:`);
     for (const r of summary.missingRequired) {
