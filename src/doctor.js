@@ -51,7 +51,17 @@ import {
 } from './config.js';
 // 制御文字の除去は build-command.js の stripControlChars に集約している（DRY）。
 // terminals/index.js と同じ出所を使い、文字クラスを 3 箇所目に複製しない。
-import { stripControlChars } from './engine/build-command.js';
+//
+// 案内文へコマンド行として値を埋めてよいかの判定（isShellSafeCommandForDisplay）と、
+// 表示値から ANSI・制御文字・U+2028/U+2029 を落とす stripAnsiAndControlChars も同じ出所から
+// 使う。doctor の hint（tmux.claudeCommand）と `up` の tmux attach 案内（tmux.session）が
+// 同じ穴・同じ表示経路を持っていたため、判定も除去の線引きも doctor 側に閉じ込めず
+// 共有する（issue #253）。
+import {
+  stripControlChars,
+  stripAnsiAndControlChars,
+  isShellSafeCommandForDisplay,
+} from './engine/build-command.js';
 // 「接続先が手元のマシンか」の判定は engine（resolveTaskPaneCwd）と同じ実装を使う。
 // 同じ apiHost を engine は「自分のマシン」、doctor は「別マシン」と読む状態を作らない。
 // os にしか依存しない小さなモジュールなので doctor から直接使える。
@@ -95,31 +105,6 @@ function readAllowedOwners(canonicalConfigPath) {
   const list = parsed?.org?.allowed_owners;
   if (!Array.isArray(list)) return [];
   return list.map((item) => String(item ?? '').trim()).filter((item) => item !== '');
-}
-
-/**
- * 表示値から ANSI エスケープ・制御文字・行区切り文字（U+2028 / U+2029）を落とす
- * （長さは変えない）。
- *
- * sanitizeReportValue（外部コマンド出力用）と sanitizeConfigDisplayValue（設定値用）の
- * 共通部分。両者の違いは「先頭行に切るか」「長さを制限するか」だけなので、除去ロジックは
- * ここ 1 か所に持つ。
- *
- * ANSI CSI シーケンスは ESC ごと先に落とす。ESC 単体は次段の stripControlChars で消えるが、
- * 先に消さないと `[0m` のような残骸が表示に残って値が読みにくくなるため。ESC を伴わない
- * `[0m` のような文字列は消えないので、正当な設定値を削ってしまうことはない。
- * @param {*} value
- * @returns {string} ANSI と制御文字を除いた文字列
- */
-function stripAnsiAndControlChars(value) {
-  const withoutAnsi = String(value ?? '')
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, ''); // ANSI CSI シーケンス（ESC 自体は次段で落ちる）
-  // 残った C0/C1 制御文字は共通ヘルパで落とす（文字クラスを複製しない）。
-  // U+2028 / U+2029 は C0/C1 の範囲外なので stripControlChars では落ちない。端末では行が
-  // 割れないが、CSS はこの 2 文字を強制改行として扱うため、診断結果を GitHub の issue へ
-  // 貼るとブラウザ上では行が割れ、偽の要件行が独立して見えてしまう（診断結果を issue へ
-  // 貼る運用があるので現実的な経路）。表示経路を守るため、C0/C1 とは別にここで落とす。
-  return stripControlChars(withoutAnsi).replace(/[\u2028\u2029]/g, '');
 }
 
 /**
@@ -585,6 +570,34 @@ export function runDoctor(options = {}) {
   const claudeCommandLabel = sanitizeReportValue(claudeCommand);
   // 素の claude を見ているか、利用者が設定した独自コマンドを見ているかで案内すべき行動が変わる。
   const usesDefaultClaudeCommand = claudeCommand === DEFAULT_CLAUDE_COMMAND;
+  // hint に「そのまま貼れるコマンド行」として設定値を埋めてよいか（issue #253）。
+  // 埋める先は表示用の claudeCommandLabel だが、判定は生の値にも掛ける。長い値は表示側で
+  // 64 文字に切られるため、末尾に置かれた危険な文字が切り落とされた結果「安全に見える」
+  // ことがあり、ラベルだけを見ると素通りしてしまうため（生が不安全ならラベルも不安全扱い）。
+  const canShowClaudeCommandLine = isShellSafeCommandForDisplay(claudeCommand)
+    && isShellSafeCommandForDisplay(claudeCommandLabel);
+  // レポート本体（current）と hint で値を出すときの表示形。危険側だけ JSON.stringify で
+  // 括る（issue #253）。current は `未導入（コマンド: <値>）` のように全角括弧の中へ値が
+  // 入るので、値に `）` を入れられると括弧を閉じて外へ出られ、レポートの行そのものが
+  // 「復旧するには次を実行: …」のような偽の指示文になる。しかも current の行は hint より
+  // 上に出るため、読み手が最初に目にする。
+  //
+  // ok（✅）側も同じ扱いに揃える。「見つかった＝実在する実行ファイル」ではあるが、実在する
+  // ことと名前が安全なことは別で、ファイル名に `）` は普通に入れられる。むしろ ✅ の行は
+  // 読み手の警戒が下がる分、偽の指示文を混ぜられたときに効いてしまう。
+  //
+  // 安全側は許可リストを通った値しか来ず `"` も `）` も入り得ないので従来の出力のまま
+  // （通常運用の表示とテストを 1 文字も動かさない）。
+  //
+  // ここで守っている不変条件は「囲い（引用符）を閉じるのは doctor 側だけで、値の側からは
+  // 閉じられない」。全角の `）` は JSON.stringify でエスケープされず値の中に見えるが、囲いを
+  // 閉じられない以上、製品が語っているように見せることはできない。**この不変条件が効くのは
+  // 囲いが読み手に見える文脈に限る。** 将来この値をコードフェンスや `<code>` の中、あるいは
+  // 引用符が意味を持たない／消費される文脈（シェルの引数例、CSV など）へ入れるときは、
+  // 同じ判定をやり直すこと。
+  const claudeCommandDisplay = canShowClaudeCommandLine
+    ? claudeCommandLabel
+    : JSON.stringify(claudeCommandLabel);
   let claudeVersion = '';
   try {
     // 外部コマンドの stdout はそのままレポート／--json に載せない（sanitizeReportValue）。
@@ -609,11 +622,12 @@ export function runDoctor(options = {}) {
     // 「なぜ ⚠️ 止まりなのか」が分かるよう、current に理由を添える。⚠️ の行は未充足リストに
     // 出ないため、hint はレポート本体には現れない。
     // 見つかった場合は素直に ✅（手元にも入っている、以上の意味は持たせない）。
+    // 値の表示形（claudeCommandDisplay）は安全側／危険側で切り替わる。理由は定義箇所を参照。
     current: claudeOk
-      ? (usesDefaultClaudeCommand ? claudeVersion : `${claudeVersion}（コマンド: ${claudeCommandLabel}）`)
+      ? (usesDefaultClaudeCommand ? claudeVersion : `${claudeVersion}（コマンド: ${claudeCommandDisplay}）`)
       : claudeRunsOnRemoteHost
         ? remoteClaudeCurrent
-        : `未導入（コマンド: ${claudeCommandLabel}）`,
+        : `未導入（コマンド: ${claudeCommandDisplay}）`,
     // 独自コマンドが見つからないときに「npm install -g @anthropic-ai/claude-code してください」を
     // 先頭に置くと、それを実行しても生えるのは claude で、設定した独自コマンドは直らない。
     // 一番効く行動（PATH 確認 → 設定値の見直し）を先に出す。
@@ -622,11 +636,23 @@ export function runDoctor(options = {}) {
     //
     // 別マシン構成では「手元に入れろ」と言わない。ペインが開くのは接続先マシンなので、
     // 手元にインストールしても元の詰まり（接続先に claude が無い）は直らない。
+    //
+    // 独自コマンドの分岐はさらに 2 つに割れる（issue #253）。許可リストを通らない値では
+    // `<設定値> --version` というコピペ用のコマンド行を出さない。hint は「そのまま
+    // ターミナルに貼ってください」という文脈で読まれるため、細工された設定ファイルを含む
+    // リポジトリの利用者が案内どおりに貼ると意図しないコマンドが動く。
+    // 値そのものの表示は両分岐で残す。config.json のどの値が問題なのかが分からないと
+    // 直しようがないため。潰すのは「実行させる形での提示」だけ。
+    //
+    // 値の表示形（claudeCommandDisplay）は current と共有する。危険側だけ JSON.stringify で
+    // 括る理由は定義箇所に書いた。
     hint: claudeRunsOnRemoteHost
       ? `ペインは VK Terminals API の${remoteHostText}のマシンで開くため、Claude Code は接続先マシンに入っていれば足ります（手元は任意）。タスクが進まない場合は、接続先マシンで \`claude --version\` が動くかを確認してください。手元にも Claude Code が要るのは、\`/vk-orchestrator-setup\` を手元で実行する場合です。その場合は ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`
       : usesDefaultClaudeCommand
         ? `\`claude\` コマンドが見つかりません。${CLAUDE_INSTALL_COMMAND} でインストールし、\`claude --version\` が動くことを確認してください（インストール済みなのに未導入と出る場合は、シェルを開き直して PATH を通し直してください）。`
-        : `ペイン起動に使うコマンド "${claudeCommandLabel}" が見つかりません。\`${claudeCommandLabel} --version\` が動くか確認してください。動かない場合は config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`,
+        : canShowClaudeCommandLine
+          ? `ペイン起動に使うコマンド "${claudeCommandDisplay}" が見つかりません。\`${claudeCommandDisplay} --version\` が動くか確認してください。動かない場合は config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。`
+          : `ペイン起動に使うコマンド ${claudeCommandDisplay} が見つかりません。設定されている値が、実行ファイル名やパスとして扱える文字だけで書かれていないため、確認用のコマンドは案内しません（バッククォート \` や \`$\`、\`;\` が含まれていると、貼ったときに別のコマンドまで動いてしまうためです）。config.json の tmux.claudeCommand（環境変数 VK_TMUX_CLAUDE_CMD）の値を見直すか、素の Claude Code を使うなら設定を外して ${CLAUDE_INSTALL_COMMAND} でインストールしてください。設定した覚えのない値なら、そのままにせず削除してください。`,
     // レポート末尾の締め（formatSetupEntryGuidance）が「Claude Code 自体が無い」と
     // 「独自コマンドが見つからない」を区別するためのフラグ。この要件だけが持つ。
     usesDefaultCommand: usesDefaultClaudeCommand,

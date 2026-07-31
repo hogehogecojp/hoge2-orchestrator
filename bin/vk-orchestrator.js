@@ -751,7 +751,15 @@ async function main() {
           await import('../src/config.js');
         if (resolveTerminalsMode(unifiedConfig) === 'tmux') {
           const { spawnSync } = await import('child_process');
+          // セッション名は設定ファイル由来（env VK_TMUX_SESSION > config tmux.session）で、
+          // tmux へ渡す値と画面へ出す値を分ける必要がある（issue #253）。
+          //   - session … tmux へ渡す実値。spawnSync は引数配列で渡すのでシェルを介さない
+          //   - 表示     … 制御文字を落として引用符込みで出す（偽のコンソール行を作らせない）
+          //   - 案内文   … そのまま貼れるコマンド行を出してよい値かを判定してから組み立てる
+          const { formatTmuxSessionLabel, formatTmuxAttachGuidance } =
+            await import('../src/setup/tmux-attach-guidance.js');
           const session = resolveTmuxSession(unifiedConfig);
+          const sessionLabel = formatTmuxSessionLabel(session);
 
           // vk-agents 派生設定を投影（VK Terminals モードと同じ。tmux で起動する Claude が
           // GUI 経由と同じ最新設定を使えるようにする）。
@@ -795,10 +803,10 @@ async function main() {
               { stdio: 'inherit' }
             );
             if (created.status !== 0) {
-              console.error(`[up] tmux セッション "${session}" を作成できませんでした（tmux は入っていますか？）。`);
+              console.error(`[up] tmux セッション ${sessionLabel} を作成できませんでした（tmux は入っていますか？）。`);
               process.exit(1);
             }
-            console.log(`tmux セッション "${session}" を作成し、orchestrator を起動しました。`);
+            console.log(`tmux セッション ${sessionLabel} を作成し、orchestrator を起動しました。`);
           } else {
             // 既存セッションに orchestrator window が無ければ起動（start-lock が二重起動を防ぐ）。
             const wins = spawnSync('tmux', ['list-windows', '-t', session, '-F', '#{window_name}'],
@@ -807,9 +815,9 @@ async function main() {
             if (!hasOrch) {
               spawnSync('tmux', ['-u', 'new-window', '-t', session, '-n', 'orchestrator', '-c', repoRoot, startCmd],
                 { stdio: 'inherit' });
-              console.log(`既存セッション "${session}" に orchestrator を起動しました。`);
+              console.log(`既存セッション ${sessionLabel} に orchestrator を起動しました。`);
             } else {
-              console.log(`セッション "${session}" で orchestrator は起動済みです。`);
+              console.log(`セッション ${sessionLabel} で orchestrator は起動済みです。`);
             }
           }
 
@@ -818,7 +826,9 @@ async function main() {
           if (process.stdout.isTTY && !process.argv.includes('--no-attach')) {
             spawnSync('tmux', ['-u', 'attach', '-t', session], { stdio: 'inherit' });
           } else {
-            console.log(`\`tmux attach -t ${session}\` で入れます（Ctrl-b d で離脱、切断されても動作継続）。`);
+            // 案内文は tmux-attach-guidance が組み立てる。セッション名は設定ファイル由来なので、
+            // そのまま貼れるコマンド行へ埋めてよい値かを判定してから出す（issue #253）。
+            console.log(formatTmuxAttachGuidance(session));
           }
           break;
         }
