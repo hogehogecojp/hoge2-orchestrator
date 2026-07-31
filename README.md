@@ -115,6 +115,8 @@ CLI だけで「自分の環境で何が足りないか」を確認したい場�
 npx vk-orchestrator doctor           # 充足状況の診断（✅/❌ と次にやるコマンド）
 npx vk-orchestrator doctor --json    # 機械可読（{ id, group, label, required, ok, current, hint, target } の配列＋要約）
                                      # ※ claude 項目のみ usesDefaultCommand（検査対象が既定の claude か）を追加で持ちます
+                                     # ※ 別マシンの VK Terminals API を使う構成と判定できたときだけ、claude 項目が
+                                     #    runsOnRemoteHost: true と remoteHostText（接続先の表示用文字列）を追加で持ちます
                                      # ※ 設定値に制御文字が含まれ、表示のために除去した項目だけ displaySanitized: true を追加で持ちます
                                      #    （合否は加工前の値で判定するため、表示が一致していても未充足になることがあります）
                                      #    対象は設定ファイル由来の項目のみ。外部コマンドの出力由来の項目（tmux / claude の版・
@@ -247,15 +249,19 @@ private リポジトリにアクセスするには `gh auth login` の認証を�
 
 ```bash
 npx vk-orchestrator up       # config.json を反映 → GUI 起動 → API 疎通を待って orchestrator を起動
-# npm start でも同じ（start スクリプトは up に割り当て済み）
+# npm start でも同じ（start スクリプトは up に割り当て済み）。ただし別マシンの VK Terminals API を使う構成では npm start を使わず npx vk-orchestrator start
 ```
 
 `up` 起動時は `vk-orchestrator doctor` と同じ充足判定を実行し、**選択中のモードで必須（`required`）なのに未充足（`!ok`）な項目が 1 つでもあれば**、`/vk-orchestrator-setup`（および `npm run setup:agents` などの不足コマンド）の実行を案内します。ただし Claude Code 自体が未導入の場合は、`/vk-orchestrator-setup` をそのまま実行できないため案内内容を切り替えます。この案内は非致命（警告のみ）で、既存環境の `up` を止めません。全必須項目が充足していれば、統合 config（`~/.vk-orchestrator/config.json`）に `setup.completedAt` を記録して次回以降の案内を省きます（判定の真実はあくまで毎回の doctor で、このフラグは案内スキップ用のヒントに過ぎません）。
 
 Claude Code の要件は、**ペインがどのマシンで開くか**で必須（❌）／任意（⚠️）が切り替わります。判定に使うのは VK Terminals API の接続先（`~/.vk-terminals/config.json` の `apiHost` または `VK_TERMINALS_HOST`）です。
 
-- **任意（⚠️）** — 接続先が手元以外のマシンのとき。ペインは接続先マシンで開くので、Claude Code は接続先に入っていれば足ります。
-- **必須（❌）** — 接続先が手元のマシンのとき。ループバック（`127.0.0.1` / `localhost` / `::1`）、自分のマシンのアドレス（tailscale serve 用に自分の Tailscale IP を書いている場合など）、全アドレス束縛（`0.0.0.0` / `::`）が該当します。
+- **任意（⚠️）** — 接続先が手元以外のマシンのとき（別マシンの VK Terminals API を使う構成）。ペインは接続先マシンで開くので、Claude Code は接続先に入っていれば足ります。
+- **必須（❌）** — 接続先が手元のマシンのとき。次のいずれかが該当します。
+  - ループバック（`localhost` / `::1` と、`127.0.0.1` `127.0.1.1` のように 4 つ組で書いた `127.x.x.x`）。`127.1` のような短縮表記や、`127.0.0.1:3010` のようにポート番号を付けた値は対象外で、別マシン扱いになります
+  - 自分のマシンのアドレス（tailscale serve 用に自分の Tailscale IP を書いている場合など）
+  - 自分のマシンの名前（`mymac.local` などの `.local` 名、Tailscale の MagicDNS 名 `mymac.tailXXXX.ts.net`、ドット無しの短縮名 `mymac`）。`.lan` / `.home.arpa` / `.internal` も同じ扱いです（いずれも、先頭の名前が自分のマシン名と一致する場合に限ります）。**外部ドメインの名前（`mymac.example.com` など）は、先頭が自分のマシン名と同じでも別マシン扱い**です（ただし `hostname` コマンドが返す名前とそっくり同じ場合は手元扱いになります）
+  - 全アドレス束縛（`0.0.0.0` / `::`）
 - **必須（❌）** — 接続先がホストとして判定できない値のとき（安全側に倒して案内を出します）。
 - **必須（❌）** — tmux モードのとき。**接続先の設定に関わらず**ペインは手元で開くため、常に手元の Claude Code が要ります。
 
@@ -272,6 +278,10 @@ npx vk-orchestrator up --no-orchestrator   # GUI のみ起動
 ```
 
 orchestrator を単体で動かしたい場合（別マシンから API を叩く・1 周だけ回す等）は `start` を直接使います。
+
+> **別マシンの VK Terminals API を使う構成では `doctor` も `start` を勧めます** — 必須項目が揃ったときの締めが、`up` ではなく `start` の案内に切り替わります（GUI は接続先マシンにあるため、手元で GUI ごと起動する `up` は使いません）。
+>
+> このとき **`npm start` と打たないでください。** `package.json` の `start` スクリプトは `up` に割り当てられているため、案内とは逆に手元の GUI が立ち上がります。npm スクリプトで実行するなら `npm run orchestrator`、そうでなければ `npx vk-orchestrator start` を使ってください。
 
 ```bash
 npx vk-orchestrator start          # タスク登録リポジトリのキューを確認して実行

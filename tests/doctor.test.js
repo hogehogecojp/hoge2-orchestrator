@@ -47,6 +47,9 @@ function withDoctorEnv(
     // 「手元のマシン」判定に使う自マシンのアドレス一覧。実マシンの NIC 構成でテストが
     // ぶれないよう既定を固定する（実運用では os.networkInterfaces() から集める）。
     localMachineAddresses = ['127.0.0.1'],
+    // 「手元のマシン」判定に使う自マシンのホスト名。実マシンの os.hostname() でテストが
+    // ぶれないよう既定を固定する（実運用では os.hostname() から集める）。
+    localMachineHostnames = ['vko-test-machine'],
     platform = 'darwin',
     nodeVersion = '20.11.0',
   } = {},
@@ -85,6 +88,7 @@ function withDoctorEnv(
       canonicalConfigPath,
       vkTerminalsApiHost,
       localMachineAddresses,
+      localMachineHostnames,
       platform,
       nodeVersion,
       execFileSync: () => {
@@ -451,6 +455,9 @@ test('runDoctor: claude 導入済み・既定コマンドなら current にコ�
 
 test('isLocalVkTerminalsApiHost: ループバック・全アドレス束縛・判定不能な値は手元へ倒す', () => {
   const localAddresses = ['127.0.0.1', '100.64.0.2'];
+  // 自マシン名も明示注入する。既定（os.hostname()）のままだと、実行マシンの名前が
+  // `mac-mini` だったときに下の「別マシン扱い」の期待が実機依存で揺れるため。
+  const localHostnames = ['vko-test-machine'];
   const localHosts = [
     '127.0.0.1', 'localhost', 'LOCALHOST', '::1', '[::1]', // ループバック
     '127.0.1.1', '::ffff:127.0.0.1', // 127.0.0.0/8 と IPv4 射影ループバック
@@ -460,10 +467,18 @@ test('isLocalVkTerminalsApiHost: ループバック・全アドレス束縛・�
     '100.64.0.2', // 自マシンのアドレス（Tailscale IP をそのまま書く運用）
   ];
   for (const host of localHosts) {
-    assert.equal(isLocalVkTerminalsApiHost(host, localAddresses), true, `${String(host)} は手元扱い`);
+    assert.equal(
+      isLocalVkTerminalsApiHost(host, localAddresses, localHostnames),
+      true,
+      `${String(host)} は手元扱い`,
+    );
   }
   for (const host of ['100.64.0.3', '192.0.2.10', 'mac-mini.local', 'example.tailnet.ts.net']) {
-    assert.equal(isLocalVkTerminalsApiHost(host, localAddresses), false, `${host} は別マシン扱い`);
+    assert.equal(
+      isLocalVkTerminalsApiHost(host, localAddresses, localHostnames),
+      false,
+      `${host} は別マシン扱い`,
+    );
   }
 });
 
@@ -510,6 +525,54 @@ test('runDoctor: 全アドレス束縛・127.0.0.0/8・判定不能な apiHost �
           true,
           `${JSON.stringify(host)} は手元扱いで必須のままにすること`,
         );
+      },
+    );
+  }
+});
+
+// --- apiHost に自マシンの「ホスト名」を書いた構成（issue #256-1）---
+
+test('isLocalVkTerminalsApiHost: 自マシンのホスト名（.local / MagicDNS 名）は手元へ倒す', () => {
+  // 判定は engine と共通の isLocalMachineHost() に委ねる。doctor 側だけへ
+  // ホスト名照合を足すと、#255 で 1 か所へ寄せた判定がまた枝分かれする。
+  const localAddresses = ['127.0.0.1', '100.64.0.2'];
+  const localHostnames = ['mymac.local'];
+  for (const host of ['mymac.local', 'mymac', 'mymac.tail1234.ts.net', 'MyMac.Local']) {
+    assert.equal(
+      isLocalVkTerminalsApiHost(host, localAddresses, localHostnames),
+      true,
+      `${host} は手元扱い`,
+    );
+  }
+  for (const host of ['other.local', 'other.tail1234.ts.net']) {
+    assert.equal(
+      isLocalVkTerminalsApiHost(host, localAddresses, localHostnames),
+      false,
+      `${host} は別マシン扱い`,
+    );
+  }
+});
+
+test('runDoctor: apiHost が自マシンのホスト名なら claude は必須のまま（issue #256-1）', () => {
+  // ペインは手元で開くのに「別マシンだから claude は任意」と診断されると、
+  // Claude Code 未導入で作業が進まない状態を検知できなくなる（#247 への逆戻り）。
+  for (const host of ['mymac.local', 'mymac.tail1234.ts.net']) {
+    withDoctorEnv(
+      {
+        terminalsMode: 'vk-terminals',
+        vkTerminalsApiHost: host,
+        localMachineAddresses: ['127.0.0.1'],
+        localMachineHostnames: ['mymac.local'],
+        claudeInstalled: false,
+        queueBackend: 'local',
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        const reqs = runDoctor(options);
+        const claude = byId(reqs, 'claude');
+        assert.equal(claude.required, true, `${host} は手元扱いで必須のままにすること`);
+        assert.equal(claude.current, '未導入（コマンド: claude）');
+        assert.ok(summarizeDoctor(reqs).missingRequired.map((r) => r.id).includes('claude'));
       },
     );
   }
@@ -1805,4 +1868,116 @@ test('bin doctor --json: 壊れた config でも生クラッシュせず stdout 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 別マシン構成での締めの案内（issue #256-3）
+//
+// README は別マシン構成に「`up` ではなく `start` を使い」と案内しているのに、
+// doctor は必須項目が揃うと常に `up` を勧めていた。別マシン構成では GUI は接続先に
+// あるので、手元で `up`（GUI 起動込み）を実行しても意味がない。
+// ---------------------------------------------------------------------------
+
+// 別マシン構成（vk-terminals モード＋接続先が手元以外）で必須項目が全充足する env。
+function withRemoteHostDoctorEnv(extra, fn) {
+  return withDoctorEnv(
+    {
+      terminalsMode: 'vk-terminals',
+      vkTerminalsApiHost: '100.64.0.3',
+      localMachineAddresses: ['127.0.0.1', '100.64.0.2'],
+      localMachineHostnames: ['vko-test-machine'],
+      claudeInstalled: false,
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+      ...extra,
+    },
+    fn,
+  );
+}
+
+test('runDoctor: 別マシン構成のとき claude 要件が runsOnRemoteHost を持つ（issue #256-3）', () => {
+  // 締めの案内を切り替える判断材料。required === false を間接的な合図に使うと、
+  // 「未導入なので任意」と「別マシンなので任意」の区別が付かない。
+  withRemoteHostDoctorEnv({}, (options) => {
+    assert.equal(byId(runDoctor(options), 'claude').runsOnRemoteHost, true);
+  });
+  // 手元構成では従来どおりフラグを生やさない（--json の出力を変えない）。
+  withDoctorEnv({ queueBackend: 'local', allowedOwners: ['vektor-inc'] }, (options) => {
+    assert.equal(Object.hasOwn(byId(runDoctor(options), 'claude'), 'runsOnRemoteHost'), false);
+  });
+});
+
+test('formatDoctorReport: 別マシン構成の締めは `start` を勧める（issue #256-3）', () => {
+  // 手元に Claude Code がある構成（/vk-orchestrator-setup を通った人はほぼこちら）。
+  withRemoteHostDoctorEnv({ claudeInstalled: true }, (options) => {
+    const reqs = runDoctor(options);
+    const summary = summarizeDoctor(reqs);
+    assert.equal(summary.allRequiredOk, true, '前提: 必須項目はすべて充足していること');
+    const report = formatDoctorReport(reqs, summary);
+    const tail = report.trimEnd().split('\n').slice(-2);
+    // 最終行が行動、その上が前提（なぜ `up` ではないのか）。
+    assert.deepEqual(tail, [
+      '   ペインは接続先（100.64.0.3）のマシンで開くため、手元の GUI を起動する `up` は使いません。',
+      '   `vk-orchestrator start` で起動できます。',
+    ]);
+    // 値を含む行とコマンドを含む行は必ず分ける（issue #253 と同じ型の穴を作らない）。
+    assert.ok(!tail[1].includes('100.64.0.3'));
+    // 手元で GUI を起動する `up` は勧めない（README と食い違わせない）。
+    assert.doesNotMatch(report, /`vk-orchestrator up` で起動/);
+  });
+});
+
+test('formatDoctorReport: 別マシン構成で手元に claude が無ければ接続先の確認を促す（issue #256-3）', () => {
+  // ⚠️ の行は未充足リストに載らないので hint はレポートに出ない。「接続先で claude が
+  // 動くか確認して」と言える場所が締めしか無い。
+  withRemoteHostDoctorEnv({ claudeInstalled: false }, (options) => {
+    const reqs = runDoctor(options);
+    const summary = summarizeDoctor(reqs);
+    assert.equal(summary.allRequiredOk, true, '前提: 必須項目はすべて充足していること');
+    assert.deepEqual(formatDoctorReport(reqs, summary).trimEnd().split('\n').slice(-2), [
+      '   ペインは接続先（100.64.0.3）のマシンで開きます。そちらで `claude --version` が動くかご確認ください。',
+      '   `vk-orchestrator start` で起動できます。',
+    ]);
+  });
+});
+
+test('runDoctor: 締めの理由行に出す接続先は hint と同じ整形を共有する（issue #256-3）', () => {
+  // 表示経路を増やさない（apiHost の切り詰め・制御文字除去は sanitizeReportValue の
+  // 1 か所で済ませる）。別々に組み立てると、同じ値が締めと hint で違う見た目になる。
+  withRemoteHostDoctorEnv({ claudeInstalled: false }, (options) => {
+    const claude = byId(runDoctor(options), 'claude');
+    assert.equal(claude.remoteHostText, '接続先（100.64.0.3）');
+    assert.ok(claude.hint.includes(claude.remoteHostText));
+  });
+});
+
+test('formatDoctorReport: 別マシン構成＋制御文字の注記でも `start` を勧める（issue #256-3）', () => {
+  withRemoteHostDoctorEnv({ allowedOwners: ['vektor-inc', `other${BEL}`] }, (options) => {
+    const reqs = runDoctor(options);
+    const summary = summarizeDoctor(reqs);
+    assert.equal(summary.allRequiredOk, true, '前提: 必須項目はすべて充足していること');
+    const report = formatDoctorReport(reqs, summary);
+    assert.equal(
+      report.trimEnd().split('\n').at(-1),
+      '   上の ⚠️ を確認してから `vk-orchestrator start` で起動してください。',
+    );
+  });
+});
+
+test('formatDoctorReport: tmux モードでは接続先に関わらず `up` を勧める（issue #256-3）', () => {
+  // tmux モードは常に手元で claude を起動するので、接続先の設定では切り替えない。
+  withDoctorEnv(
+    {
+      terminalsMode: 'tmux',
+      vkTerminalsApiHost: '100.64.0.3',
+      queueBackend: 'local',
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(summarizeDoctor(reqs).allRequiredOk, true, '前提: 必須項目はすべて充足していること');
+      assert.equal(Object.hasOwn(byId(reqs, 'claude'), 'runsOnRemoteHost'), false);
+      assert.match(formatDoctorReport(reqs), /^ {3}`vk-orchestrator up` で起動できます。$/m);
+    },
+  );
 });

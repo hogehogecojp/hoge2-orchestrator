@@ -276,9 +276,18 @@ function resolveTaskPaneCwd(issue, target) {
   }
 
   const apiHost = resolveVkTerminalsApiHost();
-  if (!isLocalMachineHost(apiHost)) {
+  // 既定引数の評価中に os.networkInterfaces() / os.hostname() が例外を投げうるので囲う
+  // （doctor 側も同じ理由で囲っている）。判断できないときは別マシン扱い＝検出をスキップして
+  // 安全既定へ倒す。
+  let apiHostIsLocal = false;
+  try {
+    apiHostIsLocal = isLocalMachineHost(apiHost);
+  } catch (err) {
+    console.warn(`  [task-cwd] 手元のマシンか判定できませんでした（別マシン扱いで続行）: ${err.message}`);
+  }
+  if (!apiHostIsLocal) {
     const cwd = fallback();
-    console.log(`  [task-cwd] VK Terminals host=${apiHost} は別マシン（このマシンのアドレスに一致せず）のため検出をスキップし、安全既定を使用: ${cwd}`);
+    console.log(`  [task-cwd] VK Terminals host=${apiHost} は別マシン（このマシンのアドレス・名前のいずれとも一致せず）のため検出をスキップし、安全既定を使用: ${cwd}`);
     return cwd;
   }
 

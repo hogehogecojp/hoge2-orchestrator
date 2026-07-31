@@ -27,7 +27,8 @@
 // さらに vk-terminals モードでは、VK Terminals API の接続先（apiHost）が手元のマシンか
 // どうかで Claude Code 要件の required が変わる。接続先が別マシンならペインはそのマシンで
 // 開くので、手元に claude が無くてもタスクは進む（required: false ＝ ⚠️）。手元を指している
-// とき（ループバックのほか、自マシンのアドレスを書いている場合を含む）は従来どおり必須。
+// とき（ループバックのほか、自マシンのアドレスや `mymac.local` などのホスト名を書いている
+// 場合を含む）は従来どおり必須。
 // 判定は engine と同じ isLocalMachineHost() に寄せ、判断できない値は必須側へ倒す。
 // tmux モードは常に手元で claude を起動するため、接続先の設定に関わらず required: true。
 
@@ -344,39 +345,41 @@ function realResolveClaudeVersion(command) {
  */
 const VALID_HOST_PATTERN = /^[a-z0-9._:-]+$/;
 
-/** 全アドレス束縛の表記（どの NIC で受けても待ち受けているのは手元のプロセス）。 */
-const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::']);
-
-/** 127.0.0.0/8（127.0.1.1 など）と IPv4 射影表記の ::ffff:127.x.x.x。 */
-const LOOPBACK_V4_PATTERN = /^(?:::ffff:)?127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
-
 /**
  * VK Terminals API の接続先が手元のマシンかを判定する（純関数）。
  *
- * ループバックと自マシンのアドレス照合は engine と共通の isLocalMachineHost() に委ねる。
- * apiHost に自分の Tailscale IP / LAN IP を書く運用（tailscale serve でモバイルから確認する
- * 構成）があるため、ループバック表記だけを見て別マシンと判定してはいけない。そこを誤ると
- * ペインは手元で開くのに claude 要件が任意へ落ち、「claude が無くてタスクが進まないのに
- * 何も案内されない」状態（issue #247）が再発する。
+ * **「何が手元を指す表記か」の知識は持たない。** ループバック範囲（127.0.0.0/8）・全アドレス
+ * 束縛（0.0.0.0 / ::）・自マシンのアドレス／ホスト名との照合は、すべて engine と共通の
+ * isLocalMachineHost() 側にある（issue #256 で移設）。ここに同じ判定を複製すると、#255 で
+ * 1 か所へ寄せたはずの解釈がまた枝分かれする。
  *
- * **判断できない値はすべて「手元」へ倒す**（＝従来どおり必須のまま）。任意へ倒すと案内が
- * 消えて詰みが再発するのに対し、必須へ倒しても出るのは従来どおりの案内だけで済むため。
+ * apiHost に自分の Tailscale IP / LAN IP / `mymac.local` を書く運用があるため、ループバック
+ * 表記だけを見て別マシンと判定してはいけない。そこを誤るとペインは手元で開くのに claude 要件が
+ * 任意へ落ち、「claude が無くてタスクが進まないのに何も案内されない」状態（issue #247）が再発する。
+ *
+ * この関数が持つのは **doctor 固有のフェイルセーフだけ**。「手元かどうか判断できない値は
+ * 『手元』へ倒す」（＝従来どおり必須のまま）。任意へ倒すと案内が消えて詰みが再発するのに対し、
+ * 必須へ倒しても出るのは従来どおりの案内だけで済むため。
  * - 空文字（未設定・解決失敗）※ isLocalMachineHost('') は false を返す仕様なのでここで拾う
- * - 全アドレス束縛（0.0.0.0 / ::）
- * - 127.0.0.0/8 と ::ffff:127.x.x.x（isLocalMachineHost は 127.0.0.1 のみをループバック扱い）
  * - ホストとして妥当でない文字を含む値（制御文字混入など）
+ *
+ * この倒し方は共有ヘルパへは移さない。共有ヘルパ側は空文字を false（＝手元と断定しない）に
+ * 保つ。現状 engine が空文字を渡す経路は無い（config.js の resolveVkTerminalsApiHost() は
+ * 未設定・空白のみのときも 127.0.0.1 へフォールバックする）が、渡された場合の安全側の既定
+ * として false を守る。「判断できない値を手元へ倒す」は doctor の案内を消さないための方針で
+ * あって、host の解釈という事実の知識ではない。
  * @param {*} host resolveVkTerminalsApiHost() の戻り値
  * @param {string[]} [localAddresses] 自マシンのアドレス一覧（省略時は os から収集）
+ * @param {string[]} [localHostnames] 自マシンのホスト名一覧（省略時は os から収集）
  * @returns {boolean} 手元のマシンを指していれば true
  */
-export function isLocalVkTerminalsApiHost(host, localAddresses) {
+export function isLocalVkTerminalsApiHost(host, localAddresses, localHostnames) {
   const normalized = normalizeHostForLocalComparison(host);
   if (normalized === '') return true;
   if (!VALID_HOST_PATTERN.test(normalized)) return true;
-  if (WILDCARD_BIND_HOSTS.has(normalized)) return true;
-  if (LOOPBACK_V4_PATTERN.test(normalized)) return true;
-  // localAddresses が undefined のときは isLocalMachineHost 側の既定（os から収集）に任せる。
-  return isLocalMachineHost(normalized, localAddresses);
+  // localAddresses / localHostnames が undefined のときは isLocalMachineHost 側の既定
+  //（os から収集）に任せる。
+  return isLocalMachineHost(normalized, localAddresses, localHostnames);
 }
 
 /**
@@ -425,14 +428,18 @@ function resolveClaudeCommandName(tmuxMode, cfg) {
  *   resolveVkTerminalsApiHost?: (options?: object) => string,
  *   vkTerminalsApiHost?: string,
  *   localMachineAddresses?: string[],
+ *   localMachineHostnames?: string[],
  *   resolveTmuxVersion?: () => string,
  *   resolveClaudeVersion?: (command: string) => string,
  *   platform?: string,
  *   nodeVersion?: string,
  * }} [options]
- * @returns {Array<{ id:string, group:string, label:string, required:boolean, ok:boolean, current:string, hint:string, target:'A'|'B'|'C'|'external'|'manifest', usesDefaultCommand?:boolean }>}
+ * @returns {Array<{ id:string, group:string, label:string, required:boolean, ok:boolean, current:string, hint:string, target:'A'|'B'|'C'|'external'|'manifest', usesDefaultCommand?:boolean, runsOnRemoteHost?:true }>}
  *   usesDefaultCommand は claude 要件のみが持ち、検査対象が既定の `claude` だったかを表す
  *   （締めの案内でインストールを勧めてよいかの判断に使う）。
+ *   runsOnRemoteHost / remoteHostText も claude 要件のみが持ち、別マシンの VK Terminals API を
+ *   使う構成と判定できたときだけ生える（締めで `up` / `start` のどちらを勧めるかの判断と、
+ *   その理由行に出す接続先の表示に使う）。
  */
 export function runDoctor(options = {}) {
   const homeDir = options.homeDir ?? homedir();
@@ -590,7 +597,11 @@ export function runDoctor(options = {}) {
   let claudeRunsOnRemoteHost = false;
   if (!tmuxMode) {
     try {
-      claudeRunsOnRemoteHost = !isLocalVkTerminalsApiHost(vkTerminalsApiHost, options.localMachineAddresses);
+      claudeRunsOnRemoteHost = !isLocalVkTerminalsApiHost(
+        vkTerminalsApiHost,
+        options.localMachineAddresses,
+        options.localMachineHostnames,
+      );
     } catch {
       // 自マシンのアドレス収集（os.networkInterfaces）で落ちても doctor 全体は止めない。
       // 判断できないので手元扱い＝従来どおり必須へ倒す（安全側）。
@@ -696,6 +707,20 @@ export function runDoctor(options = {}) {
     // レポート末尾の締め（formatSetupEntryGuidance）が「Claude Code 自体が無い」と
     // 「独自コマンドが見つからない」を区別するためのフラグ。この要件だけが持つ。
     usesDefaultCommand: usesDefaultClaudeCommand,
+    // 別マシンの VK Terminals API を使う構成（vk-terminals モード＋接続先が手元以外の
+    // マシン）と判定できたことを表すフラグ。充足時の締めで `up` と `start` のどちらを
+    // 勧めるかに使う（issue #256）。
+    //
+    // required === false を間接的な合図に使わない。required が false になる理由は
+    // 「接続先が別マシンだから」以外にも増えうるので、意図が読めるフィールドで明示する。
+    // 一方で **false のときはキー自体を生やさない**（displaySanitized と同じ扱い）。
+    // 通常構成の `--json` 出力を 1 バイトも変えないため。
+    //
+    // remoteHostText は締めの理由行が使う表示用の断片（`接続先（100.64.0.3）`）。
+    // hint と同じ整形をそのまま渡し、**新しい表示経路を増やさない**（apiHost の
+    // 切り詰め・制御文字除去は sanitizeReportValue の 1 か所で済ませる）。値が表示
+    // できないときに `接続先` へ落ちるのも hint と同じ。
+    ...(claudeRunsOnRemoteHost ? { runsOnRemoteHost: true, remoteHostText } : {}),
   });
 
   // 0-5 vk-agents スキル展開
@@ -1097,10 +1122,50 @@ export function formatDoctorReport(requirements, summary = summarizeDoctor(requi
     // 但し書きを括弧で後から足すと「起動できます」と「起動してください」が同居して、
     // 読み終えてから前提に戻される。条件を先に置いた 1 文へ丸ごと差し替える。
     // 注記が無いときは従来の文言のまま 1 文字も変えない。
+    //
+    // 勧めるコマンドは構成で変える（issue #256）。別マシンの VK Terminals API を使う構成では
+    // GUI が接続先マシンにあるので、手元で `up`（VK Terminals(GUI) の起動込み）を実行しても
+    // 意味がない。README も同じ構成に「`up` ではなく `start` を使い」と案内しており、doctor が
+    // その構成だと分かっていながら `up` を勧めると案内が食い違う。
+    // 判定は claude 要件の runsOnRemoteHost（その構成と判定できたときだけ生える）を見る。
+    // tmux モードでは常に手元で claude を起動するのでこのフラグは立たず、従来どおり `up`。
+    const remoteClaude = requirements.find((r) => r.id === 'claude' && r.runsOnRemoteHost === true);
+    const launchCommand = remoteClaude ? 'vk-orchestrator start' : 'vk-orchestrator up';
+    // **コマンドを変えるだけでは、なぜ変わったのかがレポートのどこにも出ない。**
+    // 「接続先」「別マシン」という語が一度も現れないまま、昨日まで `up` だった最終行が
+    // 理由なく変わって見える。接続先の設定ミスで別マシンと誤判定されている場合も、
+    // この画面からは気づけない（従来は `up` を実行すれば接続先が名指しで疎通エラーに出た）。
+    // 理由を 1 行前に置き、**最終行が行動・その上が前提**という順序を保つ。
+    //
+    // **外部由来の値（接続先）を含む行と、コピペ対象の起動コマンド行は必ず分ける。**
+    // 同じ行に置くと、値の側から括弧を閉じて偽の指示文を起動コマンド行に見せかける余地が
+    // 生まれる（issue #253 と同じ型）。理由行の中に `up` や `claude --version` のような
+    // バッククォート付きトークンが同居するのは構わない。守っているのは「設定値と、読み手が
+    // そのまま貼る起動コマンドを同じ行に並べない」ことであって、記法の制限ではない。
+    //
+    // 手元に Claude Code が無い構成では、理由行を確認の呼びかけへ差し替える。⚠️ の行は
+    // 未充足リストに載らないため hint がレポートに現れず、「接続先で claude が動くか
+    // 確認して」と伝えられる場所が締めしか無い。⚠️ を出しておきながら全面 GO で閉じない、
+    // という上の但し書きと同じ考え方。1 文に理由と確認を詰め込むと野暮ったくなるので分ける。
+    //
+    // 語尾は締めの行と重ねない。制御文字の注記があるときの締めは「…確認してください。」で
+    // 終わるので、理由行まで同じ語尾にすると 2 行続けて同じ形になり目が滑る（指す先は別物）。
+    //
+    // **その語尾を hasDisplaySanitized で出し分けてはいけない。** 重なるのは注記があるときだけ
+    // だが、理由行が指す先（接続先で claude が動くか）は注記の有無と何の関係もない。無関係な
+    // 条件で文言を分岐させると、同じ状況に 2 つの文言を持つことになり、片方だけ直す事故を呼ぶ。
+    // 重ならない語尾に一律で寄せて、分岐そのものを作らない。
+    if (remoteClaude) {
+      lines.push(
+        remoteClaude.ok
+          ? `   ペインは${remoteClaude.remoteHostText}のマシンで開くため、手元の GUI を起動する \`up\` は使いません。`
+          : `   ペインは${remoteClaude.remoteHostText}のマシンで開きます。そちらで \`claude --version\` が動くかご確認ください。`,
+      );
+    }
     lines.push(
       hasDisplaySanitized
-        ? '   上の ⚠️ を確認してから `vk-orchestrator up` で起動してください。'
-        : '   `vk-orchestrator up` で起動できます。',
+        ? `   上の ⚠️ を確認してから \`${launchCommand}\` で起動してください。`
+        : `   \`${launchCommand}\` で起動できます。`,
     );
   } else {
     lines.push(`❌ 未充足の必須項目が ${summary.missingRequired.length} 件あります。次のことをしてください:`);
