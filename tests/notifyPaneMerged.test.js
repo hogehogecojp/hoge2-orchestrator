@@ -444,6 +444,60 @@ describe('notifyPaneMerged', () => {
     assert.equal(badgeCalls.length, 1);
   });
 
+  // VK Terminals 側の「PR 未設定」は空文字（setTerminalPrUrl 自身が prUrl ?? '' を書き込む）。
+  // ?? は null / undefined でしか右へ倒れないため、空文字を素通しすると
+  // `'' !== prUrl` が成立して「別の PR を担当している」と誤判定される（#258）。
+  it('apiPrUrl が空文字（PR 未設定）のペインには、state を信頼して投稿する', async () => {
+    const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiPrUrl: '' } },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 1, '空文字は「未設定」であって「別の PR」ではない');
+    assert.equal(badgeCalls.length, 1);
+    assert.ok(
+      !warnings.some((w) => /別の PR を担当している/.test(w)),
+      `空文字を不一致として warn しない: ${JSON.stringify(warnings)}`
+    );
+  });
+
+  it('apiPrUrl が空白のみのペインにも、state を信頼して投稿する', async () => {
+    const { notifyPaneMerged, submits } = createHarness({
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiPrUrl: '   ' } },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 1);
+  });
+
+  // apiPrUrl が空でも prUrl 側に担当 PR が残っていることがある。空文字で打ち切らず
+  // フォールバック先まで見て判定する。
+  it('apiPrUrl が空文字でも prUrl 側が別 PR ならテキストはスキップする', async () => {
+    const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({
+      getStates: async () => ({
+        terminals: {
+          'pane-1': {
+            termId: 'term-1',
+            apiPrUrl: '',
+            prUrl: 'https://github.com/vektor-inc/example/pull/12',
+          },
+        },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 0, '無関係なペインへ割り込み指示を送らない');
+    assert.equal(badgeCalls.length, 1);
+    assert.ok(warnings.some((w) => /別の PR を担当している/.test(w)));
+  });
+
   it('states を取得できない場合も、一律スキップせず state の termId を信頼して投稿する', async () => {
     const { notifyPaneMerged, submits } = createHarness({
       getStates: async () => { throw new Error('states unavailable'); },

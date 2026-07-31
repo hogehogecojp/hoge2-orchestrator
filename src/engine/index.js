@@ -70,6 +70,7 @@ import { createReconcileOrphanedMergedTasks } from './reconcile-orphaned-merged.
 import { findReplyAfterWaitingInput, hasAgentAnsweredAfterWaitingInput } from './decision-record.js';
 import { startKeepAwake } from '../power/keep-awake.js';
 import { createNotifyPaneMerged } from './notify-pane-merged.js';
+import { attachPrUrlToPane, openInitializedTaskPane } from './task-pane-init.js';
 import { createWaitingMarkerScanner } from './waiting-marker-scanner.js';
 import {
   DEFAULT_REPLY_FORWARD_RETRY_MAX,
@@ -567,6 +568,10 @@ async function refreshUpdateStatus() {
  * readiness 確認に失敗しても従来どおり本文送信は試みる。通常起動とコンフリクト差し戻しで
  * この一連の仕様を共有し、片方だけリトライ条件が変わるのを防ぐ。
  *
+ * **直接呼ばず、必ず openInitializedTaskPane()（task-pane-init.js）経由で使うこと。**
+ * 元 issue の解決（resolvedTarget）と PR URL の登録まで含めて「通常起動のペインと同じ状態」
+ * であり、呼び出し側ごとに手当てすると片方だけ抜ける（#258）。
+ *
  * @param {object} input
  * @param {object} input.issue メタ issue
  * @param {string} input.cwd ペインの作業ディレクトリ
@@ -630,29 +635,18 @@ async function startTask(issue) {
   // task-queue のメタ issue 本文に元の作業対象 issue の URL が含まれていれば、
   // その元 issue のタイトル・リンクをヘッダーに出す（issue #23）。解決できない汎用タスクや
   // 元 issue の取得失敗時は従来どおりメタ issue のタイトル・リンクにフォールバックする。
-  let resolvedTarget = null;
-  if (!resolved.isSelf) {
-    // ペインタイトルは付随処理（cosmetic）なので、取得に失敗してもメタ issue へ
-    // フォールバックできる。リトライ（最大13秒）でタスク起動をブロックしないよう
-    // retryDelays: [] を渡して単発試行にする。
-    try {
-      const original = await github.getIssueState(
-        resolved.owner,
-        resolved.repo,
-        resolved.number,
-        { retryDelays: [] }
-      );
-      resolvedTarget = { number: resolved.number, title: original.title, url: original.htmlUrl };
-    } catch (err) {
-      console.warn(`  [set-title] 元 issue 情報の取得失敗（メタ issue 表示にフォールバック）: ${err.message}`);
-    }
-  }
+  // PR URL はこの時点では未検知なので送らない（PR 検知時に recordPRAcrossSurfaces が送る）。
   let termId;
   try {
-    termId = await createInitializedTaskPane({
+    termId = await openInitializedTaskPane({
       issue,
+      resolved,
       cwd: taskPaneCwd,
-      resolvedTarget,
+      prUrl: null,
+      createInitializedTaskPane,
+      getIssueState: (...args) => github.getIssueState(...args),
+      setTerminalPrUrl,
+      port: VK_PORT,
       createdLogTag: '→ 新規ペイン作成',
       titleLogTag: '[set-title]',
       readyLogTag: '[ready]',
@@ -1522,7 +1516,20 @@ async function notifyConflictHandbackExhausted({
   console.log(`  ${tag}: コンフリクト差し戻しの${reason}に到達 → 自動差し戻しを打ち切り`);
 }
 
-async function ensureConflictHandbackPane(issue, saved, tag) {
+/**
+ * コンフリクト差し戻し用の作業ペインを確保する。
+ *
+ * 生存している既存ペインがあればそれを使い、消えていれば通常起動と同じ初期化
+ * （タイトル＝元 issue・PR URL）で作り直す。差し戻し専用の初期化を書くと通常起動と
+ * ずれるため、新規作成は openInitializedTaskPane に一本化している（#258）。
+ *
+ * @param {object} issue メタ issue
+ * @param {object} saved state のタスクレコード
+ * @param {string|null} prUrl 担当 PR の HTML URL（PR ボタン表示用に登録し直す）
+ * @param {string} tag ログプレフィクス
+ * @returns {Promise<string|number|null>} 確保できた termId（確保できなければ null）
+ */
+async function ensureConflictHandbackPane(issue, saved, prUrl, tag) {
   if (saved.termId != null) {
     let states;
     try {
@@ -1534,9 +1541,24 @@ async function ensureConflictHandbackPane(issue, saved, tag) {
     const term = Object.values(states?.terminals ?? {}).find(
       (t) => String(t.termId) === String(saved.termId)
     );
-    if (term) return saved.termId;
+    if (term) {
+      // 既存ペイン再利用時も PR URL を送り直す。PR 検知時の recordPRAcrossSurfaces が
+      // 失敗していたり、VK Terminals の再起動で apiPrUrl が空のまま残っていることがあり、
+      // その場合は差し戻し作業中ずっと PR ボタンが出ない。この関数は差し戻し判定
+      // （head SHA が変わったとき、通算上限まで）を通った時のみ呼ばれ、毎ループ叩く
+      // 経路ではないため、送り直しのコストは無視できる。
+      await attachPrUrlToPane({
+        setTerminalPrUrl,
+        port: VK_PORT,
+        termId: saved.termId,
+        prUrl,
+        logTag: `${tag}: 既存ペインへの`,
+      });
+      return saved.termId;
+    }
   }
 
+  const resolved = resolveTarget(issue);
   let cwd;
   if (saved.worktreePath && existsSync(saved.worktreePath)) {
     cwd = saved.worktreePath;
@@ -1544,16 +1566,23 @@ async function ensureConflictHandbackPane(issue, saved, tag) {
     if (saved.worktreePath) {
       console.log(`  ${tag}: 記録済み worktree が存在しないため通常の作業ディレクトリへフォールバック: ${saved.worktreePath}`);
     }
-    cwd = resolveTaskPaneCwd(issue, resolveTarget(issue));
+    cwd = resolveTaskPaneCwd(issue, resolved);
   }
 
   try {
-    const termId = await createInitializedTaskPane({
+    const termId = await openInitializedTaskPane({
       issue,
+      resolved,
       cwd,
+      prUrl,
+      createInitializedTaskPane,
+      getIssueState: (...args) => github.getIssueState(...args),
+      setTerminalPrUrl,
+      port: VK_PORT,
       createdLogTag: `${tag}: 差し戻しペインを作成`,
       titleLogTag: `${tag}: 差し戻しペインの`,
       readyLogTag: `${tag}: 差し戻しペインの`,
+      prUrlLogTag: `${tag}: 差し戻しペインへの`,
     });
     await updateTask(issue.number, { termId, paneMissingTicks: 0 });
     return termId;
@@ -1668,7 +1697,7 @@ async function handbackConflictedPR(issue, prRef, prState, prUrl, tag) {
     return;
   }
 
-  const termId = await ensureConflictHandbackPane(issue, saved, tag);
+  const termId = await ensureConflictHandbackPane(issue, saved, prUrl, tag);
   if (termId == null) return;
 
   const prompt = buildConflictHandbackPrompt({

@@ -250,7 +250,7 @@ async function canPostToPane({ getStates, port, termId, prUrl, matchedPane, issu
       return false;
     }
 
-    const panePrUrl = pane.apiPrUrl ?? pane.prUrl ?? null;
+    const panePrUrl = readPanePrUrl(pane);
     if (panePrUrl != null && panePrUrl !== prUrl) {
       logger.warn?.(`  ${logTag} issue #${issueNumber}: termId のペインが別の PR を担当しているためマージ通知メッセージの投稿を見送ります (termId=${termId}, pane=${panePrUrl}, prUrl=${prUrl})`);
       return false;
@@ -263,6 +263,25 @@ async function canPostToPane({ getStates, port, termId, prUrl, matchedPane, issu
   }
 
   return true;
+}
+
+/**
+ * ペインが「担当 PR として保持している URL」を取り出す。保持していなければ null。
+ *
+ * VK Terminals 側の「PR 未設定」の表現は **空文字** で、setTerminalPrUrl 自身が
+ * `prUrl: prUrl ?? ''` と空文字を書き込む（src/terminals/backend-vk-terminals.js）。
+ * そのため `pane.apiPrUrl ?? pane.prUrl ?? null` では空文字が素通しになり、
+ * `'' !== prUrl` が成立して「別の PR を担当している」と誤判定されていた（#258）。
+ * PR URL を持たない実行面（tmux 等）と同じく「未設定 → state を信頼して投稿」に倒すため、
+ * 空文字・空白のみ・非文字列は未設定として扱い、次のフィールドへフォールバックする。
+ */
+function readPanePrUrl(pane) {
+  for (const value of [pane?.apiPrUrl, pane?.prUrl]) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed !== '') return trimmed;
+  }
+  return null;
 }
 
 /**
