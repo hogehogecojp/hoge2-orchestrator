@@ -537,6 +537,10 @@ const scanWaitingMarkers = createWaitingMarkerScanner({
 const scanWaitingInputIssues = createReplyForwardScanner({
   githubIntegration: GITHUB_INTEGRATION,
   fetchWaitingInputIssues: () => github.fetchWaitingInputIssues(),
+  // 転送先ペインの素性照合に使う（#267）。返信本文はペインの Claude へプロンプトとして
+  // 届く＝実行される入力なので、state の termId だけを信じて送らない。外すと照合が
+  // 無言で無効化されるのではなく、転送そのものが見送られる（fail-close）。
+  getStates,
   getTask,
   gatherTargetState,
   ensurePRRecorded,

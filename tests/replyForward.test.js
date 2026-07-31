@@ -14,6 +14,19 @@ const silentLogger = {
   warn() {},
 };
 
+// 起動時にペインへ設定したヘッダーリンク（state.paneTitleUrl）と、別タスクのペインが
+// 持っているヘッダーリンク。照合はこの 2 値の突き合わせだけで行う（#267）。
+const PANE_TITLE_URL = 'https://github.com/vektor-inc/task-queue/issues/221#vk-task-221';
+const OTHER_TASK_TITLE_URL = 'https://github.com/vektor-inc/task-queue/issues/999#vk-task-999';
+
+// 実運用（src/engine/index.js）では getStates が必ず注入されるため、既定でも「注入されて
+// いる」状態を実態として扱う。ただしペイン側は識別情報を持たせない（照合に中立＝
+// UNVERIFIABLE）ことで、照合を主眼にしないテストが従来どおり転送経路を通るようにする。
+// 照合そのものを見るテストは個別に getStates / saved.paneTitleUrl を渡す。
+const defaultGetStates = async () => ({
+  terminals: { 'pane-1': { termId: 'term-1' } },
+});
+
 function makeDeps(overrides = {}) {
   const calls = {
     submitToClaude: [],
@@ -32,6 +45,7 @@ function makeDeps(overrides = {}) {
     githubIntegration: true,
     port: 13847,
     maxAttempts: overrides.maxAttempts ?? 3,
+    getStates: defaultGetStates,
     fetchWaitingInputIssues: async () => [{ number: 221 }],
     getTask: async () => saved,
     gatherTargetState: async () => ({
@@ -446,6 +460,235 @@ describe('replyForwardScanner', () => {
     assert.equal(getSaved().replyForward.exhaustedNotified, false);
     assert.equal(calls.updateTask.length, 0);
     assert.equal(calls.setStatus.length, 0);
+  });
+
+  it('別タスクへ再採番されたペインには返信を転送せず、カーソルも試行回数も進めない', async () => {
+    const warnings = [];
+    const { scanner, calls, getSaved } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl: OTHER_TASK_TITLE_URL } },
+      }),
+      logger: {
+        log() {},
+        warn: (message) => warnings.push(message),
+      },
+    });
+
+    await scanner();
+
+    // 返信本文はペインの Claude へプロンプトとして届く＝実行される入力なので、
+    // 掴み違いが確定した時点で送らない。
+    assert.equal(calls.submitToClaude.length, 0);
+    // 見送りで再送予算を減らさない（照合は試行回数の記録より前で行う）。
+    assert.equal(calls.updateTask.length, 0);
+    assert.equal(getSaved().replyForward, undefined);
+    // カーソルを進めると次ループで再試行されず、返信が永久に届かなくなる。
+    assert.equal(getSaved().lastForwardedCommentId, undefined);
+    assert.equal(calls.setStatus.length, 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /別タスク/);
+  });
+
+  it('見送りログのペイン由来の値から ANSI・制御文字を落とす', async () => {
+    const warnings = [];
+    const { scanner } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: {
+          // ペインの値は VK Terminals 由来の外部入力。ログはコンソールに出るうえ issue へ
+          // 貼られる運用があり、画面消去やカーソル移動のシーケンスが混じると表示が崩れる
+          // （#253 と同じ経路）。ここが唯一の検知点なので、生で出ていないことを直接見る。
+          'pane-1': { termId: 'term-1', apiUrl: `\x1b[2J${OTHER_TASK_TITLE_URL}\x07\r` },
+        },
+      }),
+      logger: {
+        log() {},
+        warn: (message) => warnings.push(message),
+      },
+    });
+
+    await scanner();
+
+    assert.equal(warnings.length, 1);
+    assert.doesNotMatch(warnings[0], /[\x00-\x1f\x7f]/);
+    assert.match(warnings[0], /別タスク/);
+    // 値そのものは（制御文字を除いて）読める形で残す。落として無地にしてしまうと、
+    // どのペインを掴んでいたのか追えなくなる。
+    assert.ok(warnings[0].includes(`pane=${OTHER_TASK_TITLE_URL}`));
+    // 期待値の側はこちらが state に持っている値なので、加工せずそのまま出す。
+    assert.ok(warnings[0].includes(`期待=${PANE_TITLE_URL}`));
+  });
+
+  it('別タスクのペインでも次巡回で正しいペインへ戻れば初回として転送する', async () => {
+    let apiUrl = OTHER_TASK_TITLE_URL;
+    const { scanner, calls, getSaved } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl } },
+      }),
+    });
+
+    await scanner();
+    apiUrl = PANE_TITLE_URL;
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 1);
+    // 見送った巡回で予算を消費していれば attempts は 2 になる。1 であることが消費なしの証跡。
+    assert.deepEqual(calls.updateTask[0][1], {
+      replyForward: { commentId: 111, attempts: 1, exhaustedNotified: false },
+    });
+    assert.equal(getSaved().lastForwardedCommentId, 111);
+  });
+
+  it('ヘッダーリンクが一致するペインへは従来どおり転送する', async () => {
+    const { scanner, calls, getSaved } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl: PANE_TITLE_URL } },
+      }),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 1);
+    assert.equal(getSaved().lastForwardedCommentId, 111);
+    assert.deepEqual(calls.setStatus, [[221, 'status:in-progress']]);
+  });
+
+  it('paneTitleUrl を持たない既存タスクは照合不能として従来どおり転送する', async () => {
+    const { scanner, calls } = makeDeps({
+      // saved.paneTitleUrl 無し（この変更より前に起動したタスク）。ペイン側は値を持つ。
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl: OTHER_TASK_TITLE_URL } },
+      }),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 1);
+  });
+
+  it('ペイン側が担当 PR しか持たない場合も転送する（PR URL は照合材料にしない）', async () => {
+    const { scanner, calls } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: {
+          // ensurePRRecorded がこのイテレーションで書きうる値を期待値に使わないため、
+          // 担当 PR が何であれ転送は止めない（ヘッダーが無ければ照合不能）。
+          'pane-1': { termId: 'term-1', apiPrUrl: 'https://github.com/vektor-inc/example/pull/9' },
+        },
+      }),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 1);
+  });
+
+  it('states 取得失敗では転送を見送り、試行回数を消費しない', async () => {
+    const warnings = [];
+    const { scanner, calls, getSaved } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => {
+        throw new Error('VK Terminals unavailable');
+      },
+      logger: {
+        log() {},
+        warn: (message) => warnings.push(message),
+      },
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 0);
+    assert.equal(calls.updateTask.length, 0);
+    assert.equal(getSaved().lastForwardedCommentId, undefined);
+    assert.match(warnings[0], /次ループで再試行/);
+  });
+
+  it('states の形式が不正でも転送を見送る', async () => {
+    const { scanner, calls } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({ terminals: null }),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 0);
+    assert.equal(calls.updateTask.length, 0);
+  });
+
+  it('getStates が未注入なら見送り、再試行では解消しないと分かる warn を出す', async () => {
+    const warnings = [];
+    const { scanner, calls } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      getStates: null,
+      logger: {
+        log() {},
+        warn: (message) => warnings.push(message),
+      },
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 0);
+    assert.equal(calls.updateTask.length, 0);
+    assert.match(warnings[0], /再試行では解消しません/);
+  });
+
+  it('termId のペインが一覧に無ければ従来どおり転送を試みる', async () => {
+    const { scanner, calls, getSaved } = makeDeps({
+      saved: { paneTitleUrl: PANE_TITLE_URL },
+      // 一致するペインが無い＝誤配送の相手がいない。ここで見送ると送信失敗による
+      // 試行回数の消費 → 上限到達コメント（手動での貼り付け案内）へ到達できなくなる。
+      getStates: async () => ({
+        terminals: { 'pane-9': { termId: 'term-9', apiUrl: OTHER_TASK_TITLE_URL } },
+      }),
+      submitError: new Error('terminal not found'),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 1);
+    assert.deepEqual(getSaved().replyForward, {
+      commentId: 111,
+      attempts: 1,
+      exhaustedNotified: false,
+    });
+  });
+
+  it('別タスクのペインでも転送済み返信の in-progress 復帰再試行は止めない', async () => {
+    const { scanner, calls } = makeDeps({
+      saved: { lastForwardedCommentId: 111, paneTitleUrl: PANE_TITLE_URL },
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl: OTHER_TASK_TITLE_URL } },
+      }),
+    });
+
+    await scanner();
+
+    // ペインへは何も書き込まない経路（#154 の固着回復）なので照合対象外。
+    assert.equal(calls.submitToClaude.length, 0);
+    assert.deepEqual(calls.setStatus, [[221, 'status:in-progress']]);
+  });
+
+  it('別タスクのペインでも上限到達コメントの投稿は止めない', async () => {
+    const { scanner, calls } = makeDeps({
+      saved: {
+        paneTitleUrl: PANE_TITLE_URL,
+        replyForward: { commentId: 111, attempts: 3, exhaustedNotified: false },
+      },
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiUrl: OTHER_TASK_TITLE_URL } },
+      }),
+    });
+
+    await scanner();
+
+    assert.equal(calls.submitToClaude.length, 0);
+    // GitHub へのコメント投稿はペインへ書き込まないため照合対象外。
+    assert.equal(calls.addTargetComment.length, 1);
   });
 
   it('上限到達通知後の state 更新失敗は走査外へ投げず waiting-input を維持する', async () => {
