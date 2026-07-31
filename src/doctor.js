@@ -192,6 +192,46 @@ function toDisplayValue(value) {
 }
 
 /**
+ * 許可オーナー一覧（org.allowed_owners）を、**要素の境界が読める** 1 行の表示値へ整える。
+ *
+ * 従来は `join(', ')` の結果を丸ごと 1 回サニタイズしていたが、それだと要素の中に `, ` が
+ * 入っているとき「区切り」と「値の一部」を見分けられない。`["acme, evil"]`（1 要素）と
+ * `["acme", "evil"]`（2 要素）が同じ `acme, evil` になるため、前者で
+ * `github.owner: "evil"` を診断すると「一覧に evil が並んでいるのに ❌」という
+ * #252 と同型の自己矛盾に見える。原因が違う（制御文字が絡まないので注記も出ない）ので
+ * #252 の対応では拾えず、読んだ人は doctor のバグだと受け取って真因
+ * （一覧の要素が 1 個の文字列である＝設定の書き間違いか改竄）へ辿り着けない（issue #260）。
+ *
+ * 区切り文字を珍しいものへ変えるのではなく **要素ごとに引用符で括る**。区切りを変えても
+ * その文字を含む値で同じ問題が起きるだけだが、引用符なら値は必ず囲いの内側に収まる。
+ * 引用符は `JSON.stringify` に任せる（手書きの `"${item}"` だと値に `"` を入れて囲いの外へ
+ * 出られる）。`up` のセッション名表示（formatTmuxSessionLabel）と同じ理由・同じ形で、
+ * 守る不変条件も同じ「囲いを閉じるのは製品側だけで、値の側からは閉じられない」。
+ * 設定ファイル（JSON）に書いてある形と同じ見た目になるので、開いて確認する側とも揃う。
+ *
+ * サニタイズは **要素ごとに先に** 済ませる。連結してから通すと、こちらが足した引用符まで
+ * 加工対象の文字列に混ざり、altered が「値が加工されたか」を指さなくなる。
+ * altered は「どれか 1 要素でも加工されたか」で立て、注記は引用符の外・末尾へ 1 度だけ置く
+ * （引用符の中へ入れると注記が値の一部に読める。label 側の扱いと揃える）。
+ *
+ * 表示できる文字が残らない要素は `""` になる。要素の数と位置は保ったまま「この要素は
+ * 見せられない」と伝わる形で、理由は末尾の注記と ⚠️ ブロックが引き受ける
+ * （単独の値のときに使う「（値が制御文字のみで表示できません）」を一覧の中へ置くと、
+ * それ自体が 1 個の要素に読めてしまう）。
+ *
+ * **合否（ok）の判定には使わない。** 判定は生の値の完全一致のままで、ここは表示だけを扱う。
+ * @param {string[]} owners readAllowedOwners が返す一覧（trim 済み・空要素なし）
+ * @returns {{ display:string, altered:boolean }} display=注記込みの表示値 /
+ *   altered=どれか 1 要素でも加工されたか
+ */
+function formatAllowedOwnersDisplay(owners) {
+  const views = owners.map((owner) => toDisplayValue(owner));
+  const altered = views.some((view) => view.altered);
+  const list = views.map((view) => JSON.stringify(view.text)).join(', ');
+  return { display: altered ? `${list}${DISPLAY_SANITIZED_NOTE}` : list, altered };
+}
+
+/**
  * 加工が起きた要件にだけ立てるフラグ（`--json` の消費側が文字列を読まずに判定するため）。
  *
  * 注記を current の文字列へ混ぜるだけだと機械可読性が落ちる（消費側が日本語の文言に
@@ -807,12 +847,14 @@ export function runDoctor(options = {}) {
   // レポートに出るため、current と同じく表示は必ずサニタイズ済みの値を使う。
   const allowedOwners = readAllowedOwners(canonicalConfigPath);
   const allowedOwnersOk = allowedOwners.includes(owner);
-  const allowedOwnersView = toDisplayValue(allowedOwners.join(', '));
+  // 表示は要素ごとに引用符で括る（要素の中の `, ` を区切りと見分けるため。issue #260）。
+  // 一覧そのものの並び・件数は加工しない（判定は下の allowedOwnersOk が生の値で済ませている）。
+  const allowedOwnersView = formatAllowedOwnersDisplay(allowedOwners);
   // この行こそが issue #252 の当事者。owner を加工して表示していると
   // 「label に出ている名前が current の一覧にも並んでいるのに ❌」という自己矛盾に見え、
   // doctor のバグだと受け取られて真因（設定ファイルの制御文字）へ辿り着けない。
   //
-  // label / hint は owner の状態で 3 通りに分ける。**この行の hint は「未充足時に利用者が
+  // label / hint は owner の状態で 4 通りに分ける。**この行の hint は「未充足時に利用者が
   // 実際に打つ手」なので、加工が起きているときに従来文（一覧へ追加してください）を先に
   // 読ませてはいけない。** 一覧には既にその名前があるので、言われたとおり開いても直らず、
   // #252 と同じ袋小路に戻る。しかも前半だけ読んで動くと、許可オーナー一覧
@@ -820,6 +862,45 @@ export function runDoctor(options = {}) {
   // 「原因 → 最初にやること → それでもダメなら」の順に **hint ごと差し替える**。
   let allowedOwnersLabel = `org.allowed_owners に "${ownerView.text}" を含む`;
   let allowedOwnersHint = `vk-agents 正本 config の org.allowed_owners に "${ownerView.text}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影。未追加だと staff 系スキル／vk-kore の硬ゲートで弾かれます）。`;
+  //
+  // 一覧のどれかの要素が、**区切りで割ると owner になる断片を含む**か（issue #260）。
+  // `["acme, evil"]` のように 2 つのオーナー名が 1 個の要素として書かれている典型で、
+  // #260 で表示を要素ごとの引用符に変えて「見分けられる」ようにはなったが、それだけでは
+  // 「では何を直すのか」を誰も言っていない状態になる。この形を検知できたときは、
+  // 一覧への追加を先に読ませず「1 オーナー = 1 要素で書けているか」から案内する。
+  //
+  // **これは hint（案内文）の出し分け専用で、判定 allowedOwnersOk には絶対に流用しない。**
+  // 許可判定を部分一致にすると `vektor-inc-clone` が `vektor-inc` にマッチして硬ゲートを
+  // バイパスできる（rules/repository-access.md が「完全一致。部分一致は禁止」を明記）。
+  // 判定は上の `allowedOwners.includes(owner)`（完全一致）のままで、ここは 1 文字も触らない。
+  //
+  // 突き合わせは**生の値**で行う（サニタイズ済みの値で見ると、制御文字入りの owner が
+  // 一覧の要素の一部に化けて、実際には無い「埋め込み」を案内してしまう）。hint に載せる
+  // 表示だけは他と同じくサニタイズ済みの ownerView.text を使う。
+  //
+  // 条件はこの定数だけで完結させる（else if の位置に依存させない）。オーナー名として
+  // 見せられない値のときは「一覧に "" が含まれています」に化けるので、先の分岐と同じ
+  // 2 つのガード（表示できる文字が残るか・文字列として書かれているか）をここでも持つ。
+  //
+  // 突き合わせは単なる部分文字列ではなく **区切りで割った断片との一致** で見る。
+  // `includes` だけだと `["vektor-inc-clone"]` + owner `vektor-inc` でも発火し、
+  // 「2 つのオーナー名が 1 個の要素として書かれています」という**断定が事実と食い違う**
+  // 案内を出してしまう。原因へ辿り着かせるための行で的外れな断定をしたら逆効果なので、
+  // 「1 要素に複数書いた」と言い切れる形だけを拾う。
+  //
+  // 区切りに入れるのは、GitHub の owner 名（英数字とハイフンのみ）には現れず、かつ人が
+  // 区切りのつもりで書く文字だけ。ASCII のカンマ・セミコロンに加えて、日本語入力のまま
+  // 書いた読点・全角カンマ・全角セミコロンも拾う（`\s` は全角スペース U+3000 も含む）。
+  // **ハイフンは絶対に入れない**（owner 名の正規の文字なので、入れた瞬間に上の誤検知が
+  // そのまま戻る）。ここに無い区切りで書かれていた場合は既定の hint に戻るだけで、
+  // 案内が壊れるわけではない（拾えないより、間違ったことを言い切らないほうを採る）。
+  const OWNER_LIST_SEPARATORS = /[,;、，；\s]+/;
+  const ownerLooksEmbedded = !allowedOwnersOk
+    && ownerIsString
+    && ownerView.text !== ''
+    // item !== owner は !allowedOwnersOk から自明だが、「完全一致した要素の話ではない」ことを
+    // 読み手にもコードにも明示しておく（判定へ流用されないための歯止めを兼ねる）。
+    && allowedOwners.some((item) => item !== owner && item.split(OWNER_LIST_SEPARATORS).includes(owner));
   //
   // 分岐の起点は「加工されたか」ではなく **「オーナー名として見せられる値か」**。
   // 加工の有無で分岐すると、文字列以外の値が素通りして `"" を追加してください` が復活する。
@@ -866,6 +947,27 @@ export function runDoctor(options = {}) {
     // ブロックも一緒に載せること。さらに削るなら、この前提を先に確認すること。
     // #252 の核心である「一覧と同じ名前に見えるのに ❌」の一文だけは必ず残す。
     allowedOwnersHint = `config.json の github.owner に制御文字が混ざっています。上の表示では取り除いてあるので一覧と同じ名前に見えますが、判定は元の値で行うため未充足のままです。まず github.owner を制御文字の無い値へ直してください。直してもなお未充足なら、vk-agents 正本 config の org.allowed_owners に "${ownerView.text}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影）。`;
+  } else if (ownerLooksEmbedded) {
+    // label は既定のまま（`"evil" を含む`）。ここで加工されているものは無く、
+    // 直す先は owner ではなく**一覧の書き方**なので、label に注記や但し書きを足す理由がない。
+    //
+    // hint は #252 と同じ「原因 → 最初にやること → それでもダメなら」の順で丸ごと差し替える。
+    // 既定文（一覧に追加してください）を先に読ませると、一覧には既にその名前が見えている
+    // ので「言われたとおりなのに直らない」に戻り、しかも本当の原因（1 要素に 2 つ書いてある）
+    // を残したまま許可オーナー一覧＝セキュリティ境界へ項目を足すことになる。
+    //
+    // 例に出す `["acme, evil"]` / `["acme", "evil"]` は書き方の例示（固定値）で、設定値の
+    // 表示ではない。設定値として見せるのは引用符付きの ownerView.text（current の一覧と
+    // 同じ整形）だけに保つ。
+    //
+    // 「分割せず出所を疑う」の一文を、対処（分割）と同じ段に置く。この案内は
+    // 「1 要素にまとまっている名前を分けてください」と読めるので、正本 config へ
+    // `"vektor-inc, evilcorp"` を仕込まれていた場合、利用者の手で分割させて evilcorp を
+    // 正規の許可要素へ昇格させる筋道になりうる（同じ書き込み権があれば最初から単独要素で
+    // 足せるので実害は増えないが、#252 が「覚えのない文字なら設定ファイルの出所そのものを
+    // 疑ってください」を置いているのと同じ発想で、手を動かす前に一度止める）。
+    // 後段（追加してください）へ回すと、分割し終えた後に読むことになるので意味がない。
+    allowedOwnersHint = `一覧の中に "${ownerView.text}" を含む要素がありますが、要素そのものが "${ownerView.text}" ではないため未充足です（\`["acme, evil"]\` のように 2 つのオーナー名が 1 個の要素として書かれていると一致しません）。まず vk-agents 正本 config の org.allowed_owners が \`["acme", "evil"]\` のように「1 オーナー = 1 要素」になっているか確認してください。見覚えのないオーナー名が一緒に書かれていたら、分割せず設定ファイルの出所そのものを疑ってください。書き方が正しいのに未充足なら、org.allowed_owners に "${ownerView.text}" を追加してください（値を A の config.json に入れてから \`vk-orchestrator apply\` で投影）。`;
   }
   requirements.push({
     id: 'org.allowed_owners',

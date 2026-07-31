@@ -1222,7 +1222,8 @@ test('runDoctor: 許可オーナー一覧は長さで切り詰めない（issue 
     (options) => {
       const current = byId(runDoctor(options), 'org.allowed_owners').current;
       assert.ok(current.length > 64, '前提: 検証には 64 文字超の一覧を使う');
-      assert.equal(current, owners.join(', '));
+      // 要素は引用符で括るが（issue #260）、件数も値も落とさない。
+      assert.equal(current, owners.map((owner) => `"${owner}"`).join(', '));
     },
   );
 });
@@ -1537,13 +1538,176 @@ test('runDoctor: 加工が起きない通常ケースでは表示も要件オブ
       assert.equal(byId(reqs, 'github.owner').current, 'acme');
       assert.equal(byId(reqs, 'github.repo').current, 'queue');
       assert.equal(byId(reqs, 'orchestrator.assigneeFilter').current, 'me');
-      assert.equal(byId(reqs, 'org.allowed_owners').current, 'acme, other');
+      // 一覧だけは要素の境界が読めるよう引用符で括る（issue #260。注記は付かないまま）。
+      assert.equal(byId(reqs, 'org.allowed_owners').current, '"acme", "other"');
       assert.equal(byId(reqs, 'org.allowed_owners').label, 'org.allowed_owners に "acme" を含む');
       assert.doesNotMatch(byId(reqs, 'org.allowed_owners').hint, /制御文字/);
       // レポート本文にも注記が現れない。
       assert.doesNotMatch(formatDoctorReport(reqs), /制御文字/);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// 許可オーナー一覧の要素境界（issue #260）
+//
+// 一覧を `, ` で 1 行に連結して見せると、要素の中に `, ` が入っていたとき
+// 「区切り」と「値の一部」を見分けられない。`org.allowed_owners: ["acme, evil"]`
+// （1 要素）と `["acme", "evil"]`（2 要素）が同じ表示になるため、前者で
+// `github.owner: "evil"` を診断すると「一覧に evil が並んでいるのに ❌」という
+// #252 と同型の自己矛盾に見え、doctor のバグだと受け取られて真因へ辿り着けない。
+// **判定（完全一致）は正しいので変えず、表示だけで境界を読めるようにする。**
+// ---------------------------------------------------------------------------
+
+// 一覧だけを差し替えて org.allowed_owners 要件を取り出すヘルパ（owner は固定）。
+function allowedOwnersRequirement(allowedOwners, owner = 'evil') {
+  return withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner } }, allowedOwners },
+    (options) => byId(runDoctor(options), 'org.allowed_owners'),
+  );
+}
+
+test('runDoctor: 一覧の要素は引用符で括り、値の中の `, ` と区切りを見分けられる（issue #260）', () => {
+  const owners = allowedOwnersRequirement(['acme, evil']);
+  // 判定は従来どおり完全一致。"evil" という要素は無いので未充足のまま（fail-open にしない）。
+  assert.equal(owners.ok, false);
+  // 表示は「1 要素の値が `acme, evil`」と読める形になっていること。
+  assert.equal(owners.current, '"acme, evil"');
+  // 加工はしていないので注記もフラグも付かない（#252 の注記とは別の話）。
+  assert.doesNotMatch(owners.current, /制御文字/);
+  assert.equal(owners.displaySanitized, undefined);
+});
+
+test('runDoctor: 要素数の違う一覧が同じ表示にならない（issue #260 の自己矛盾の再現）', () => {
+  const oneElement = allowedOwnersRequirement(['acme, evil']);
+  const twoElements = allowedOwnersRequirement(['acme', 'evil']);
+  // 判定はもともと割れている（1 要素側だけ未充足）。
+  assert.equal(oneElement.ok, false);
+  assert.equal(twoElements.ok, true);
+  // 表示も同じく割れていること（判定と表示が同じ結論を指す）。
+  assert.notEqual(
+    oneElement.current,
+    twoElements.current,
+    '要素数が違えば表示も違うこと（同じだと ❌ の理由が読み取れない）',
+  );
+  assert.equal(twoElements.current, '"acme", "evil"');
+});
+
+test('runDoctor: 値に引用符が含まれても囲いを閉じられない（表示の境界を壊さない）', () => {
+  const owners = allowedOwnersRequirement(['ac"me, evil', 'evil']);
+  // 一覧に "evil" が要素として存在するので判定は充足（表示の話と混ざらないことの確認）。
+  assert.equal(owners.ok, true);
+  // 値の中の `"` はエスケープされ、囲いとしての引用符は要素数 × 2 個のまま。
+  assert.equal(owners.current, `${JSON.stringify('ac"me, evil')}, "evil"`);
+  const fences = owners.current.replace(/\\./g, '').match(/"/g) ?? [];
+  assert.equal(fences.length, 4, '囲いを閉じるのは製品側だけ（値の側から増やせない）');
+});
+
+test('runDoctor: 一覧の要素が加工されたら注記は引用符の外に 1 度だけ付く（#260 と #252 の両立）', () => {
+  const owners = allowedOwnersRequirement(['acme', `ot${BEL}her`, `ye${BEL}t`], 'acme');
+  assert.equal(owners.ok, true);
+  // 引用符の中は値だけ（注記を値の一部に読ませない）。注記は末尾に 1 度だけ。
+  assert.equal(owners.current, '"acme", "other", "yet"（表示のため制御文字を除去）');
+  assert.equal(owners.current.match(/制御文字を除去/g).length, 1);
+  // どれか 1 要素でも加工されればフラグが立つ。
+  assert.equal(owners.displaySanitized, true);
+});
+
+test('runDoctor: 一覧の要素に owner が埋め込まれているとき hint が真因（1 オーナー = 1 要素）を指す（issue #260）', () => {
+  const owners = allowedOwnersRequirement(['acme, evil']);
+  assert.equal(owners.ok, false);
+  // 1 文目が原因の説明（既定文の「一覧に追加してください」で始まらない）。
+  assert.match(owners.hint, /^一覧の中に "evil" を含む要素がありますが/);
+  assert.match(owners.hint, /1 個の要素として書かれていると一致しません/);
+  // 「まず書き方を確認」が「そのうえで追加」より前に来ていること（#252 と同じ順序）。
+  const checkAt = owners.hint.indexOf('「1 オーナー = 1 要素」になっているか確認');
+  const addAt = owners.hint.indexOf('org.allowed_owners に "evil" を追加');
+  assert.ok(checkAt >= 0, '書き方の確認が含まれること');
+  assert.ok(addAt > checkAt, '一覧への追加は書き方の確認より後ろに置くこと');
+  // label は既定のまま（加工は起きておらず、直す先は owner ではなく一覧の書き方）。
+  assert.equal(owners.label, 'org.allowed_owners に "evil" を含む');
+  assert.equal(owners.displaySanitized, undefined);
+});
+
+test('runDoctor: 部分一致する要素が無い通常の未充足では従来の hint のまま（案内を増やさない）', () => {
+  const owners = allowedOwnersRequirement(['acme', 'other']);
+  assert.equal(owners.ok, false);
+  assert.match(owners.hint, /^vk-agents 正本 config の org\.allowed_owners に "evil" を追加してください/);
+  assert.doesNotMatch(owners.hint, /1 個の要素として/);
+});
+
+test('runDoctor: 埋め込みの検知は hint の出し分け専用で、判定は完全一致のまま（ゲートをバイパスさせない）', () => {
+  // 検知を判定に流用すると `["vektor-inc, evilcorp"]` で evilcorp 側も通ることになる
+  // （rules/repository-access.md が禁じている部分一致）。案内が出ても ok は false のまま。
+  const owners = allowedOwnersRequirement(['vektor-inc, evilcorp'], 'vektor-inc');
+  assert.equal(owners.ok, false);
+  assert.match(owners.hint, /一覧の中に "vektor-inc" を含む要素がありますが/);
+});
+
+test('runDoctor: ハイフン連結の別オーナー名では埋め込みの案内を出さない（既定 hint のまま）', () => {
+  // `vektor-inc-clone` は「2 つのオーナー名を 1 個の要素に書いた」形ではないので、
+  // そう断定する案内を出すと事実と食い違い、原因から遠ざける。区切りで割って一致した
+  // ときだけ発火させ、ここでは既定の hint に戻す。ok は当然 false のまま。
+  const owners = allowedOwnersRequirement(['vektor-inc-clone'], 'vektor-inc');
+  assert.equal(owners.ok, false);
+  assert.match(owners.hint, /^vk-agents 正本 config の org\.allowed_owners に "vektor-inc" を追加してください/);
+  assert.doesNotMatch(owners.hint, /1 個の要素として/);
+});
+
+// 区切りに入れるのは owner 名（英数字とハイフン）に現れない文字だけ。人が書き間違える形を
+// 拾いつつ、ハイフンを入れないこと（誤検知が戻る）を並べて固定する。
+for (const { name, separator } of [
+  { name: '半角カンマ＋空白', separator: ', ' },
+  { name: '半角カンマのみ', separator: ',' },
+  { name: '半角スペース', separator: ' ' },
+  { name: '全角スペース', separator: '　' },
+  { name: '読点', separator: '、' },
+  { name: '全角カンマ', separator: '，' },
+  { name: 'セミコロン', separator: '; ' },
+]) {
+  test(`runDoctor: ${name}で 1 要素にまとめられていても埋め込みとして検知する`, () => {
+    const owners = allowedOwnersRequirement([`acme${separator}evil`]);
+    assert.equal(owners.ok, false);
+    assert.match(owners.hint, /^一覧の中に "evil" を含む要素がありますが/);
+  });
+}
+
+test('runDoctor: 埋め込みの hint は分割の前に出所を疑う一文を挟む（#252 と同じ発想）', () => {
+  // この案内は「まとまっている名前を分けてください」と読めるため、正本 config へ
+  // `"vektor-inc, evilcorp"` を仕込まれていた場合に利用者の手で evilcorp を正規の要素へ
+  // 昇格させる筋道になりうる。手を動かす前に一度止める一文を、対処と同じ段に置く。
+  const owners = allowedOwnersRequirement(['vektor-inc, evilcorp'], 'vektor-inc');
+  assert.match(owners.hint, /見覚えのないオーナー名が一緒に書かれていたら、分割せず設定ファイルの出所そのものを疑って/);
+  // 文言は #252 側（formatDisplaySanitizedWarning）の言い回しに揃える。
+  assert.ok(
+    formatDisplaySanitizedWarning([{ displaySanitized: true }]).includes('設定ファイルの出所そのものを疑って'),
+    '前提: #252 側と同じ言い回しであること',
+  );
+  // 位置は「書き方の確認」の後・「一覧へ追加」の前（分割し終えた後に読ませない）。
+  const checkAt = owners.hint.indexOf('になっているか確認');
+  const doubtAt = owners.hint.indexOf('見覚えのないオーナー名が');
+  const addAt = owners.hint.indexOf('org.allowed_owners に "vektor-inc" を追加');
+  assert.ok(checkAt >= 0 && doubtAt > checkAt && addAt > doubtAt, `想定の順序に並ぶこと: ${owners.hint}`);
+});
+
+test('runDoctor: 制御文字入り owner では #252 の hint が優先される（分岐の順序を崩さない）', () => {
+  // 生の値どうしでは埋め込みが成立する（`acme, evil<BEL>` は `evil<BEL>` を含む）が、
+  // 先に直すべきは owner 側の制御文字なので #252 の案内が勝つこと。
+  const owners = allowedOwnersRequirement(['acme, ' + `evil${BEL}`], `evil${BEL}`);
+  assert.equal(owners.ok, false);
+  assert.match(owners.hint, /^config\.json の github\.owner に制御文字が混ざっています/);
+  assert.doesNotMatch(owners.hint, /1 個の要素として/);
+  assert.equal(owners.displaySanitized, true);
+});
+
+test('runDoctor: 文字列でない owner では埋め込みの案内を出さない（見せられない値を一覧の話にしない）', () => {
+  // String({}) は '[object Object]' に化けるだけ。`o.includes(owner)` は生の値
+  // （オブジェクト）で false になるが、ガードが外れると「一覧の中に "" を含む要素が」
+  // という壊れた案内へ落ちうるので、型のガードごと固定する。
+  const owners = allowedOwnersRequirement(['acme, evil'], {});
+  assert.equal(owners.ok, false);
+  assert.match(owners.hint, /文字列のオーナー名になっていません/);
+  assert.doesNotMatch(owners.hint, /1 個の要素として/);
 });
 
 test('summarizeDoctor: 全 required 充足で allRequiredOk=true（ローカルモード最小構成）', () => {
