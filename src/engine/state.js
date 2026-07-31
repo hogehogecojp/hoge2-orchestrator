@@ -43,7 +43,11 @@ function updateState(mutator) {
   return next;
 }
 
-export function recordTaskStart({ issueNumber, termId, wpPort, repo }) {
+// paneTitleUrl は「起動時にペインのヘッダーへ設定した URL」。termId だけでは
+// 「その termId のペインが今もこのタスクのものか」を確かめられず、ペインが閉じられた後に
+// 実行面が同じ termId を別タスクへ再採番すると、無関係なペインへ通知・差し戻しを
+// 送ってしまう（#263）。ペイン側の申告（apiUrl）と突き合わせるための控えとして残す。
+export function recordTaskStart({ issueNumber, termId, wpPort, repo, paneTitleUrl = null }) {
   return updateState(state => {
     const key = String(issueNumber);
     // pane 消失による自動再開の回数（resumeCount）は再ディスパッチをまたいで
@@ -54,6 +58,7 @@ export function recordTaskStart({ issueNumber, termId, wpPort, repo }) {
     const prevConflictHandback = state.issues[key]?.conflictHandback;
     state.issues[key] = {
       termId,
+      paneTitleUrl,               // ペイン照合用（#263）。URL 付きで設定できなければ null
       wpPort,
       repo,                       // "owner/repo" 形式（task-queue が把握できる範囲）
       startedAt: new Date().toISOString(),

@@ -25,7 +25,19 @@ function createTaskStore(initial = {}) {
   };
 }
 
-function createHarness({ store, submitToClaude, getStates = null, logger } = {}) {
+// 既定のペイン一覧。state の termId（term-1）は在るが、識別情報（apiPrUrl / apiUrl）は
+// 持たない中立なペイン（tmux 相当）にしてある。
+//
+// 実運用（src/engine/index.js）では getStates が必ず注入されるため、既定でも「注入されて
+// いる」状態を実態として扱う（未注入は配線が外れた異常で、その場合の挙動＝テキスト投稿の
+// 見送りは専用のテストで検証する）。一方でここに担当 PR を持たせると、PR URL の内容を
+// 変えるテスト（汚染 URL・末尾に文字列が続く URL）が照合で弾かれて主眼がぼやけるため、
+// 照合に中立なペインを既定にする。照合そのものを見るテストは個別に getStates を渡す。
+const defaultGetStates = async () => ({
+  terminals: { 'pane-1': { termId: 'term-1' } },
+});
+
+function createHarness({ store, submitToClaude, getStates = defaultGetStates, logger } = {}) {
   const badgeCalls = [];
   const submits = [];
   const warnings = [];
@@ -122,6 +134,8 @@ describe('notifyPaneMerged', () => {
       port: 13847,
       getTask: taskStore.getTask,
       updateTask: taskStore.updateTask,
+      // 照合は必ず通る経路なので、実運用と同じく getStates を注入した状態で見る。
+      getStates: defaultGetStates,
       setTerminalPrUrl: async () => {
         order.push('badge');
         return { ok: true };
@@ -266,6 +280,7 @@ describe('notifyPaneMerged', () => {
       port: 13847,
       getTask: taskStore.getTask,
       updateTask: async () => { throw new Error('state write failed'); },
+      getStates: defaultGetStates,
       setTerminalPrUrl: async () => ({ ok: true }),
       submitToClaude: async (...args) => {
         submits.push(args);
@@ -343,7 +358,9 @@ describe('notifyPaneMerged', () => {
     assert.equal(submits.length, 1, '送信中のキーは投稿しない');
   });
 
-  it('state の termId が別 PR のペインを指している場合はテキストのみスキップする', async () => {
+  // 別タスクのペインへバッジを書くと、そのペインの担当者から見て自分の PR が
+  // 「マージ済み」に化ける。掴み違いが確定している以上、テキストもバッジも送らない（#263）。
+  it('state の termId が別 PR のペインを指している場合はテキストもバッジもスキップする', async () => {
     const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({
       getStates: async () => ({
         terminals: {
@@ -355,7 +372,7 @@ describe('notifyPaneMerged', () => {
     await notifyPaneMerged(79, PR_URL, '[merge-watch]');
 
     assert.equal(submits.length, 0, '無関係なペインへ割り込み指示を送らない');
-    assert.equal(badgeCalls.length, 1, 'バッジ通知は従来どおり行う');
+    assert.equal(badgeCalls.length, 0, '無関係なペインの PR ボタンを書き換えない');
     assert.ok(warnings.some((w) => /別の PR を担当している/.test(w)));
   });
 
@@ -494,13 +511,105 @@ describe('notifyPaneMerged', () => {
     await notifyPaneMerged(79, PR_URL, '[merge-watch]');
 
     assert.equal(submits.length, 0, '無関係なペインへ割り込み指示を送らない');
-    assert.equal(badgeCalls.length, 1);
+    assert.equal(badgeCalls.length, 0, '無関係なペインの PR ボタンを書き換えない');
     assert.ok(warnings.some((w) => /別の PR を担当している/.test(w)));
   });
 
-  it('states を取得できない場合も、一律スキップせず state の termId を信頼して投稿する', async () => {
+  // #263: PR 検知済みタスクは pane-resume の termId リセット（termId:null）へ到達しないため、
+  // ペインを閉じた後も state に termId が残る。VK Terminals が同じ termId を別タスクの新しい
+  // ペインへ再採番すると、掴み違えたペインは PR 未検知（apiPrUrl 空）なので「PR 未設定 →
+  // state を信頼」の経路に落ち、無関係なペインへマージ通知が届いてしまう。
+  // ヘッダーリンク（apiUrl）は起動時にこちらが設定した値なので、これが別 issue を指していれば
+  // 「別タスクのペイン」と確定できる。
+  it('termId が別タスクのペインへ再利用されている場合（PR 未設定・ヘッダーリンクが別 issue）は投稿もバッジもスキップする', async () => {
+    const store = createTaskStore({
+      79: { termId: 'term-1', paneTitleUrl: 'https://github.com/vektor-inc/example/issues/300' },
+    });
+    const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({
+      store,
+      getStates: async () => ({
+        terminals: {
+          'pane-1': {
+            termId: 'term-1',
+            apiPrUrl: '',
+            apiUrl: 'https://github.com/vektor-inc/example/issues/901',
+          },
+        },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 0, '別タスクのペインへ割り込み指示を送らない');
+    assert.equal(badgeCalls.length, 0, '別タスクのペインの PR ボタンを書き換えない');
+    assert.ok(
+      warnings.some((w) => /別タスク/.test(w)),
+      `別タスクのペインだと分かる warn を残す: ${JSON.stringify(warnings)}`
+    );
+    assert.equal(
+      store.tasks.get('79').mergedNoticeSentPrUrl,
+      undefined,
+      '掴み違いによる見送りでは送信済みマークを書かない'
+    );
+  });
+
+  // ログはコンソールに出るうえ issue へ貼られる運用がある。ペイン由来の値は外部入力なので、
+  // 制御文字・ANSI をそのまま流すと表示が崩れる（#253 と同じ経路）。
+  it('別タスク判定の warn に出すペイン由来の値から制御文字・ANSI を落とす', async () => {
+    const store = createTaskStore({
+      79: { termId: 'term-1', paneTitleUrl: 'https://github.com/vektor-inc/example/issues/300' },
+    });
+    const { notifyPaneMerged, warnings } = createHarness({
+      store,
+      getStates: async () => ({
+        terminals: {
+          'pane-1': {
+            termId: 'term-1',
+            apiUrl: 'https://github.com/vektor-inc/example/issues/901\u001b[31m\u0007\n偽の行',
+          },
+        },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    const warned = warnings.filter((w) => /別タスク/.test(w));
+    assert.equal(warned.length, 2, `テキスト投稿とバッジの両方で見送る: ${JSON.stringify(warnings)}`);
+    for (const message of warned) {
+      assert.ok(!/[\u001b\u0007\n]/.test(message), 'ANSI・制御文字を落とす');
+      assert.ok(message.includes('偽の行'), '値そのものは落とさない（読めなくならないように）');
+    }
+  });
+
+  it('ヘッダーリンクが state の記録と一致していれば投稿する（同一タスクのペイン）', async () => {
+    const titleUrl = 'https://github.com/vektor-inc/example/issues/300';
+    const store = createTaskStore({ 79: { termId: 'term-1', paneTitleUrl: titleUrl } });
+    const { notifyPaneMerged, badgeCalls, submits } = createHarness({
+      store,
+      getStates: async () => ({
+        terminals: { 'pane-1': { termId: 'term-1', apiPrUrl: '', apiUrl: titleUrl } },
+      }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 1);
+    assert.equal(badgeCalls.length, 1);
+  });
+
+  // この変更より前に起動したタスクには paneTitleUrl が無い。照合できないことを理由に
+  // 見送ると、実行中タスクが黙ってマージ通知を失う。
+  it('state に paneTitleUrl が無い（既存タスク）なら照合不能として state を信頼する', async () => {
     const { notifyPaneMerged, submits } = createHarness({
-      getStates: async () => { throw new Error('states unavailable'); },
+      getStates: async () => ({
+        terminals: {
+          'pane-1': {
+            termId: 'term-1',
+            apiPrUrl: '',
+            apiUrl: 'https://github.com/vektor-inc/example/issues/901',
+          },
+        },
+      }),
     });
 
     await notifyPaneMerged(79, PR_URL, '[merge-watch]');
@@ -508,8 +617,85 @@ describe('notifyPaneMerged', () => {
     assert.equal(submits.length, 1);
   });
 
+  // 期待値の変更（安藤レビュー）: 以前は states 取得失敗でも state を信頼して投稿していたが、
+  // それでは VK Terminals API が落ちている間だけ修正前の挙動（＝誤爆しうる状態）に戻る。
+  // テキスト投稿はペインで実行されるプロンプトなので、照合材料が「一時的に」取れないときは
+  // 見送る。送信済みマークは送信成功後にしか書かないため、次ループで必ず再試行され
+  // 取りこぼしにはならない。作用の弱いバッジ書き込みは従来どおり続行する。
+  it('states を取得できない場合はテキスト投稿を見送り、バッジ通知だけ行う', async () => {
+    const { notifyPaneMerged, badgeCalls, submits, warnings, taskStore } = createHarness({
+      getStates: async () => { throw new Error('states unavailable'); },
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 0, '照合できない間はプロンプトを送らない');
+    assert.equal(badgeCalls.length, 1, 'バッジ通知は作用が弱いので従来どおり行う');
+    assert.ok(warnings.some((w) => /照合/.test(w)), JSON.stringify(warnings));
+    assert.equal(
+      taskStore.tasks.get('79').mergedNoticeSentPrUrl,
+      undefined,
+      'マークを書かず、API が復帰した次ループで再試行できるようにする'
+    );
+  });
+
+  // 現状 index.js では必ず注入されるので到達しないが、将来配線が外れたときに
+  // 「最も作用の強いテキスト投稿だけが黙って照合なしに戻る」のは避けたい（安藤レビュー）。
+  it('getStates が未注入（照合の配線が外れた状態）ならテキスト投稿を見送り、バッジだけ行う', async () => {
+    const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({ getStates: null });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 0, '照合できない配線では送らない（fail-close）');
+    assert.equal(badgeCalls.length, 1, 'バッジ通知は作用が弱いので従来どおり行う');
+    // 見送りを黙って続けると「通知が来ないのにログに何も無い」状態になる。
+    // この経路は再試行では直らないので、そう分かる文言まで含めて確認する。
+    const warned = warnings.filter((w) => /getStates/.test(w));
+    assert.equal(warned.length, 1, `配線が外れたことを warn する: ${JSON.stringify(warnings)}`);
+    assert.match(warned[0], /issue #79/);
+    assert.match(warned[0], /見送りま/, '何をしないのかを書く');
+    assert.match(warned[0], /再試行では解消しません/, '次にどうなるのかを書く');
+  });
+
+  it('states の形式が不正な場合もテキスト投稿を見送り、痕跡を残す', async () => {
+    const { notifyPaneMerged, badgeCalls, submits, warnings } = createHarness({
+      getStates: async () => ({ terminals: null }),
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+
+    assert.equal(submits.length, 0);
+    assert.equal(badgeCalls.length, 1);
+    // VK Terminals 側のバージョン差・仕様変更で現実に起こりうる経路なので、
+    // 「通知が来ないのにログに何も無い」状態にしない。
+    const warned = warnings.filter((w) => /形式が不正/.test(w));
+    assert.equal(warned.length, 1, `形式不正を warn する: ${JSON.stringify(warnings)}`);
+    assert.match(warned[0], /issue #79/);
+    assert.match(warned[0], /見送りま/, '何をしないのかを書く');
+    assert.match(warned[0], /次ループで再試行/, '次にどうなるのかを書く');
+  });
+
+  it('states 取得が復帰した次のループではテキストを投稿する', async () => {
+    let broken = true;
+    const { notifyPaneMerged, submits } = createHarness({
+      getStates: async () => {
+        if (broken) throw new Error('states unavailable');
+        return { terminals: { 'pane-1': { termId: 'term-1', apiPrUrl: PR_URL } } };
+      },
+    });
+
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+    assert.equal(submits.length, 0);
+
+    broken = false;
+    await notifyPaneMerged(79, PR_URL, '[merge-watch]');
+    assert.equal(submits.length, 1, '見送りは取りこぼしではなく次ループへの持ち越し');
+  });
+
   // 一致確認はバッジ通知より前に行う必要がある。setTerminalPrUrl はペインへ prUrl を
   // 書き込むため、後から確認すると自分で書いた値と照合することになり検証にならない。
+  // 照合が後回しなら、バッジが先に PR_URL を書いて一致してしまい、テキストまで届く。
+  // 「バッジもテキストも送られていない」ことが、照合が先に走った何よりの証拠になる。
   it('ペインの担当 PR 確認はバッジ通知より前に行う', async () => {
     const order = [];
     const taskStore = createTaskStore({ 79: { termId: 'term-1' } });
@@ -537,7 +723,7 @@ describe('notifyPaneMerged', () => {
 
     await notifyPaneMerged(79, PR_URL, '[merge-watch]');
 
-    assert.deepEqual(order, ['states', 'badge']);
+    assert.deepEqual(order, ['states'], '照合で弾いた時点でバッジ通知まで到達しない');
     assert.equal(submits.length, 0, 'バッジ通知の書き込みで一致したことにしない');
   });
 });

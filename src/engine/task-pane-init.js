@@ -104,7 +104,7 @@ export async function attachPrUrlToPane({ setTerminalPrUrl, port, termId, prUrl,
  * @param {object|null} params.resolved    resolveTarget(issue) の結果
  * @param {string} params.cwd              ペインの作業ディレクトリ
  * @param {string|null} [params.prUrl=null] 担当 PR の HTML URL（未検知なら null）
- * @param {(args:{issue:object, cwd:string, resolvedTarget:object|null, createdLogTag:string, titleLogTag:string, readyLogTag:string})=>Promise<string|number>} params.createInitializedTaskPane
+ * @param {(args:{issue:object, cwd:string, resolvedTarget:object|null, createdLogTag:string, titleLogTag:string, readyLogTag:string})=>Promise<{termId:string|number, titleUrl:string|null}>} params.createInitializedTaskPane
  * @param {function} params.getIssueState  resolveTargetIssueForTitle 参照
  * @param {function} params.setTerminalPrUrl attachPrUrlToPane 参照
  * @param {number} params.port             VK Terminals API ポート
@@ -114,7 +114,9 @@ export async function attachPrUrlToPane({ setTerminalPrUrl, port, termId, prUrl,
  * @param {string} [params.prUrlLogTag]    PR URL 登録のログプレフィクス。タイトル系と分けるのは、
  *   PR URL の送信失敗が `[set-title]` の接頭辞で出るとログから原因を辿れなくなるため
  * @param {object} [params.logger=console]
- * @returns {Promise<string|number>} 作成したペインの termId
+ * @returns {Promise<{termId: string|number, titleUrl: string|null}>}
+ *   titleUrl は実際にペインへ設定できたヘッダーリンク。呼び出し側は state の paneTitleUrl として
+ *   残し、「この termId のペインは今もこのタスクのものか」の照合材料にする（#263）。
  * @throws ペイン作成に失敗した場合（呼び出し元で握る）
  */
 export async function openInitializedTaskPane({
@@ -138,7 +140,7 @@ export async function openInitializedTaskPane({
     logger,
   });
 
-  const termId = await createInitializedTaskPane({
+  const { termId, titleUrl = null } = await createInitializedTaskPane({
     issue,
     cwd,
     resolvedTarget,
@@ -157,5 +159,5 @@ export async function openInitializedTaskPane({
     logger,
   });
 
-  return termId;
+  return { termId, titleUrl };
 }

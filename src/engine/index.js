@@ -71,6 +71,8 @@ import { findReplyAfterWaitingInput, hasAgentAnsweredAfterWaitingInput } from '.
 import { startKeepAwake } from '../power/keep-awake.js';
 import { createNotifyPaneMerged } from './notify-pane-merged.js';
 import { attachPrUrlToPane, openInitializedTaskPane } from './task-pane-init.js';
+// state の termId が今もこのタスクのペインを指しているかの照合（#263）。
+import { PANE_OWNERSHIP, findPaneByTermId, resolvePaneOwnership } from './pane-identity.js';
 import { createWaitingMarkerScanner } from './waiting-marker-scanner.js';
 import {
   DEFAULT_REPLY_FORWARD_RETRY_MAX,
@@ -105,6 +107,7 @@ import {
   buildPaneTitle,
   collectReservedWpEnvPorts,
   extractGitHubIssueUrl,
+  stripAnsiAndControlChars,
 } from './build-command.js';
 import { buildOrchestratorMenu } from './menu.js';
 
@@ -376,14 +379,20 @@ export { buildCommand, buildPaneTitle, assignWpEnvPort, expandTemplate, extractG
 // VK Terminals 側のエンドポイント（/api/set-pr-url）は VK Terminals issue #44 で導入予定で、
 // 未対応のバージョンでも本処理が止まらないように設計している。
 //
+// PR ボタンの書き込み先は state の termId 頼りだが、この termId はペインを閉じた後も残る
+// ことがあり、実行面が同じ id を別タスクへ再採番していると別タスクのペインに「他人の PR」の
+// ボタンが出る（#263）。そのため書き込み前に素性を照合し、別タスクだと分かったらバッジだけ
+// 見送る（本流は止めない）。
+//
 // @param {object} args
 // @param {string|number|null} args.termId        対象ターミナル ID（null なら VK Terminals 通知は省略）
+// @param {string|null} [args.paneTitleUrl]       起動時にペインへ設定したヘッダーリンク（照合材料）
 // @param {string} args.queueIssueHtmlUrl         タスク登録リポジトリ側 issue の HTML URL（back-ref に使う）
 // @param {{owner:string,repo:string,number:number}} args.prRef  対象 PR の owner/repo/number
 // @param {string} args.prUrl                     対象 PR の HTML URL
 // @param {string} args.logTag                    ログプレフィクス
 // -------------------------------------------------------
-async function recordPRAcrossSurfaces({ termId, queueIssueHtmlUrl, prRef, prUrl, logTag }) {
+async function recordPRAcrossSurfaces({ termId, paneTitleUrl = null, queueIssueHtmlUrl, prRef, prUrl, logTag }) {
   if (queueIssueHtmlUrl) {
     try {
       await github.appendQueueIssueRefToPR(prRef, queueIssueHtmlUrl);
@@ -393,12 +402,57 @@ async function recordPRAcrossSurfaces({ termId, queueIssueHtmlUrl, prRef, prUrl,
   }
 
   if (termId != null) {
+    // 判定材料はヘッダーリンク（起動時に設定した URL）だけにする。ここで期待値に使える PR URL は
+    // 「これから書き込む値」なので、ペイン側は未設定か別値しか返しようがなく所有権の肯定材料に
+    // ならない。むしろ PR を張り替えた（PR#1 を閉じて PR#2 を作った）自分自身のペインを
+    // 別タスクと誤判定し、以後 PR ボタンが二度と更新されなくなる。
+    const inspection = await inspectTaskPane({
+      termId,
+      expectedTitleUrl: paneTitleUrl,
+      logTag,
+    });
+    if (inspection.ownership === PANE_OWNERSHIP.OTHER_TASK) {
+      // ペイン由来の値は外部入力。ログは issue へ貼られる運用があるため、制御文字・ANSI を
+      // 落としてから出す（既存の共通実装を再利用。#253）。期待値はこちらが持つ値なので触らない。
+      console.warn(`  ${logTag} termId が別タスクのペインを指しているため PR ボタンの書き込みを見送ります (termId=${termId}, 不一致=${inspection.mismatch}, pane=${stripAnsiAndControlChars(inspection.paneValue)}, 期待=${inspection.expectedValue})`);
+      return;
+    }
     try {
       await setTerminalPrUrl(VK_PORT, termId, prUrl);
     } catch (err) {
       console.warn(`  ${logTag} VK Terminals への PR URL 送信失敗（処理は継続）: ${err.message}`);
     }
   }
+}
+
+/**
+ * state の termId が指すペインの素性を照合する（VK Terminals へ問い合わせる版）。
+ *
+ * states を取得できない・ペインが一覧に無い場合は「照合不能」を返して呼び出し側の処理を
+ * 続行させる（fail-open）。表示系の付随処理を実行面の一時不調で落とさないため。
+ * 逆に「見送るべきときに続行してはいけない」経路（コンフリクト差し戻しのペイン再利用）は
+ * 取得失敗時に見送る必要があるので、この関数を使わず個別に states を取得している。
+ *
+ * 判定材料はヘッダーリンクだけを受け取る。この関数を使う経路（PR ボタンの書き込み）が
+ * 持っている PR URL は「これから書き込む値」で、所有権の肯定材料にならないため。
+ *
+ * @returns {Promise<{ownership:string, mismatch:string|null, paneValue:string|null, expectedValue:string|null}>}
+ */
+async function inspectTaskPane({ termId, expectedTitleUrl = null, logTag }) {
+  const unverifiable = { ownership: PANE_OWNERSHIP.UNVERIFIABLE, mismatch: null, paneValue: null, expectedValue: null };
+  if (termId == null) return unverifiable;
+
+  let states;
+  try {
+    states = await getStates(VK_PORT);
+  } catch (err) {
+    console.warn(`  ${logTag} ペインの照合用 states を取得できないため state の termId を信頼します: ${err.message}`);
+    return unverifiable;
+  }
+
+  const pane = findPaneByTermId(states?.terminals, termId);
+  if (!pane) return unverifiable;
+  return resolvePaneOwnership({ pane, expectedTitleUrl });
 }
 
 // runPostMergeCleanup は finally で removeTask し termId を含む state を消すので、
@@ -579,7 +633,9 @@ async function refreshUpdateStatus() {
  * @param {string} input.createdLogTag ペイン作成直後のログ本文
  * @param {string} input.titleLogTag タイトル設定ログ接頭辞
  * @param {string} input.readyLogTag 起動待ちログ接頭辞
- * @returns {Promise<string|number>} termId
+ * @returns {Promise<{termId: string|number, titleUrl: string|null}>}
+ *   titleUrl は **実際にペインへ設定できた** ヘッダーリンク（設定できなければ null）。
+ *   呼び出し側はこれを state の paneTitleUrl として残し、後でペインの素性照合に使う（#263）。
  */
 async function createInitializedTaskPane({
   issue,
@@ -592,8 +648,13 @@ async function createInitializedTaskPane({
   const termId = await createNewPane(VK_PORT, cwd);
   console.log(`  ${createdLogTag} (termId: ${termId})`);
   const { titleText, url: titleUrl } = buildPaneTitle(issue, resolvedTarget);
+  // URL 付きの送信が成功したときだけ控えを残す。URL を受け付けない実行面へのフォールバック
+  // （URL 無しの再送）や送信自体の失敗ではペインに URL が入らないため、ここで控えを残すと
+  // 後段の照合が必ず不一致になり、通知も差し戻しも一切出なくなる。
+  let appliedTitleUrl = null;
   try {
     await setTerminalTitle(VK_PORT, termId, titleText, titleUrl);
+    if (typeof titleUrl === 'string') appliedTitleUrl = titleUrl;
   } catch (err) {
     if (typeof titleUrl === 'string') {
       try {
@@ -614,7 +675,7 @@ async function createInitializedTaskPane({
   if (!ready) {
     console.warn(`  ${readyLogTag} Claude 起動完了を確認できませんでした。送信を試みます (termId=${termId})`);
   }
-  return termId;
+  return { termId, titleUrl: appliedTitleUrl };
 }
 
 // -------------------------------------------------------
@@ -637,8 +698,9 @@ async function startTask(issue) {
   // 元 issue の取得失敗時は従来どおりメタ issue のタイトル・リンクにフォールバックする。
   // PR URL はこの時点では未検知なので送らない（PR 検知時に recordPRAcrossSurfaces が送る）。
   let termId;
+  let paneTitleUrl = null;
   try {
-    termId = await openInitializedTaskPane({
+    ({ termId, titleUrl: paneTitleUrl } = await openInitializedTaskPane({
       issue,
       resolved,
       cwd: taskPaneCwd,
@@ -650,7 +712,7 @@ async function startTask(issue) {
       createdLogTag: '→ 新規ペイン作成',
       titleLogTag: '[set-title]',
       readyLogTag: '[ready]',
-    });
+    }));
   } catch (err) {
     console.error(`  新規ペイン作成失敗: ${err.message}`);
     return false;
@@ -692,10 +754,13 @@ async function startTask(issue) {
   // wpPort は buildCommand が算出済みの値を再利用する（二重計算・二重 config 読み込みを回避）。
   // wp-env 無効時は wpPort が null になり state に保存されないため、既存のクリーンアップ経路
   // （!saved.wpPort で早期 return）が自然にスキップされる。
+  // paneTitleUrl は「このペインへ実際に設定したヘッダーリンク」。ペインが閉じられた後に
+  // 同じ termId が別タスクへ再採番されたことを検知するための控え（#263）。
   try {
     await recordTaskStart({
       issueNumber: number,
       termId,
+      paneTitleUrl,
       wpPort,
       repo:   targetIssue ? `${targetIssue.owner}/${targetIssue.repo}` : null,
     });
@@ -942,8 +1007,12 @@ async function ensurePRRecorded(issue, target, pr) {
   if (github.extractPRUrlFromIssueBody(issue.body) === pr.html_url) return;
 
   let termId = null;
+  let paneTitleUrl = null;
   try {
-    termId = (await getTask(issue.number))?.termId ?? null;
+    const saved = await getTask(issue.number);
+    termId = saved?.termId ?? null;
+    // ペイン照合用の控え。この変更より前に起動したタスクには無いため null になりうる。
+    paneTitleUrl = saved?.paneTitleUrl ?? null;
   } catch { /* state 取得失敗は致命的でない */ }
 
   try {
@@ -953,6 +1022,7 @@ async function ensurePRRecorded(issue, target, pr) {
   }
   await recordPRAcrossSurfaces({
     termId,
+    paneTitleUrl,
     queueIssueHtmlUrl: issue.html_url,
     prRef: { owner: target.owner, repo: target.repo, number: pr.number },
     prUrl: pr.html_url,
@@ -1523,6 +1593,12 @@ async function notifyConflictHandbackExhausted({
  * （タイトル＝元 issue・PR URL）で作り直す。差し戻し専用の初期化を書くと通常起動と
  * ずれるため、新規作成は openInitializedTaskPane に一本化している（#258）。
  *
+ * 「生存している」の判定は在否だけでは足りない。state の termId はペインを閉じても残る
+ * ことがあり、実行面が同じ termId を別タスクの新しいペインへ再採番すると、差し戻しプロンプト
+ * （＝別ブランチでの作業指示）が無関係なペインへ届く（#263）。そのため再利用の前に素性を
+ * 照合し、別タスクのペインだと分かったら再利用せず新規に作り直す（見送りにはしない。
+ * コンフリクトの差し戻し自体は必要なため）。
+ *
  * @param {object} issue メタ issue
  * @param {object} saved state のタスクレコード
  * @param {string|null} prUrl 担当 PR の HTML URL（PR ボタン表示用に登録し直す）
@@ -1538,10 +1614,22 @@ async function ensureConflictHandbackPane(issue, saved, prUrl, tag) {
       console.warn(`  ${tag}: 既存ペインを生存確認できないため今回は見送り: ${err.message}`);
       return null;
     }
-    const term = Object.values(states?.terminals ?? {}).find(
-      (t) => String(t.termId) === String(saved.termId)
-    );
-    if (term) {
+    const term = findPaneByTermId(states?.terminals, saved.termId);
+    // 別タスクのペインを掴んでいたら再利用しない。ここで再利用すると、そのペインの担当者が
+    // 進めている作業へ「別ブランチのコンフリクトを解消せよ」という指示が割り込む。
+    const reuseCheck = term
+      ? resolvePaneOwnership({
+        pane: term,
+        expectedPrUrl: prUrl,
+        // この変更より前に起動したタスクには控えが無い。その場合は照合材料なしとして
+        // 従来どおり再利用する（後方互換）。
+        expectedTitleUrl: saved.paneTitleUrl ?? null,
+      })
+      : null;
+    if (reuseCheck?.ownership === PANE_OWNERSHIP.OTHER_TASK) {
+      // ペイン由来の値は外部入力なので、ログへ出す前に制御文字・ANSI を落とす（#253 と同じ経路）。
+      console.warn(`  ${tag}: termId が別タスクのペインに再利用されているため新規ペインを作成します (termId=${saved.termId}, 不一致=${reuseCheck.mismatch}, pane=${stripAnsiAndControlChars(reuseCheck.paneValue)}, 期待=${reuseCheck.expectedValue})`);
+    } else if (term) {
       // 既存ペイン再利用時も PR URL を送り直す。PR 検知時の recordPRAcrossSurfaces が
       // 失敗していたり、VK Terminals の再起動で apiPrUrl が空のまま残っていることがあり、
       // その場合は差し戻し作業中ずっと PR ボタンが出ない。この関数は差し戻し判定
@@ -1570,7 +1658,7 @@ async function ensureConflictHandbackPane(issue, saved, prUrl, tag) {
   }
 
   try {
-    const termId = await openInitializedTaskPane({
+    const { termId, titleUrl } = await openInitializedTaskPane({
       issue,
       resolved,
       cwd,
@@ -1584,7 +1672,9 @@ async function ensureConflictHandbackPane(issue, saved, prUrl, tag) {
       readyLogTag: `${tag}: 差し戻しペインの`,
       prUrlLogTag: `${tag}: 差し戻しペインへの`,
     });
-    await updateTask(issue.number, { termId, paneMissingTicks: 0 });
+    // paneTitleUrl は必ず上書きする（設定できなかった場合の null も含む）。古いペインの控えを
+    // 残すと、作り直した後のペインを「別タスク」と誤判定してしまう。
+    await updateTask(issue.number, { termId, paneTitleUrl: titleUrl, paneMissingTicks: 0 });
     return termId;
   } catch (err) {
     console.warn(`  ${tag}: コンフリクト差し戻し用ペインを確保できないため見送り: ${err.message}`);

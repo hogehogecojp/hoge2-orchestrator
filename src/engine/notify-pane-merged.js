@@ -20,6 +20,10 @@
 // 叩かずに分岐を検証できるようにしている。
 // -------------------------------------------------------
 
+import { PANE_OWNERSHIP, findPaneByTermId, resolvePaneOwnership } from './pane-identity.js';
+// ペイン由来の値をログへ出す前の正規化（既存の共通実装を再利用する。#253）。
+import { stripAnsiAndControlChars } from './build-command.js';
+
 // 送信済みマークのプロセス内フォールバック上限。state からマークを引けない経路
 // （removeTask 後・state レコードが無い issue）でも同一プロセス中の二重投稿を防ぐが、
 // 常駐プロセスで無制限に溜めないよう挿入順に古いものから捨てる。
@@ -101,20 +105,36 @@ export function createNotifyPaneMerged({
         termId = matchedPane.termId;
       }
 
-      // テキスト投稿の可否は「バッジ通知より前」に判定する。
+      // ペインの素性は「バッジ通知より前」に 1 回だけ確かめる。
       // setTerminalPrUrl(prMerged) は対象ペインへ prUrl を書き込むため、バッジ通知の後に
       // 「ペインの担当 PR が一致するか」を確かめると自分で書いた値と照合することになり、
       // 別タスクのペインを掴んでいても必ず一致してしまう（検証にならない）。
+      //
+      // テキスト投稿の要否（重複抑止）に関わらず毎回照合するのは、バッジ通知が抑止の対象外で
+      // 毎回走るため。ここを投稿判定の中に閉じ込めると、2 回目以降のマージ検知では未照合のまま
+      // 別タスクのペインへバッジを書いてしまう。
+      const paneCheck = await inspectTargetPane({
+        getStates,
+        port,
+        termId,
+        matchedPane,
+        expectedPrUrl: prUrl,
+        // paneTitleUrl はペイン起動時に setTerminalTitle で設定した URL。この変更より前に
+        // 起動したタスクのレコードには存在しないため、その場合は照合材料なしとして扱う。
+        expectedTitleUrl: task?.paneTitleUrl ?? null,
+        issueNumber,
+        logTag,
+        logger,
+      });
+
       const message = reservedNotice
-        ? await planMergedMessage({
+        ? planMergedMessage({
           submitToClaude,
           postedNotices,
           noticeKey,
           task,
-          getStates,
-          port,
+          paneCheck,
           termId,
-          matchedPane,
           issueNumber,
           prUrl,
           safePrUrl,
@@ -123,6 +143,13 @@ export function createNotifyPaneMerged({
           logger,
         })
         : null;
+
+      // 別タスクのペインだと確定した場合はバッジも書かない。無関係なペインの PR ボタンが
+      // 「マージ済み」に化けると、そのペインの担当者が自分の PR がマージされたと誤読する。
+      if (paneCheck.ownership === PANE_OWNERSHIP.OTHER_TASK) {
+        logger.warn?.(`  ${logTag} issue #${issueNumber}: ${describeOtherTaskPane(paneCheck)}ため VK Terminals への prMerged 通知を見送ります (termId=${termId}, prUrl=${prUrl})`);
+        return;
+      }
 
       try {
         await setTerminalPrUrl(port, termId, prUrl, { prMerged: true });
@@ -161,15 +188,13 @@ export function createNotifyPaneMerged({
  * 同じ PR について 2 回以上投稿しないよう「state の送信済みマーク（mergedNoticeSentPrUrl）」
  * 「プロセス内メモ」「処理中キー（呼び出し側で予約済み）」の三段で抑止する。
  */
-async function planMergedMessage({
+function planMergedMessage({
   submitToClaude,
   postedNotices,
   noticeKey,
   task,
-  getStates,
-  port,
+  paneCheck,
   termId,
-  matchedPane,
   issueNumber,
   prUrl,
   safePrUrl,
@@ -182,9 +207,7 @@ async function planMergedMessage({
     return null;
   }
 
-  if (!(await canPostToPane({
-    getStates, port, termId, prUrl, matchedPane, issueNumber, logTag, logger,
-  }))) {
+  if (!canPostToPane({ paneCheck, termId, prUrl, issueNumber, logTag, logger })) {
     return null;
   }
 
@@ -192,27 +215,110 @@ async function planMergedMessage({
 }
 
 /**
+ * 通知先ペインを特定し、そのペインが本当にこのタスクのものかを照合する。
+ *
+ * state 由来の termId は古くなりうる。ペインを閉じても termId が state に残る経路があり
+ * （#263）、実行面が同じ id を別タスクのペインへ再採番すると無関係なペインを指す。
+ * 照合の判断基準は pane-identity.js に集約し、ここでは「取得できたか」だけを扱う。
+ *
+ * 「照合できなかった」は 2 種類あり、**扱いを分ける**（unverifiableReason）:
+ *
+ *   - 'states-unavailable' … 一時的に材料が取れなかった（取得失敗・形式不正）。次ループでは
+ *     取れる見込みがあるので、テキスト投稿は見送って持ち越す。ここを state 信頼に倒すと、
+ *     VK Terminals API が落ちている間だけ修正前の挙動（誤爆しうる状態）に戻ってしまう。
+ *   - 'no-identity' … そもそも材料が無い（tmux 等の実行面・getStates 未注入の構成・
+ *     paneTitleUrl の無い既存タスク）。待っても解決しないので state を信頼する。ここを
+ *     見送りに倒すと、その実行面・その既存タスクでは通知が永久に出なくなる。
+ *
+ * 対象 termId のペインが一覧に無い場合は found:false。テキスト投稿はしない（ペインが消えて
+ * いる、または別 id へ採番し直されたときにどのペインへ届くか確証が無い）。
+ *
+ * @param {object|null} [params.matchedPane] prUrl 逆引きで既に特定済みのペイン。逆引きした
+ *   時点で担当 PR の一致は確認済みなので、所有者として扱う（states の再取得もしない）。
+ * @returns {Promise<{pane:object|null, found:boolean|null, ownership:string, unverifiableReason:string|null, mismatch:string|null, paneValue:string|null, expectedValue:string|null}>}
+ *   found は true / false / null（一覧を取得できず在否そのものが不明）。
+ */
+async function inspectTargetPane({
+  getStates, port, termId, matchedPane, expectedPrUrl, expectedTitleUrl, issueNumber, logTag, logger,
+}) {
+  const unverifiable = (pane, found, unverifiableReason) => ({
+    pane, found, ownership: PANE_OWNERSHIP.UNVERIFIABLE, unverifiableReason,
+    mismatch: null, paneValue: null, expectedValue: null,
+  });
+
+  if (matchedPane != null) {
+    return {
+      pane: matchedPane,
+      found: true,
+      ownership: PANE_OWNERSHIP.OWNER,
+      unverifiableReason: null,
+      mismatch: null,
+      paneValue: null,
+      expectedValue: null,
+    };
+  }
+
+  // getStates 未注入は照合の仕組みそのものが配線されていない状態。index.js では必ず注入して
+  // いるので現状は到達しないが、将来配線が外れたときに「最も作用の強いテキスト投稿だけが
+  // 黙って照合なしに戻る」のは避けたいので、fail-close 側（見送り）に分類する。
+  // 見送りを黙って続けると「通知が来ないのにログに何も無い」状態になるため、必ず痕跡を残す。
+  // この経路だけは次ループでも直らない（配線の問題）ので、そう分かる文言にする。
+  if (typeof getStates !== 'function') {
+    logger.warn?.(`  ${logTag} issue #${issueNumber}: ペイン一覧の取得手段（getStates）が配線されていないためペインを照合できず、マージ通知メッセージの投稿を見送ります（この状態は再試行では解消しません。配線を確認してください）。prUrl=${expectedPrUrl}`);
+    return unverifiable(null, null, 'states-unavailable');
+  }
+
+  let states;
+  try {
+    states = await getStates(port);
+  } catch (err) {
+    logger.warn?.(`  ${logTag} issue #${issueNumber}: VK Terminals states 取得失敗。termId のペインを照合できないためマージ通知メッセージの投稿を見送ります（次ループで再試行）。prUrl=${expectedPrUrl} (${err.message})`);
+    return unverifiable(null, null, 'states-unavailable');
+  }
+
+  // terminals の欠落・非オブジェクトは VK Terminals 側のバージョン差・仕様変更で現実に起きうる。
+  // 黙って見送ると「通知が来ないのにログに何も無い」状態が続くため、ここでも痕跡を残す。
+  const terminals = states?.terminals;
+  if (!terminals || typeof terminals !== 'object') {
+    logger.warn?.(`  ${logTag} issue #${issueNumber}: VK Terminals states の形式が不正（terminals が取れません）でペインを照合できないため、マージ通知メッセージの投稿を見送ります（次ループで再試行）。prUrl=${expectedPrUrl}`);
+    return unverifiable(null, null, 'states-unavailable');
+  }
+
+  // 在否そのものが分かっているので照合不能の理由は 'pane-missing'（呼び出し側は found で弾く）。
+  const pane = findPaneByTermId(terminals, termId);
+  if (!pane) return unverifiable(null, false, 'pane-missing');
+
+  const ownership = resolvePaneOwnership({ pane, expectedPrUrl, expectedTitleUrl });
+  // spread はこの関数が付ける情報より先に置く。後に置くと、resolvePaneOwnership が将来
+  // pane / found / unverifiableReason と同名のキーを返したとき、黙って上書きされてしまう。
+  return {
+    ...ownership,
+    pane,
+    found: true,
+    // ペインは見えているのに判定できない＝材料そのものが無い。待っても解決しない側。
+    unverifiableReason: ownership.ownership === PANE_OWNERSHIP.UNVERIFIABLE ? 'no-identity' : null,
+  };
+}
+
+/**
  * 送信先ペインがマージ通知の投稿先としてふさわしいかを確認する。
  *
- * 見ているのは 2 点。
+ * 見ているのは 4 点。
  *
- * (1) そのペインが本当にこの PR の担当か。
- *     state 由来の termId は古くなりうる（tmux の pane_id は再採番されるため、別タスクの
- *     ペインを指すことがある）。バッジ書き換えだけなら軽微だったが、テキスト投稿は無関係な
- *     ペインへの割り込み指示になるため、投稿前に照合する。
+ * (1) そのペインが一覧に在るか（inspectTargetPane の found）。
  *
- *     実行面ごとの扱い（判断の方針）:
- *       - ペイン一覧を取得できない（getStates 未注入・取得失敗・形式不正）→ state を信頼して
- *         投稿する。照合できないことを理由に一律スキップすると、実行面の一時不調でお知らせが
- *         出なくなるため。
- *       - 対象 termId のペインが一覧に無い → 投稿しない。ペインが消えている（または別 id へ
- *         採番し直された）ときにどのペインへ届くか確証が無い。
- *       - ペインは在るが担当 PR を保持していない（tmux など apiPrUrl/prUrl を持たない実行面）
- *         → state を信頼して投稿する。ここを不一致扱いにすると、その実行面ではテキスト通知が
- *         一切出なくなるため。tmux のペイン一覧は orchestrator 自身が作ったペインに限られる。
- *       - ペインが別の PR を担当している → 投稿しない（掴み違いが確定しているため）。
+ * (2) そのペインが本当にこのタスクの担当か（inspectTargetPane の ownership）。
+ *     バッジ書き換えだけなら軽微だったが、テキスト投稿は無関係なペインへの割り込み指示に
+ *     なるため、投稿前に照合する。
  *
- * (2) そのペインが入力待ちで止まっていないか（pane.waiting）。
+ * (3) 照合そのものができなかった場合、それが一時的か恒久的か（unverifiableReason）。
+ *     一時的（states 取得失敗・形式不正）なら見送って次ループへ持ち越す。テキスト投稿は
+ *     ペインで実行されるプロンプトであり、この照合が守りたい当のものなので、材料が取れない
+ *     間まで state 信頼で送ってしまうと守りが穴になる。恒久的（tmux 等・既存タスク）なら
+ *     待っても解決しないので state を信頼する。
+ *     見送っても送信済みマークは書かないため取りこぼしにはならない（次ループで再試行）。
+ *
+ * (4) そのペインが入力待ちで止まっていないか（pane.waiting）。
  *     waiting は「y/n 確認・権限承認などでユーザーの入力を待っている」状態。submitToClaude は
  *     最後に必ず Enter を撃つため（clearBeforeSend:false でも Enter は止まらない）、この状態へ
  *     投稿すると承認ダイアログの既定選択を機械が黙って確定させ、ユーザーが承認していない
@@ -221,43 +327,25 @@ async function planMergedMessage({
  *     waiting のペインを除外している（src/terminals/index.js）。
  *     ここでスキップしても送信済みマークは書かないため、承認が済んでペインが動き出した後の
  *     ループで改めて届く。
- *
- * @param {object|null} [params.matchedPane] prUrl 逆引きで既に特定済みのペイン。渡された場合は
- *   担当 PR の照合は済んでいるものとして扱い、waiting だけを見る（states の再取得もしない）。
  */
-async function canPostToPane({ getStates, port, termId, prUrl, matchedPane, issueNumber, logTag, logger }) {
-  let pane = matchedPane ?? null;
-
-  if (pane == null) {
-    if (typeof getStates !== 'function') return true;
-
-    let states;
-    try {
-      states = await getStates(port);
-    } catch (err) {
-      logger.warn?.(`  ${logTag} issue #${issueNumber}: VK Terminals states 取得失敗。termId の担当 PR を確認できないため state の termId を使います。prUrl=${prUrl} (${err.message})`);
-      return true;
-    }
-
-    const terminals = states?.terminals;
-    if (!terminals || typeof terminals !== 'object') return true;
-
-    pane = Object.values(terminals).find(
-      (p) => p && typeof p === 'object' && String(p.termId) === String(termId)
-    );
-    if (!pane) {
-      logger.warn?.(`  ${logTag} issue #${issueNumber}: termId のペインが見つからないためマージ通知メッセージの投稿を見送ります (termId=${termId}, prUrl=${prUrl})`);
-      return false;
-    }
-
-    const panePrUrl = readPanePrUrl(pane);
-    if (panePrUrl != null && panePrUrl !== prUrl) {
-      logger.warn?.(`  ${logTag} issue #${issueNumber}: termId のペインが別の PR を担当しているためマージ通知メッセージの投稿を見送ります (termId=${termId}, pane=${panePrUrl}, prUrl=${prUrl})`);
-      return false;
-    }
+function canPostToPane({ paneCheck, termId, prUrl, issueNumber, logTag, logger }) {
+  if (paneCheck.found === false) {
+    logger.warn?.(`  ${logTag} issue #${issueNumber}: termId のペインが見つからないためマージ通知メッセージの投稿を見送ります (termId=${termId}, prUrl=${prUrl})`);
+    return false;
   }
 
-  if (pane.waiting === true) {
+  if (paneCheck.ownership === PANE_OWNERSHIP.OTHER_TASK) {
+    logger.warn?.(`  ${logTag} issue #${issueNumber}: ${describeOtherTaskPane(paneCheck)}ためマージ通知メッセージの投稿を見送ります (termId=${termId}, prUrl=${prUrl})`);
+    return false;
+  }
+
+  // 照合材料が取れなかった場合は見送る。この分類に落ちる 3 経路（getStates 未注入・取得失敗・
+  // 形式不正）は **すべて inspectTargetPane 側の return 地点で warn 済み** なので、ここでは
+  // 重ねない。見送りの痕跡が残らないと「通知が来ないのにログに何も無い」状態になるため、
+  // 経路を足すときは必ずその return 地点にも warn を置くこと。
+  if (paneCheck.unverifiableReason === 'states-unavailable') return false;
+
+  if (paneCheck.pane?.waiting === true) {
     logger.warn?.(`  ${logTag} issue #${issueNumber}: ペインが入力待ち（承認ダイアログ等）のためマージ通知メッセージの投稿を見送ります（次ループで再試行）(termId=${termId}, prUrl=${prUrl})`);
     return false;
   }
@@ -266,22 +354,22 @@ async function canPostToPane({ getStates, port, termId, prUrl, matchedPane, issu
 }
 
 /**
- * ペインが「担当 PR として保持している URL」を取り出す。保持していなければ null。
+ * 別タスクのペインと判定した理由をログ用の 1 句にする。
  *
- * VK Terminals 側の「PR 未設定」の表現は **空文字** で、setTerminalPrUrl 自身が
- * `prUrl: prUrl ?? ''` と空文字を書き込む（src/terminals/backend-vk-terminals.js）。
- * そのため `pane.apiPrUrl ?? pane.prUrl ?? null` では空文字が素通しになり、
- * `'' !== prUrl` が成立して「別の PR を担当している」と誤判定されていた（#258）。
- * PR URL を持たない実行面（tmux 等）と同じく「未設定 → state を信頼して投稿」に倒すため、
- * 空文字・空白のみ・非文字列は未設定として扱い、次のフィールドへフォールバックする。
+ * 「PR が違う」と「ヘッダーリンクが違う」では原因も対処も別（前者は termId の取り違え、
+ * 後者は termId の再採番）なので、どちらで弾いたのかと実際の値を必ず残す。
+ * 文末を「〜ている」で揃え、呼び出し側が「…ため〜を見送ります」と続けられるようにする。
+ *
+ * ペイン側の値だけ正規化するのは、これが VK Terminals から受け取った外部由来の値だから。
+ * ログはコンソールに出るうえ issue へ貼られる運用があり、制御文字・ANSI が混じると表示が
+ * 崩れる（#253 と同じ経路）。期待値の側は github.com 由来でスキーム検証済みのため触らない
+ * （buildPaneTitle が URL を触らないのと同じ線引き）。
  */
-function readPanePrUrl(pane) {
-  for (const value of [pane?.apiPrUrl, pane?.prUrl]) {
-    if (typeof value !== 'string') continue;
-    const trimmed = value.trim();
-    if (trimmed !== '') return trimmed;
-  }
-  return null;
+function describeOtherTaskPane({ mismatch, paneValue, expectedValue }) {
+  const safePaneValue = stripAnsiAndControlChars(paneValue);
+  return mismatch === 'pr-url'
+    ? `termId のペインが別の PR を担当している（pane=${safePaneValue}, 期待=${expectedValue}）`
+    : `termId のペインが別タスクへ再利用されている（ペインのヘッダー=${safePaneValue}, 起動時に設定=${expectedValue}）`;
 }
 
 /**

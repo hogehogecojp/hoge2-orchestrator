@@ -32,6 +32,7 @@ const RESOLVED = {
   isSelf: false,
 };
 const PR_URL = 'https://github.com/vektor-inc/vk-terminals/pull/289';
+const TITLE_URL = 'https://github.com/vektor-inc/vk-terminals/issues/275';
 
 function createLogger() {
   const warnings = [];
@@ -158,10 +159,11 @@ function createPaneHarness({ getIssueState, setTerminalPrUrl, createPane } = {})
     deps: {
       port: 13847,
       logger,
+      // ペイン作成は termId と「実際にペインへ設定できたヘッダーリンク」を返す契約（#263）。
       createInitializedTaskPane: createPane ?? (async (args) => {
         paneCalls.push(args);
         order.push('create-pane');
-        return 4;
+        return { termId: 4, titleUrl: TITLE_URL };
       }),
       getIssueState: getIssueState ?? (async () => ({
         title: '移動先のタブに入力欄も説明も無い',
@@ -180,7 +182,7 @@ describe('openInitializedTaskPane', () => {
   it('差し戻し経路: 元 issue の resolvedTarget と PR URL を揃えてペインを初期化する', async () => {
     const h = createPaneHarness();
 
-    const termId = await openInitializedTaskPane({
+    const { termId, titleUrl } = await openInitializedTaskPane({
       issue: META_ISSUE,
       resolved: RESOLVED,
       cwd: '/tmp/worktree',
@@ -192,6 +194,8 @@ describe('openInitializedTaskPane', () => {
     });
 
     assert.equal(termId, 4);
+    // 設定できたヘッダーリンクを呼び出し側へ返す（state の paneTitleUrl に残すため。#263）
+    assert.equal(titleUrl, TITLE_URL);
     assert.equal(h.paneCalls.length, 1);
     assert.deepEqual(h.paneCalls[0].resolvedTarget, {
       number: 275,
@@ -207,7 +211,7 @@ describe('openInitializedTaskPane', () => {
   it('通常起動経路: PR 未検知（prUrl 無し）なら PR URL は送らず、resolvedTarget だけ揃える', async () => {
     const h = createPaneHarness();
 
-    const termId = await openInitializedTaskPane({
+    const { termId } = await openInitializedTaskPane({
       issue: META_ISSUE,
       resolved: RESOLVED,
       cwd: '/tmp/repo',
@@ -225,7 +229,7 @@ describe('openInitializedTaskPane', () => {
   it('元 issue の取得に失敗しても resolvedTarget=null でペイン作成を続行する', async () => {
     const h = createPaneHarness({ getIssueState: async () => { throw new Error('404'); } });
 
-    const termId = await openInitializedTaskPane({
+    const { termId } = await openInitializedTaskPane({
       issue: META_ISSUE,
       resolved: RESOLVED,
       cwd: '/tmp/worktree',
@@ -243,7 +247,7 @@ describe('openInitializedTaskPane', () => {
   it('PR URL の送信に失敗しても termId を返し、PR 用の接頭辞で warn する', async () => {
     const h = createPaneHarness({ setTerminalPrUrl: async () => { throw new Error('ECONNREFUSED'); } });
 
-    const termId = await openInitializedTaskPane({
+    const { termId } = await openInitializedTaskPane({
       issue: META_ISSUE,
       resolved: RESOLVED,
       cwd: '/tmp/worktree',

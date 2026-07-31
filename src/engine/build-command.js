@@ -116,6 +116,10 @@ export function extractGitHubIssueUrl(text) {
 // - resolvedTarget: 元の作業対象 issue が解決できたときのみ `{ number, title, url }`。
 //                   解決できない汎用タスクや取得失敗時は null を渡す。
 // resolvedTarget があればそれを、無ければ従来どおりメタ issue を表示対象にする。
+//
+// 返す url は表示（リンク）だけでなく、**ペインの identity** としても使う。state に控えた URL と
+// ペインの apiUrl を突き合わせて「この termId は今もこのタスクのペインか」を判定するため
+// （#263、src/engine/pane-identity.js）。そのため url はタスクごとに一意である必要がある。
 // @returns {{ titleText: string, url: string }}
 // -------------------------------------------------------
 export function buildPaneTitle(metaIssue, resolvedTarget) {
@@ -124,9 +128,24 @@ export function buildPaneTitle(metaIssue, resolvedTarget) {
   if (resolvedTarget) {
     return {
       titleText: stripControlChars(`#${resolvedTarget.number} ${resolvedTarget.title}`),
-      url: resolvedTarget.url,
+      // 元 issue の URL に、メタ issue 番号のフラグメントを足してタスク一意にする。
+      //
+      // なぜ必要か: resolveTarget() はメタ issue 本文から元 issue の URL を拾うだけで排他が無く、
+      // 同じ元 issue を指すメタ issue は複数作られうる（失敗タスクの再登録・作業分割）。
+      // 元 issue の URL をそのまま使うと、その 2 タスクのペインでヘッダー URL が同値になり、
+      // termId の掴み違いが起きたときにペイン照合が「一致した」と誤答する（#263）。
+      //
+      // 表示への影響: フラグメントなので、クリック時に開くページは元 issue のままで変わらない
+      // （存在しないアンカーはブラウザに無視され、ページ先頭が表示される）。VK Terminals 側も
+      // 受け取った URL を new URL() で検証するだけで正規化せずそのまま保持するため、
+      // apiUrl として往復してもフラグメントは落ちない（main.js の validateUrlField）。
+      //
+      // **消さないこと。** 「元 issue へ飛ぶだけなら不要な文字列」に見えるが、これを外すと
+      // 上記の誤判定が復活し、別タスクのペインへマージ通知や差し戻し指示が届く。
+      url: `${resolvedTarget.url}#vk-task-${metaIssue.number}`,
     };
   }
+  // メタ issue へのリンクは元々タスク単位で一意なので、フラグメントは足さない。
   return {
     titleText: stripControlChars(`#${metaIssue.number} ${metaIssue.title}`),
     url: metaIssue.html_url,
