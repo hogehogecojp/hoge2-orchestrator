@@ -1303,7 +1303,9 @@ test('runDoctor: 制御文字入り owner は allowed_owners に一致させな�
       // 表示は 1 行へ整えられる（判定と表示が別物であることの確認）。
       assert.match(owners.label, /"vektor-inc"/);
       assert.ok(!hasControlChars(owners.hint));
-      // github.owner 側の充足判定（hasNonEmpty）も従来どおり生の値で行う。
+      // github.owner 側の充足判定も従来どおり生の値で行う。
+      // **#261 の境界はここ**: 制御文字が「混ざっているだけ」（除去後に文字が残る）値は
+      // 従来どおり充足のまま。未充足へ倒すのは「除去すると 1 文字も残らない」値だけ。
       assert.equal(byId(reqs, 'github.owner').ok, true);
       // 表示は整形済みの値 ＋ 加工したことの注記（issue #252。注記の中身はそちらのテストで検証）。
       assert.match(byId(reqs, 'github.owner').current, /^vektor-inc（/);
@@ -1408,7 +1410,7 @@ test('runDoctor: vk-terminals のパスと展開済み定義の版にも注記�
 // **その状態に落ちる経路は制御文字だけではない**ので、入力の型も振って不変条件を固定する。
 // - 文字列以外の値は String() を通した結果が空になるとは限らない（[] は '' だが {} は
 //   '[object Object]'）。「加工されたか」でも「空か」でも拾い切れないため型自体を見る。
-for (const { name, owner, sanitized, ok = false } of [
+for (const { name, owner, sanitized } of [
   { name: '制御文字のみ', owner: BEL, sanitized: true },
   // 以下は加工が起きない（＝ ownerAltered が false になる）経路。
   { name: '空配列', owner: [] },
@@ -1416,15 +1418,13 @@ for (const { name, owner, sanitized, ok = false } of [
   { name: '数値', owner: 123 },
   { name: '真偽値', owner: true },
   {
-    // String(['vektor-inc']) は 'vektor-inc' に化けるため ok は true になる一方、label は
-    // 「値を見せられない」側に落ちる。この食い違い（✅ なのに値を見せない）は判定側
-    // （hasNonEmpty が非文字列を「値あり」と数える）の話で #261 で扱う。ここでは現状が
-    // 意図的であることを記録に残すために pin する。
+    // String(['vektor-inc']) は 'vektor-inc' に化けるため、#252 の時点では ok だけが true に
+    // なり（label は「値を見せられない」側）、✅ なのに値を見せない行になっていた。
+    // **#261 で判定側も揃えた**ので、いまはどちらも「使えない値」として未充足になる。
     // 値は既定オーナー名（vektor-inc）を避ける。hint 中の「書き方の例」と同じ文字列だと、
     // 「設定値を見せた」のか「例示」なのかを検査が区別できず、除外フラグが必要になるため。
-    name: '要素が 1 つの配列（#261 で扱う組み合わせ）',
+    name: '要素が 1 つの配列',
     owner: ['acme'],
-    ok: true,
   },
 ]) {
   test(`runDoctor: owner が${name}のとき値を引用符で見せず、一覧への追加も案内しない（issue #252 レビュー指摘）`, () => {
@@ -1449,17 +1449,21 @@ for (const { name, owner, sanitized, ok = false } of [
         assert.match(owners.label, /^org\.allowed_owners に github\.owner の値を含む$/);
         // 一覧への追加ではなく、まず owner を直すことだけを案内する。
         assert.doesNotMatch(owners.hint, /追加してください/);
-        assert.match(owners.hint, /github\.owner を/);
-        // 原因が「制御文字だけ」か「文字列でない」かで言い分ける。文字列以外は typeof で
-        // 確定して分かっているので断定し、直し方は引用符付きの形を見せる。
+        assert.match(owners.hint, /github\.owner/);
+        // 原因が「制御文字だけ」か「文字列でない」かの言い分けは **github.owner 側の hint**
+        // が担う。この行は owner から派生した失敗なので、対処を二重に書かず依存だけ伝える
+        // （issue #261）。文字列以外は typeof で確定して分かっているので断定し、直し方は
+        // 引用符付きの形を見せる。
+        const ownerRequirement = byId(reqs, 'github.owner');
         if (sanitized) {
-          assert.match(owners.hint, /制御文字（画面に表示できない文字）だけの値/);
+          assert.match(ownerRequirement.hint, /制御文字（画面に表示できない文字）だけの値/);
         } else {
-          assert.match(owners.hint, /文字列のオーナー名になっていません/);
-          assert.match(owners.hint, /のように引用符で囲んだユーザー／組織名へ直して/);
+          assert.match(ownerRequirement.hint, /文字列のオーナー名になっていません/);
+          assert.match(ownerRequirement.hint, /のように引用符で囲んだユーザー／組織名へ直して/);
         }
-        // 判定は従来どおり（生の値をそのまま一覧と突き合わせる）。
-        assert.equal(owners.ok, ok);
+        // 判定は生の値の完全一致のまま。ただし **owner が使えない値のときは照合そのものを
+        // 行わない**（String(['acme']) が 'acme' に化けて通る経路を止める。issue #261）。
+        assert.equal(owners.ok, false);
         // 加工が起きたときだけフラグが立つ（見せられないことと、加工したことは別）。
         assert.equal(owners.displaySanitized, sanitized || undefined);
       },
@@ -1467,14 +1471,16 @@ for (const { name, owner, sanitized, ok = false } of [
   });
 }
 
-test('runDoctor: 制御文字だけの owner は current で「表示できません」まで言い切る', () => {
+test('runDoctor: 制御文字だけの owner は current で「使えません」まで言い切る', () => {
   withDoctorEnv(
     { queueBackend: 'github', config: { github: { owner: BEL } }, allowedOwners: ['vektor-inc'] },
     (options) => {
       // 「状態・結果」の 2 段構え（他の空値表示 `（未設定・一切取り込まない）` と揃える）。
+      // #261 で未充足へ倒したので、「設定はされているが値として使えない」まで言い切る
+      //（❌ の隣で「表示できません」とだけ書くと、設定を書いた人が原因を探す先を見失う）。
       assert.equal(
         byId(runDoctor(options), 'github.owner').current,
-        '（値が制御文字のみで表示できません）',
+        '（設定されていますが、値が制御文字のみでオーナー名として使えません）',
       );
     },
   );
@@ -1767,10 +1773,337 @@ test('runDoctor: 文字列でない owner では埋め込みの案内を出さ�
   // String({}) は '[object Object]' に化けるだけ。`o.includes(owner)` は生の値
   // （オブジェクト）で false になるが、ガードが外れると「一覧の中に "" を含む要素が」
   // という壊れた案内へ落ちうるので、型のガードごと固定する。
-  const owners = allowedOwnersRequirement(['acme, evil'], {});
-  assert.equal(owners.ok, false);
-  assert.match(owners.hint, /文字列のオーナー名になっていません/);
-  assert.doesNotMatch(owners.hint, /1 個の要素として/);
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: {} } }, allowedOwners: ['acme, evil'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      const owners = byId(reqs, 'org.allowed_owners');
+      assert.equal(owners.ok, false);
+      assert.doesNotMatch(owners.hint, /1 個の要素として/);
+      // 原因の説明は github.owner 側にある（#261 でこの行は依存だけを伝える形になった）。
+      assert.match(byId(reqs, 'github.owner').hint, /文字列のオーナー名になっていません/);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 使えない設定値は未充足として数える（issue #261）
+//
+// 従来の判定（hasNonEmpty）は「空文字でなければ設定済み」だったため、制御文字だけの値や
+// 文字列で書かれていない値（`[]` / `{}` / 数値 / 真偽値 / `["acme"]`）まで充足と数えていた。
+// これらは実際には GitHub オーナー名として使えず、**doctor が「すべて設定済み」と言った
+// 直後にタスクが 1 件も流れない**。充足数が表しているのは「設定を書いた項目の数」ではなく
+// 「このまま起動して進む見込み」なので、進まない値は充足から外す。
+//
+// 判定に使う条件は AND で足すだけ（型が文字列であること・制御文字を除いても文字が残ること）。
+// **加工結果は充足を取り消す根拠にだけ使い、与える根拠には使わない**ので、❌ → ✅ へ動く
+// 経路は増えない。許可オーナー一覧との照合は従来どおり生の値の完全一致のまま。
+// ---------------------------------------------------------------------------
+
+// 未充足へ倒す 2 状態（undisplayable / invalid-type）を網羅する入力。
+// 表示では値そのものを出さず「種類の名前」だけを出す（`[object Object]` は利用者の
+// config.json に存在しない文字列なので、探しに行かせないために絶対に出さない）。
+const UNUSABLE_CONFIG_VALUES = [
+  { name: '制御文字のみ', value: BEL, sanitized: true, currentNote: '値が制御文字のみで' },
+  { name: '空配列', value: [], typeName: '配列' },
+  { name: 'オブジェクト', value: {}, typeName: 'オブジェクト' },
+  { name: '要素が 1 つの配列', value: ['acme'], typeName: '配列' },
+  { name: '数値', value: 123, typeName: '数値' },
+  { name: '真偽値', value: true, typeName: '真偽値' },
+];
+
+for (const { name, value, typeName, currentNote } of UNUSABLE_CONFIG_VALUES) {
+  test(`runDoctor: ${name}の設定値は充足から外す（issue #261）`, () => {
+    withDoctorEnv(
+      {
+        queueBackend: 'github',
+        config: {
+          github: { owner: value, repo: value },
+          orchestrator: { assigneeFilter: value },
+        },
+        // 化けた値が一致しうる要素をあえて一覧に入れておく（`["acme"]` → 'acme'）。
+        allowedOwners: ['vektor-inc', 'acme'],
+      },
+      (options) => {
+        const reqs = runDoctor(options);
+        assert.equal(byId(reqs, 'github.owner').ok, false);
+        assert.equal(byId(reqs, 'orchestrator.assigneeFilter').ok, false);
+        // repo は未設定なら従来どおり ✅（既定 task-queue が有効）。書いてあるのに
+        // 使えない値のときだけ ❌ にする。
+        assert.equal(byId(reqs, 'github.repo').ok, false);
+        // owner が使える値になるまで照合そのものを行わない（fail-close）。
+        assert.equal(byId(reqs, 'org.allowed_owners').ok, false);
+
+        // **どの状態でも値の欄が空・空白のみにならない**（`…` の右が空で終わる行を作らない）。
+        // formatDoctorReport 側の `|| '…'` のような防御ではなく、値の側で必ず非空にする。
+        for (const r of reqs) {
+          assert.match(r.current, /\S/, `${r.id} の current が非空であること`);
+        }
+        // 内部表現（[object Object]）は表示のどこにも出さない。
+        for (const r of reqs) {
+          for (const field of ['current', 'label', 'hint']) {
+            assert.ok(!r[field].includes('[object Object]'), `${r.id} の ${field}: ${r[field]}`);
+          }
+        }
+
+        // 「未設定」とは別の受け皿。値そのものは出さず、種類の名前だけを出す。
+        for (const id of ['github.owner', 'github.repo', 'orchestrator.assigneeFilter']) {
+          const current = byId(reqs, id).current;
+          assert.match(current, /^（設定されていますが、/, `${id}: ${current}`);
+          assert.doesNotMatch(current, /未設定/, `${id}: ${current}`);
+          if (typeName) assert.ok(current.endsWith(`文字列ではありません: ${typeName}）`), current);
+          else assert.ok(current.includes(currentNote), current);
+        }
+      },
+    );
+  });
+}
+
+test('runDoctor: 使えない値の hint は「設定してください」ではなく状態ごとの対処を出す（issue #261）', () => {
+  // 既存の汎用 hint（「〜に自分のユーザー／組織名を設定してください（既定 vektor-inc の
+  // ままだと…）」）は、設定を書いた自覚がある人には噛み合わない（後半は無関係）。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: BEL } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const hint = byId(runDoctor(options), 'github.owner').hint;
+      assert.equal(
+        hint,
+        'config.json の github.owner が制御文字（画面に表示できない文字）だけの値になっています。'
+          + 'この値ではオーナー名として使えないため、まず github.owner を正しいユーザー／組織名へ直してください。',
+      );
+    },
+  );
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: [] } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const hint = byId(runDoctor(options), 'github.owner').hint;
+      assert.equal(
+        hint,
+        'config.json の github.owner が、文字列のオーナー名になっていません（現在は配列）。'
+          + 'まず github.owner を "vektor-inc" のように引用符で囲んだユーザー／組織名へ直してください。',
+      );
+      // 既定値の案内（設定を書いた人には噛み合わない）は出さない。
+      assert.doesNotMatch(hint, /既定 vektor-inc のままだと/);
+    },
+  );
+});
+
+test('runDoctor: 使えない値の hint は共有ヘルパーで組み立て、キー名だけが入れ替わる（issue #261）', () => {
+  // 3 か所へ手書きすると語調が割れる。同じ形の文をヘルパーで生成していることを、
+  // 「自分のキー名しか出てこない」ことで固定する。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { repo: [] }, orchestrator: { assigneeFilter: [] } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      for (const id of ['github.repo', 'orchestrator.assigneeFilter']) {
+        const hint = byId(reqs, id).hint;
+        assert.match(hint, new RegExp(`^config\\.json の ${id.replace('.', '\\.')} が、文字列の`));
+        assert.match(hint, /（現在は配列）/);
+        assert.match(hint, /のように引用符で囲んだ/);
+        // 別のキーの話に化けない（コピペで語調と一緒にキー名まで持ってこない）。
+        assert.ok(!hint.includes('github.owner'), hint);
+      }
+    },
+  );
+});
+
+test('runDoctor: owner が使えない値のとき org.allowed_owners は依存だけを伝える（issue #261）', () => {
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: [] } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const owners = byId(runDoctor(options), 'org.allowed_owners');
+      assert.equal(
+        owners.hint,
+        'まず上の「GitHub オーナー（github.owner）」を直してください。'
+          + 'github.owner が使える値になるまで、org.allowed_owners との照合ができません（一覧そのものは変更不要です）。',
+      );
+      // 許可オーナー一覧＝セキュリティ境界。反射的に項目を足させないための一文は必須。
+      assert.match(owners.hint, /一覧そのものは変更不要です/);
+      assert.doesNotMatch(owners.hint, /追加してください/);
+      // label は #252 で入った中立形のまま（引用符で "" や "[object Object]" を見せない）。
+      assert.equal(owners.label, 'org.allowed_owners に github.owner の値を含む');
+    },
+  );
+});
+
+test('formatDoctorReport: 空配列の設定値でも値の欄が空のまま終わる行が無い（issue #261）', () => {
+  // `…` は「この後に値が来る」という約束なので、空で終わると印刷が途中で切れたようにも
+  // 「値が空文字」とも読めて状態が確定しない。行末での空欄を直接禁止する。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { owner: [], repo: [] }, orchestrator: { assigneeFilter: [] } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const report = formatDoctorReport(runDoctor(options));
+      for (const line of report.split('\n')) {
+        assert.doesNotMatch(line, /…\s*$/, `値の欄が空のまま終わる行が無いこと: ${line}`);
+      }
+    },
+  );
+});
+
+test('formatDoctorReport: オブジェクトの設定値でも [object Object] を出さない（issue #261）', () => {
+  // 利用者の config.json のどこにも存在しない文字列なので、出すと設定ファイルの中に
+  // 無いものを探しに行かせることになる。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { owner: {}, repo: {} }, orchestrator: { assigneeFilter: {} } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      assert.doesNotMatch(formatDoctorReport(runDoctor(options)), /\[object Object\]/);
+    },
+  );
+});
+
+test('runDoctor: 化けて一致していた値は照合を通さない（["acme"] / 制御文字。issue #261）', () => {
+  // String(['acme']) は 'acme' に化けるため、従来は一覧に 'acme' があると充足していた。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: ['acme'] } }, allowedOwners: ['acme'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(byId(reqs, 'github.owner').ok, false);
+      assert.equal(byId(reqs, 'org.allowed_owners').ok, false);
+    },
+  );
+  // 一覧側に同じ制御文字が書かれていても通さない（生の値どうしでは一致してしまう経路）。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: BEL } }, allowedOwners: [BEL] },
+    (options) => {
+      assert.equal(byId(runDoctor(options), 'org.allowed_owners').ok, false);
+    },
+  );
+});
+
+test('runDoctor: 使えない owner は既定 vektor-inc に化けない（fail-open にしない。issue #261）', () => {
+  // 「値が入っているか」で既定値へ切り替える分岐をそのまま置き換えると、壊れた値が既定の
+  // vektor-inc に化けて許可オーナー一覧の照合を通る（今より緩む）。既定へ戻すのは
+  // **本当に未設定のときだけ**。
+  withDoctorEnv(
+    { queueBackend: 'github', config: { github: { owner: [] } }, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const owners = byId(runDoctor(options), 'org.allowed_owners');
+      assert.equal(owners.ok, false, '壊れた owner が既定値に化けて照合を通らないこと');
+    },
+  );
+  // 未設定のときは従来どおり既定値で照合する（この経路は 1 文字も変えない）。
+  withDoctorEnv(
+    { queueBackend: 'github', config: {}, allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(byId(reqs, 'org.allowed_owners').ok, true);
+      assert.equal(byId(reqs, 'github.owner').current, '（未設定・既定 vektor-inc）');
+      assert.equal(
+        byId(reqs, 'github.owner').hint,
+        'config.json の github.owner に自分のユーザー／組織名を設定してください（既定 vektor-inc のままだと他組織のキューを見に行きます）。',
+      );
+    },
+  );
+});
+
+test('runDoctor: 未設定の github.repo は従来どおり充足のまま（既定 task-queue が有効）', () => {
+  withDoctorEnv({ queueBackend: 'github', config: {}, allowedOwners: ['vektor-inc'] }, (options) => {
+    const repo = byId(runDoctor(options), 'github.repo');
+    assert.equal(repo.ok, true);
+    assert.equal(repo.current, 'task-queue（既定）');
+  });
+});
+
+test('runDoctor: 制御文字だけの値でも ⚠️ の注意書きは消えない（#252 の成果を残す）', () => {
+  // ownerAltered の第 1 項を「使えるか」にすると displaySanitized が落ち、改竄の痕跡を
+  // 伝える一文がレポートから消える。ここは「設定が存在するか」で見る。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { owner: BEL, repo: BEL }, orchestrator: { assigneeFilter: BEL } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      for (const id of ['github.owner', 'github.repo', 'orchestrator.assigneeFilter']) {
+        assert.equal(byId(reqs, id).ok, false, `${id} の ok`);
+        assert.equal(byId(reqs, id).displaySanitized, true, `${id} の displaySanitized`);
+      }
+      const report = formatDoctorReport(reqs);
+      assert.match(report, /画面には表示されない文字（制御文字）が含まれていた/);
+      assert.match(report, /設定ファイルの出所そのものを疑って/);
+    },
+  );
+});
+
+test('runDoctor: 文字列でない値では制御文字の注記も警告も出さない（判定順は 型 → 制御文字）', () => {
+  // `["a\nb"]` は String() の結果に制御文字が残るため、型を先に見ないと「文字列ではない」
+  // のに制御文字の警告が出る。あの文面は「画面に表示されない文字が含まれていた」と断言する
+  // ので、`[]` や `["a\nb"]` に対して出すと嘘になる（滅多に出ないことが警告の機能でもある）。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: { github: { owner: ['a\nb'], repo: ['a\nb'] }, orchestrator: { assigneeFilter: ['a\nb'] } },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      for (const id of ['github.owner', 'github.repo', 'orchestrator.assigneeFilter']) {
+        assert.equal(byId(reqs, id).displaySanitized, undefined, `${id} に注記フラグを立てない`);
+      }
+      assert.equal(formatDisplaySanitizedWarning(reqs), '');
+      assert.doesNotMatch(formatDoctorReport(reqs), /制御文字/);
+    },
+  );
+});
+
+test('runDoctor: 制御文字が混ざっているだけの値は従来どおり充足のまま（issue #261 の境界）', () => {
+  // 境界は「制御文字を取り除いた後に 1 文字も残らないか」だけ。取り除いても文字が残る値は
+  // ✅ のまま＝正しく設定している利用者の表示は 1 文字も変わらない。
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: {
+        github: { owner: 'vek\ntor-inc', repo: 'que\nue' },
+        orchestrator: { assigneeFilter: 'm\ne' },
+      },
+      allowedOwners: ['vektor-inc'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(byId(reqs, 'github.owner').ok, true);
+      assert.equal(byId(reqs, 'github.repo').ok, true);
+      assert.equal(byId(reqs, 'orchestrator.assigneeFilter').ok, true);
+      // 判定は生の値のままなので、許可オーナー一覧との照合は通さない（fail-close 維持）。
+      assert.equal(byId(reqs, 'org.allowed_owners').ok, false);
+      assert.equal(byId(reqs, 'github.owner').displaySanitized, true);
+    },
+  );
+});
+
+test('runDoctor: 正常な値では表示も判定も 1 文字も変わらない（issue #261）', () => {
+  withDoctorEnv(
+    {
+      queueBackend: 'github',
+      config: {
+        github: { owner: 'acme', repo: 'queue' },
+        orchestrator: { assigneeFilter: 'me' },
+      },
+      allowedOwners: ['acme'],
+    },
+    (options) => {
+      const reqs = runDoctor(options);
+      assert.equal(summarizeDoctor(reqs).allRequiredOk, true);
+      assert.equal(byId(reqs, 'github.owner').current, 'acme');
+      assert.equal(byId(reqs, 'github.repo').current, 'queue');
+      assert.equal(byId(reqs, 'orchestrator.assigneeFilter').current, 'me');
+      assert.equal(byId(reqs, 'org.allowed_owners').label, 'org.allowed_owners に "acme" を含む');
+      // 新しい受け皿の文言はどこにも現れない（正常時にノイズを足さない）。
+      assert.doesNotMatch(formatDoctorReport(reqs), /設定されていますが/);
+    },
+  );
 });
 
 test('summarizeDoctor: 全 required 充足で allRequiredOk=true（ローカルモード最小構成）', () => {

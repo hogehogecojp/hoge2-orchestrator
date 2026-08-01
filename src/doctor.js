@@ -72,6 +72,10 @@ import { formatAgentsVersionRequirement } from './engine/update-messages.js';
 
 const DEFAULT_OWNER = 'vektor-inc';
 const DEFAULT_REPO = 'task-queue';
+// github.owner 要件の表示名。org.allowed_owners の hint が「まず上の〈この行〉を直して」と
+// 名指しで参照するため、1 か所に持つ（別々に書くと、片方を直したときに案内が存在しない
+// 行を指し始める＝読み手がレポート上で探し物を見つけられなくなる）。
+const OWNER_REQUIREMENT_LABEL = 'GitHub オーナー（github.owner）';
 // ペイン起動に使う既定の Claude Code コマンド（config.js の resolveTmuxClaudeCommand の既定と同じ）。
 const DEFAULT_CLAUDE_COMMAND = 'claude';
 // Claude Code のインストール手順。要件の hint とレポート末尾の両方で使うため 1 か所に持つ
@@ -82,11 +86,91 @@ function getPath(obj, path) {
   return path.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj);
 }
 
-function hasNonEmpty(obj, path) {
+/**
+ * 設定値が「そのまま起動して進む見込みのある値か」を 4 状態に分類する（issue #261）。
+ *
+ * 従来は「空文字でなければ設定済み」（hasNonEmpty）だったため、制御文字だけの値や文字列で
+ * 書かれていない値まで充足と数えていた。これらは owner 名／リポジトリ名として使えず、
+ * ラベル用意時の形式検査で弾かれてその場で止まるため、**doctor が「すべて設定済み」と
+ * 言った直後にタスクが 1 件も流れない**。充足数が表しているのは「設定を書いた項目の数」
+ * ではなく「このまま起動して進む見込み」なので、進まない値は充足から外す。
+ *
+ * **判定順は「型 → 制御文字」で固定する。** 逆にすると `["a\nb"]` のような値で
+ * String() の結果に制御文字が残り、型が不正なのに「制御文字が含まれていた」という
+ * 事実と違う注記・警告へ進んでしまう。
+ *
+ * ここで加工（制御文字の除去）の結果を見るのは **充足を取り消す根拠としてだけ**で、
+ * 充足を与える根拠には使わない。追加している条件はすべて AND なので判定は単調に厳しく
+ * なり、`ok` が false → true へ動く経路は生まれない（許可オーナー一覧との照合は従来どおり
+ * **生の値の完全一致**のまま。加工後の値で比較すると "vek\ntor-inc" が "vektor-inc" に
+ * 化けて許可ゲートを通る＝ fail-open になる）。
+ * @param {object} obj
+ * @param {string} path
+ * @returns {'unset'|'invalid-type'|'undisplayable'|'ok'} unset=未設定・空白のみ /
+ *   invalid-type=文字列で書かれていない / undisplayable=制御文字を除くと 1 文字も残らない
+ */
+function classifyConfigValue(obj, path) {
   const value = getPath(obj, path);
-  if (value === undefined || value === null) return false;
-  if (typeof value === 'string') return value.trim() !== '';
-  return true;
+  if (value === undefined || value === null) return 'unset';
+  if (typeof value !== 'string') return 'invalid-type';
+  if (value.trim() === '') return 'unset';
+  if (sanitizeConfigDisplayValue(value) === '') return 'undisplayable';
+  return 'ok';
+}
+
+/**
+ * 値の「種類の名前」（配列・オブジェクト・数値・真偽値）。
+ *
+ * **書かれた値そのものは表示しない。** `{}` を String() に通すと `[object Object]` に
+ * 化けるが、これはプログラムの内部表現が漏れているだけで利用者の config.json のどこにも
+ * 存在しない文字列で、表示すると設定ファイルの中に無いものを探しに行かせることになる。
+ * 種類の名前は製品側が組み立てる決まった言葉なので、設定値の中身で表示を偽装される心配も
+ * ない（#248 で塞いだ「値からレポートの行を生やす」穴を開け直さない）。
+ * @param {*} value
+ * @returns {string} 必ず非空（表示の受け皿が空文字になると `…` の右が空で終わる）
+ */
+function describeValueType(value) {
+  if (Array.isArray(value)) return '配列';
+  if (typeof value === 'number') return '数値';
+  if (typeof value === 'boolean') return '真偽値';
+  if (typeof value === 'object') return 'オブジェクト';
+  // JSON からは上の 4 種類しか来ないが、**空文字だけは絶対に返さない**（この関数の戻り値が
+  // そのまま current の一部になるため）。想定外の型でも状態が読める言い方に倒す。
+  return `文字列以外（${typeof value}）`;
+}
+
+/**
+ * 使えない値（invalid-type / undisplayable）の表示値と対処の案内を組み立てる（issue #261）。
+ *
+ * **「未設定」とは別の受け皿にする。** ❌ に倒すだけだと `（未設定・既定 vektor-inc）` と
+ * 表示され、設定を書いた自覚がある人に「未設定」と言うことになる。設定ファイルに項目自体が
+ * 無いのだと思って探しに行き、#252 / #260 が潰してきた「真因に辿り着けない」形に戻る。
+ *
+ * 文言を 3 か所へ手書きすると語調が割れるので、**同じ形の文をここ 1 か所で生成し、
+ * 呼び出し側は自分のキー名と語だけを渡す**。
+ * @param {'invalid-type'|'undisplayable'} state
+ * @param {*} value 生の設定値（種類の名前を出すためだけに使う。値そのものは出さない）
+ * @param {{ key:string, noun:string, target:string, example:string }} labels
+ *   key=config.json のキー名 / noun=その値の呼び名 / target=あるべき値の説明 /
+ *   example=引用符付きの書き方の例（固定値。設定値の表示ではない）
+ * @returns {{ current:string, hint:string }} current は必ず非空
+ */
+function describeUnusableConfigValue(state, value, { key, noun, target, example }) {
+  if (state === 'undisplayable') {
+    return {
+      current: `（設定されていますが、値が制御文字のみで${noun}として使えません）`,
+      hint: `config.json の ${key} が制御文字（画面に表示できない文字）だけの値になっています。`
+        + `この値では${noun}として使えないため、まず ${key} を正しい${target}へ直してください。`,
+    };
+  }
+  const typeName = describeValueType(value);
+  return {
+    current: `（設定されていますが、文字列ではありません: ${typeName}）`,
+    // 「可能性があります」と引かない。typeof で文字列でないことを**確定して知っている**ので、
+    // 断定できる場面で引くと余計な探索を始めさせる。実態はほぼ引用符の付け忘れ。
+    hint: `config.json の ${key} が、文字列の${noun}になっていません（現在は${typeName}）。`
+      + `まず ${key} を ${example} のように引用符で囲んだ${target}へ直してください。`,
+  };
 }
 
 /**
@@ -810,31 +894,62 @@ export function runDoctor(options = {}) {
   // owner は「表示」と「org.allowed_owners との一致判定」の両方に使う。判定には**生の値**を
   // 使い続け、表示にだけ ownerView を使う。制御文字を除去した値で比較すると
   // "vek\ntor-inc" が "vektor-inc" に化けて許可ゲートを通ってしまう（fail-open）ため。
-  const ownerSet = hasNonEmpty(cfg, 'github.owner');
-  const owner = ownerSet ? String(getPath(cfg, 'github.owner')).trim() : DEFAULT_OWNER;
+  const ownerState = classifyConfigValue(cfg, 'github.owner');
+  // **既定値へ戻すのは `unset` のときだけ。** 「値が入っているか」で切り替えていた従来の
+  // 分岐をそのまま「使える値か」へ置き換えると、壊れた owner が既定 vektor-inc に化けて
+  // 許可オーナー一覧の照合を通ってしまう（今より緩む＝ fail-open）。
+  const owner = ownerState === 'unset' ? DEFAULT_OWNER : String(getPath(cfg, 'github.owner')).trim();
   const ownerView = toDisplayValue(owner);
   // 設定値が文字列として書かれているか。オブジェクト・配列・数値・真偽値は String() を通すと
   // "[object Object]" のような**値の形をした文字列**に化けるだけで、オーナー名としては使えない。
   // 未設定のときは既定値（文字列）を見るので、文字列として扱う。
-  const ownerIsString = !ownerSet || typeof getPath(cfg, 'github.owner') === 'string';
-  // 未設定なら表示するのは既定値の案内文なので、加工の有無は問わない。
-  const ownerAltered = ownerSet && ownerView.altered;
+  const ownerIsString = ownerState !== 'invalid-type';
+  // 制御文字の注記・フラグを立てるのは **値が文字列のときだけ**（`ok` か `undisplayable`）。
+  // 判定順は「型 → 制御文字」で、型が不正ならここへは進まない（`["a\nb"]` は String() の
+  // 結果に制御文字が残るが、それは「文字列ではない」話であって制御文字の話ではない）。
+  // 第 1 項は「使えるか」ではなく **「設定が存在するか」** で見る。使えるかで見ると
+  // 制御文字だけの値で displaySanitized が落ち、改竄の痕跡を伝える #252 の警告が消える。
+  const ownerAltered = (ownerState === 'ok' || ownerState === 'undisplayable') && ownerView.altered;
+  const ownerUnusable = ownerState === 'invalid-type' || ownerState === 'undisplayable';
+  const ownerUnusableView = ownerUnusable
+    ? describeUnusableConfigValue(ownerState, getPath(cfg, 'github.owner'), {
+      key: 'github.owner',
+      noun: 'オーナー名',
+      target: 'ユーザー／組織名',
+      example: `"${DEFAULT_OWNER}"`,
+    })
+    : null;
   requirements.push({
     id: 'github.owner',
     group: 'GitHub',
-    label: 'GitHub オーナー（github.owner）',
+    label: OWNER_REQUIREMENT_LABEL,
     required: githubMode,
     target: 'A',
-    ok: ownerSet,
-    current: ownerSet ? ownerView.display : `（未設定・既定 ${DEFAULT_OWNER}）`,
-    hint: 'config.json の github.owner に自分のユーザー／組織名を設定してください（既定 vektor-inc のままだと他組織のキューを見に行きます）。',
+    // 使えない値は未充足（issue #261）。ここが ✅ のままだと、直すための導線
+    //（doctor の案内・起動時の警告・対話セットアップの質問）が全部閉じたままになる。
+    ok: ownerState === 'ok',
+    current: ownerUnusableView?.current
+      ?? (ownerState === 'unset' ? `（未設定・既定 ${DEFAULT_OWNER}）` : ownerView.display),
+    // 既定の hint は「未設定の人」向けの文言。設定を書いた自覚がある人には噛み合わない
+    //（後半の「既定のままだと」に至っては無関係）ので、使えない値のときは差し替える。
+    hint: ownerUnusableView?.hint
+      ?? 'config.json の github.owner に自分のユーザー／組織名を設定してください（既定 vektor-inc のままだと他組織のキューを見に行きます）。',
     ...displaySanitizedFlag(ownerAltered),
   });
 
   // 2-2 github.repo（GitHub モードのみ。既定 task-queue で可）
-  const repoSet = hasNonEmpty(cfg, 'github.repo');
-  const repo = repoSet ? String(getPath(cfg, 'github.repo')).trim() : DEFAULT_REPO;
+  const repoState = classifyConfigValue(cfg, 'github.repo');
+  const repo = repoState === 'unset' ? DEFAULT_REPO : String(getPath(cfg, 'github.repo')).trim();
   const repoView = toDisplayValue(repo);
+  const repoUnusable = repoState === 'invalid-type' || repoState === 'undisplayable';
+  const repoUnusableView = repoUnusable
+    ? describeUnusableConfigValue(repoState, getPath(cfg, 'github.repo'), {
+      key: 'github.repo',
+      noun: 'リポジトリ名',
+      target: 'リポジトリ名',
+      example: `"${DEFAULT_REPO}"`,
+    })
+    : null;
   requirements.push({
     id: 'github.repo',
     group: 'GitHub',
@@ -842,26 +957,46 @@ export function runDoctor(options = {}) {
     required: githubMode,
     target: 'A',
     // 既定 task-queue も有効な値なので、名前が解決できていれば ok（実在確認はネットワーク検知のため行わない）。
-    ok: true,
-    current: repoSet ? repoView.display : `${DEFAULT_REPO}（既定）`,
-    hint: 'config.json の github.repo に task-queue の Issue を登録するリポジトリ名を設定してください（既定 task-queue で可）。',
-    ...displaySanitizedFlag(repoSet && repoView.altered),
+    // **未設定は従来どおり ✅**（既定が効く）。書いてあるのに使えない値のときだけ ❌ にする。
+    ok: !repoUnusable,
+    current: repoUnusableView?.current
+      ?? (repoState === 'unset' ? `${DEFAULT_REPO}（既定）` : repoView.display),
+    hint: repoUnusableView?.hint
+      ?? 'config.json の github.repo に task-queue の Issue を登録するリポジトリ名を設定してください（既定 task-queue で可）。',
+    ...displaySanitizedFlag((repoState === 'ok' || repoState === 'undisplayable') && repoView.altered),
   });
 
   // 2-5 orchestrator.assigneeFilter（GitHub モードで必須。空＝一切取り込まない）
-  const assigneeSet = hasNonEmpty(cfg, 'orchestrator.assigneeFilter');
+  const assigneeState = classifyConfigValue(cfg, 'orchestrator.assigneeFilter');
   const assigneeView = toDisplayValue(getPath(cfg, 'orchestrator.assigneeFilter'));
+  const assigneeUnusable = assigneeState === 'invalid-type' || assigneeState === 'undisplayable';
+  const assigneeUnusableView = assigneeUnusable
+    ? describeUnusableConfigValue(assigneeState, getPath(cfg, 'orchestrator.assigneeFilter'), {
+      key: 'orchestrator.assigneeFilter',
+      noun: '担当者フィルタ',
+      // target は前後を日本語で終える語にする（`GitHub ログイン名` のように英字で始めると
+      // 「囲んだGitHub」と詰まって読みにくい）。文の形はヘルパー側に閉じているので、
+      // 呼び出し側で調整できるのはこの語だけ。
+      target: 'ログイン名か all（自分だけなら自分の login）',
+      example: '"all"',
+    })
+    : null;
   requirements.push({
     id: 'orchestrator.assigneeFilter',
     group: 'GitHub',
     label: '担当者フィルタ（orchestrator.assigneeFilter）',
     required: githubMode,
     target: 'A',
-    ok: assigneeSet,
-    // ok は hasNonEmpty（生の値）で判定済み。ここは表示だけを整える。
-    current: assigneeSet ? assigneeView.display : '（未設定・一切取り込まない）',
-    hint: 'config.json の orchestrator.assigneeFilter に GitHub ログイン名（自分だけなら自分の login）か all を設定してください（空＝一切取り込まない安全側既定）。',
-    ...displaySanitizedFlag(assigneeSet && assigneeView.altered),
+    // 壊れた値だと**どの issue にも一致せず 1 件も取り込まれない**ので、owner と同じ扱いに揃える。
+    ok: assigneeState === 'ok',
+    // ok は生の値の型と状態で判定済み。ここは表示だけを整える。
+    current: assigneeUnusableView?.current
+      ?? (assigneeState === 'unset' ? '（未設定・一切取り込まない）' : assigneeView.display),
+    hint: assigneeUnusableView?.hint
+      ?? 'config.json の orchestrator.assigneeFilter に GitHub ログイン名（自分だけなら自分の login）か all を設定してください（空＝一切取り込まない安全側既定）。',
+    ...displaySanitizedFlag(
+      (assigneeState === 'ok' || assigneeState === 'undisplayable') && assigneeView.altered,
+    ),
   });
 
   // 3-1 org.allowed_owners に owner を含める（両モードで必須。硬ゲート通過用）
@@ -871,7 +1006,13 @@ export function runDoctor(options = {}) {
   // label / hint にも owner を埋め込んでおり、未充足時は `- ${label}: ${hint}` の形で
   // レポートに出るため、current と同じく表示は必ずサニタイズ済みの値を使う。
   const allowedOwners = readAllowedOwners(canonicalConfigPath);
-  const allowedOwnersOk = allowedOwners.includes(owner);
+  // **owner が使える値のときだけ照合する（issue #261）。** String(["vektor-inc"]) は
+  // "vektor-inc" に化けるため、従来はこの経路で許可ゲートを通れた。制御文字だけの owner も
+  // 一覧に同じ値が書かれていれば通ってしまう。どちらも安全側（fail-close）へ倒す。
+  // 未設定（unset）は owner が既定値へ解決されている＝使える値なので従来どおり照合する
+  // （ここを弾くと、ローカルモードで config.json を書いていない利用者が一斉に ❌ になる）。
+  // 照合そのものは従来どおり **生の値の完全一致**（加工後の値では比較しない）。
+  const allowedOwnersOk = !ownerUnusable && allowedOwners.includes(owner);
   // 表示は要素ごとに引用符で括る（要素の中の `, ` を区切りと見分けるため。issue #260）。
   // 一覧そのものの並び・件数は加工しない（判定は下の allowedOwnersOk が生の値で済ませている）。
   const allowedOwnersView = formatAllowedOwnersDisplay(allowedOwners);
@@ -927,32 +1068,30 @@ export function runDoctor(options = {}) {
     // 読み手にもコードにも明示しておく（判定へ流用されないための歯止めを兼ねる）。
     && allowedOwners.some((item) => item !== owner && item.split(OWNER_LIST_SEPARATORS).includes(owner));
   //
-  // 分岐の起点は「加工されたか」ではなく **「オーナー名として見せられる値か」**。
+  // 分岐の起点は「加工されたか」ではなく **「オーナー名として使える値か」**。
   // 加工の有無で分岐すると、文字列以外の値が素通りして `"" を追加してください` が復活する。
   // 拾うべき経路は 2 つあり、どちらも String() の結果を引用符に入れると壊れた案内になる:
   //   - 表示できる文字が残らない値（制御文字だけの値、`"github.owner": []` など）
   //   - 文字列として書かれていない値（`{}` なら "[object Object]" に化けるだけで空にならない）
   // 設定ファイルは手編集でも改竄でも書けるので、どちらも現実の入力として扱う。
-  if (ownerView.text === '' || !ownerIsString) {
+  // 条件は github.owner 行の判定（ownerUnusable）と**同じ述語を使う**。ここで別の式を
+  // 書くと、❌ の付き方と案内文の出し分けが将来ずれる（片方だけ直す事故を作らない）。
+  if (ownerUnusable) {
     // オーナー名として見せられる値が無いので、**引用符で見せない**。`"" を含む` /
     // `"[object Object]" を追加してください` と出すと、そのとおり操作した人が許可オーナー
     // 一覧へ無意味な項目を足すことになる（セキュリティ境界を無駄に広げる指示）。追加の案内
     // 自体を出さず、「まず owner を直す」だけに絞る。直せば次の doctor で通常の案内に戻る。
     allowedOwnersLabel = 'org.allowed_owners に github.owner の値を含む';
-    // 原因が「制御文字だけ」かどうかで、利用者が config.json で探すものが変わるので言い分ける。
-    // 文字列以外の値は `{}` / `[]` / 数値 / 真偽値をまとめて 1 文で扱う（利用者がやることは
-    // どれも同じ「github.owner を正しいユーザー／組織名へ直す」なので、分けても選択肢が増えるだけ）。
-    // 制御文字側で「出所を疑ってください」を繰り返さないのは、加工が起きた＝ ⚠️ ブロックが
-    // 必ず出る側で、同じ一文が数行上に既にあるため。
+    // **対処は二重に書かない（issue #261）。** owner が使えない値のとき、この行の未充足は
+    // そこから派生した失敗にすぎない。原因の説明と直し方は github.owner 行の hint が
+    // 持っているので（制御文字だけなのか・文字列でないのかもそちらで言い分ける）、ここは
+    // 依存関係だけを伝えて、読み手を 1 か所へ集める。同じ対処を 2 行に書くと、どちらを
+    // やればよいのか・両方やるのかが読めなくなる。
     //
-    // 文字列以外の側は「可能性があります」と引かない。typeof で文字列でないことを**確定して
-    // 知っている**ので、断定できる場面で引くと「では他に何が考えられるのか」と余計な探索を
-    // 始めさせる。実態はほぼ引用符の付け忘れなので、直し方は語で説明するより形を 1 つ見せる。
-    // ここに出る `"vektor-inc"` は書き方の例示（固定値）であって設定値の表示ではないので、
-    // 「設定値を引用符で見せない」という上の判断とは衝突しない。
-    allowedOwnersHint = ownerAltered
-      ? 'config.json の github.owner が制御文字（画面に表示できない文字）だけの値になっています。この値では許可オーナーの判定ができないため、まず github.owner を正しいユーザー／組織名へ直してください。'
-      : `config.json の github.owner が、文字列のオーナー名になっていません。この値では許可オーナーの判定ができないため、まず github.owner を \`"${DEFAULT_OWNER}"\` のように引用符で囲んだユーザー／組織名へ直してください。`;
+    // **「一覧そのものは変更不要です」は必須。** これが無いと、読んだ人が反射的に
+    // 許可オーナー一覧（＝作業してよい相手を限定している安全用の一覧）へ項目を足してしまう。
+    allowedOwnersHint = `まず上の「${OWNER_REQUIREMENT_LABEL}」を直してください。`
+      + 'github.owner が使える値になるまで、org.allowed_owners との照合ができません（一覧そのものは変更不要です）。';
   } else if (ownerAltered) {
     // 注記は current ではなく **label の末尾** へ出す。この行で加工されているのは current
     // （許可オーナー一覧）ではなく label に埋めた owner なので、current に付けると
