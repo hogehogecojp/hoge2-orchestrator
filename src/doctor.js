@@ -119,6 +119,28 @@ function classifyConfigValue(obj, path) {
 }
 
 /**
+ * 文字列と**確定している**状態（`ok` / `undisplayable`）のときだけ生の値を返し、
+ * それ以外は空文字を返す（issue #261）。
+ *
+ * 目的は `String(設定値)` を設定由来の経路から消すこと。`{"toString": "x"}` のように
+ * `Object.prototype.toString` を文字列で上書きした値は JSON としては正しいのに、文字列化
+ * しようとした時点で TypeError（Cannot convert object to primitive value）になる。従来は
+ * それが runDoctor 全体を落とし、bin 側の「config.json が正しい JSON か確認してください」
+ * という**真因を指していない**案内だけが出ていた（設定を書き間違えた人が原因へ辿り着けない
+ * という、この issue が扱っている問題そのもの）。型は classifyConfigValue が手前で確定
+ * させているので、使えないと分かっている値をわざわざ文字列化する理由がない。
+ *
+ * **`undisplayable` を空文字に丸めない**のがこの関数の要点。丸めると制御文字だけの値で
+ * 「表示のために加工した」注記（#252）が立たなくなり、改竄の痕跡を伝える ⚠️ が消える。
+ * @param {'unset'|'invalid-type'|'undisplayable'|'ok'} state
+ * @param {*} value 生の設定値
+ * @returns {string}
+ */
+function stringValueOrEmpty(state, value) {
+  return state === 'ok' || state === 'undisplayable' ? value : '';
+}
+
+/**
  * 値の「種類の名前」（配列・オブジェクト・数値・真偽値）。
  *
  * **書かれた値そのものは表示しない。** `{}` を String() に通すと `[object Object]` に
@@ -898,7 +920,11 @@ export function runDoctor(options = {}) {
   // **既定値へ戻すのは `unset` のときだけ。** 「値が入っているか」で切り替えていた従来の
   // 分岐をそのまま「使える値か」へ置き換えると、壊れた owner が既定 vektor-inc に化けて
   // 許可オーナー一覧の照合を通ってしまう（今より緩む＝ fail-open）。
-  const owner = ownerState === 'unset' ? DEFAULT_OWNER : String(getPath(cfg, 'github.owner')).trim();
+  // 文字列化（String()）は通さない。使えないと分かっている値は空文字へ倒す
+  // （`{"toString": "x"}` は文字列化した時点で例外になり、診断そのものが出せなくなる）。
+  const owner = ownerState === 'unset'
+    ? DEFAULT_OWNER
+    : stringValueOrEmpty(ownerState, getPath(cfg, 'github.owner')).trim();
   const ownerView = toDisplayValue(owner);
   // 設定値が文字列として書かれているか。オブジェクト・配列・数値・真偽値は String() を通すと
   // "[object Object]" のような**値の形をした文字列**に化けるだけで、オーナー名としては使えない。
@@ -939,7 +965,9 @@ export function runDoctor(options = {}) {
 
   // 2-2 github.repo（GitHub モードのみ。既定 task-queue で可）
   const repoState = classifyConfigValue(cfg, 'github.repo');
-  const repo = repoState === 'unset' ? DEFAULT_REPO : String(getPath(cfg, 'github.repo')).trim();
+  const repo = repoState === 'unset'
+    ? DEFAULT_REPO
+    : stringValueOrEmpty(repoState, getPath(cfg, 'github.repo')).trim();
   const repoView = toDisplayValue(repo);
   const repoUnusable = repoState === 'invalid-type' || repoState === 'undisplayable';
   const repoUnusableView = repoUnusable
@@ -968,7 +996,10 @@ export function runDoctor(options = {}) {
 
   // 2-5 orchestrator.assigneeFilter（GitHub モードで必須。空＝一切取り込まない）
   const assigneeState = classifyConfigValue(cfg, 'orchestrator.assigneeFilter');
-  const assigneeView = toDisplayValue(getPath(cfg, 'orchestrator.assigneeFilter'));
+  // toDisplayValue も内部で String() を通すため、文字列と確定した状態のときだけ生の値を渡す。
+  const assigneeView = toDisplayValue(
+    stringValueOrEmpty(assigneeState, getPath(cfg, 'orchestrator.assigneeFilter')),
+  );
   const assigneeUnusable = assigneeState === 'invalid-type' || assigneeState === 'undisplayable';
   const assigneeUnusableView = assigneeUnusable
     ? describeUnusableConfigValue(assigneeState, getPath(cfg, 'orchestrator.assigneeFilter'), {

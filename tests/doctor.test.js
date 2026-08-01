@@ -1859,6 +1859,45 @@ for (const { name, value, typeName, currentNote } of UNUSABLE_CONFIG_VALUES) {
   });
 }
 
+// 文字列化そのものが失敗する値でも、診断が丸ごと出なくなってはいけない（issue #261）。
+// `{"toString": "x"}` は JSON としては正しいが、Object.prototype.toString を文字列で
+// 上書きするため String() が "Cannot convert object to primitive value" を投げる。
+// 従来は runDoctor が例外で終わり、bin 側が「config.json が正しい JSON か確認してください」
+// という**真因を指していない**案内だけを出していた。設定を書き間違えた人が原因へ辿り着け
+// ないという、この issue が扱っている問題そのものが、いちばん強い形で出る場面になる。
+// 型は classifyConfigValue が手前で確定させているので、そもそも文字列化する必要が無い。
+for (const { id, buildConfig } of [
+  { id: 'github.owner', buildConfig: (value) => ({ github: { owner: value } }) },
+  { id: 'github.repo', buildConfig: (value) => ({ github: { repo: value } }) },
+  {
+    id: 'orchestrator.assigneeFilter',
+    buildConfig: (value) => ({ orchestrator: { assigneeFilter: value } }),
+  },
+]) {
+  test(`runDoctor: ${id} が文字列化できない値でも診断が止まらない（issue #261）`, () => {
+    withDoctorEnv(
+      {
+        queueBackend: 'github',
+        config: buildConfig({ toString: 'x' }),
+        allowedOwners: ['vektor-inc'],
+      },
+      (options) => {
+        // 修正前はここで throw（＝レポートも --json も一切出せない）。
+        const reqs = runDoctor(options);
+        const requirement = byId(reqs, id);
+        // 受け皿は他の invalid-type と同じ（この値だけ特別扱いしない）。
+        assert.equal(requirement.ok, false);
+        assert.equal(requirement.current, '（設定されていますが、文字列ではありません: オブジェクト）');
+        assert.match(requirement.hint, /文字列の.*になっていません（現在はオブジェクト）/);
+        // レポートの組み立ても通ること（表示経路にも文字列化が残っていないこと）。
+        const report = formatDoctorReport(reqs);
+        assert.match(report, /文字列ではありません: オブジェクト/);
+        assert.doesNotMatch(report, /\[object Object\]/);
+      },
+    );
+  });
+}
+
 test('runDoctor: 使えない値の hint は「設定してください」ではなく状態ごとの対処を出す（issue #261）', () => {
   // 既存の汎用 hint（「〜に自分のユーザー／組織名を設定してください（既定 vektor-inc の
   // ままだと…）」）は、設定を書いた自覚がある人には噛み合わない（後半は無関係）。
