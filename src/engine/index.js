@@ -50,7 +50,7 @@ import { cleanupForIssue, formatCleanupSummary, inspectWorktreeByPort } from './
 import { canTransitionToDone as canTransitionToDoneImpl } from './done-gate.js';
 import { closeSourceIssueBeforeGate as closeSourceIssueBeforeGateImpl } from './source-close.js';
 import { handlePaneMissing, handleUndeliveredBody, normalizeResumeMax } from './pane-resume.js';
-import { decideInProgressAction, needsReviewGate } from './in-progress-decision.js';
+import { decideInProgressAction, needsPaneActivity, needsReviewGate } from './in-progress-decision.js';
 import {
   DEFAULT_CONFLICT_HANDBACK_MAX,
   DEFAULT_CONFLICT_HANDBACK_SEND_FAILURE_MAX,
@@ -73,6 +73,8 @@ import { createNotifyPaneMerged } from './notify-pane-merged.js';
 import { attachPrUrlToPane, openInitializedTaskPane } from './task-pane-init.js';
 // state の termId が今もこのタスクのペインを指しているかの照合（#263）。
 import { PANE_OWNERSHIP, findPaneByTermId, resolvePaneOwnership } from './pane-identity.js';
+// 作業ペインが現に動いているか（#272）。waiting-input へ倒すのを保留してよいかの判定に使う。
+import { isPaneWorking } from './pane-activity.js';
 import { createWaitingMarkerScanner } from './waiting-marker-scanner.js';
 import {
   DEFAULT_REPLY_FORWARD_RETRY_MAX,
@@ -1061,6 +1063,28 @@ async function scanInProgressIssues() {
   }
   if (issues.length === 0) return;
 
+  // 作業ペインの稼働状況（#272）。未応答の確認が残っていても、そのタスクのペインが現に
+  // 動いているあいだは waiting-input へ倒すのを保留するために使う。
+  //
+  // このスキャンは loop() の checkHealth ゲートより前に居る＝ VK Terminals を上げない構成でも
+  // 走るため、states は「保留の判定が実際に効く issue が現れてから」1 度だけ取りに行く
+  // （needsPaneActivity のガード）。無条件に取ると、未応答の確認が 0 件でも毎ループ HTTP を
+  // 投げて warn を積み上げ、checkHealth 側の案内と二重になる。
+  // 取得失敗時は null のままで、以後の issue でも再試行しない（1 ループ内で結果は変わらない）。
+  // null ＝材料無し＝「保留しない＝従来どおり倒す」（fail-open）。
+  let paneStates = null;
+  let paneStatesResolved = false;
+  async function resolvePaneStates() {
+    if (paneStatesResolved) return paneStates;
+    paneStatesResolved = true;
+    try {
+      paneStates = await getStates(VK_PORT);
+    } catch (err) {
+      console.warn(`[scan-in-progress] VK Terminals states 取得失敗（作業ペインの稼働判定なしで続行）: ${err.message}`);
+    }
+    return paneStates;
+  }
+
   for (const issue of issues) {
     // dispatch 直後で status 反映直後のレース中（起動処理中）の issue は次ループに回す。
     if (inFlightIssues.has(issue.number)) continue;
@@ -1090,6 +1114,43 @@ async function scanInProgressIssues() {
       await ensurePRRecorded(issue, target, pr);
     }
 
+    // このタスクの作業ペインが現に動いているか（#272）。termId が引けない・ペインが
+    // 一覧に無い・states を取れなかった、のいずれも false（＝保留しない）になる。
+    // 調べるのは判定に効く場面（未応答の確認が残っている issue）だけ。
+    let paneTermId = null;
+    let paneWorking = false;
+    if (needsPaneActivity({ comments })) {
+      let saved = null;
+      try {
+        saved = await getTask(issue.number);
+      } catch (err) {
+        // 材料無し＝保留しない側へ倒すが、無音にはしない（保留が効かない理由を残す）。
+        console.warn(`  [scan-in-progress] issue #${issue.number}: state 取得失敗（作業ペインの稼働判定なしで続行）: ${err.message}`);
+      }
+      paneTermId = saved?.termId ?? null;
+      const pane = findPaneByTermId((await resolvePaneStates())?.terminals, paneTermId);
+      // 掴み違い（閉じたペインの番号が別タスクへ再採番される #263）を照合してから使う。
+      // 別タスクのペインの稼働状況で保留すると、保留が終わる条件が「別タスクのペインが
+      // 静止すること」になり、そちらの Claude が動き続けるあいだ本物の質問が出なくなる。
+      // 照合材料が無い（UNVERIFIABLE）ときは pane-identity.js の方針どおり state を信頼し、
+      // 塞ぐのは「明確な不一致」だけにする。
+      const paneOwnership = resolvePaneOwnership({
+        pane,
+        // 期待値はヘッダーリンクだけ。PR URL は同じループ内の ensurePRRecorded が
+        // これから書き込みうる値で、自分で書いた値を読み返して一致と自己確認してしまう
+        // （reply-forward.js と同じ理由）。
+        expectedTitleUrl: saved?.paneTitleUrl ?? null,
+      });
+      if (paneOwnership.ownership === PANE_OWNERSHIP.OTHER_TASK) {
+        // ペイン由来の値は外部入力（VK Terminals の POST /api/set-title で外から書ける）。
+        // ログは issue へ貼られる運用があるため、制御文字・ANSI を落としてから出す
+        // （既存の共通実装を再利用。#253）。期待値は state.json 由来の自前の値なので触らない。
+        console.warn(`  [scan-in-progress] issue #${issue.number}: pane(termId:${paneTermId}) は別タスクのペインのため稼働判定に使わない（${paneOwnership.mismatch}: pane=${stripAnsiAndControlChars(paneOwnership.paneValue)} / 期待=${paneOwnership.expectedValue}）`);
+      } else {
+        paneWorking = isPaneWorking({ pane });
+      }
+    }
+
     const action = decideInProgressAction({
       comments,
       // draft も渡す: 修正対応中の Draft PR を「マージ待ち」にしないため（#213）。
@@ -1102,7 +1163,17 @@ async function scanInProgressIssues() {
       reviewGateReady,
       // コンフリクト差し戻し直後に waiting-merge へ戻して作業依頼を打ち消さない。
       prConflicted,
+      // 作業ペインが動いているあいだは waiting-input へ倒すのを保留する（#272）。
+      paneWorking,
     });
+
+    // 保留したことは必ずログに出す（無音にしない）。表示上は「作業中」のままなので、
+    // ここを黙らせると「本当に作業中」なのか「未応答の確認を保留し続けている」のかを
+    // 人が区別できなくなる。ペインが静止すれば次の巡回で waiting-input に倒れる。
+    if (action.type === 'none' && action.deferred === 'pane-busy') {
+      console.log(`  [scan-in-progress] issue #${issue.number}: 未応答の指示待ちを検知したが作業ペイン(termId:${paneTermId})が稼働中のため waiting-input を保留`);
+      continue;
+    }
 
     if (action.type === 'none') {
       // 完了条件は満たしたのに waiting-merge へ進めなかったケースは、保留理由を毎ループ出す。

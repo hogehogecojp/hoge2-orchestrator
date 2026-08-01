@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { decideInProgressAction, needsReviewGate } from '../src/engine/in-progress-decision.js';
+import { decideInProgressAction, needsPaneActivity, needsReviewGate } from '../src/engine/in-progress-decision.js';
 
 const agentWaitingInput = ['Comment by vk-agents', 'Status: waiting-input', '', '確認お願いします'].join('\n');
 const agentAnswered = ['Comment by vk-agents', 'Status: answered', '', 'ペイン経由で解決済みです'].join('\n');
@@ -84,6 +84,110 @@ describe('decideInProgressAction', () => {
 
   it('引数なしでも安全に none', () => {
     assert.equal(decideInProgressAction().type, 'none');
+  });
+
+  describe('作業ペイン稼働中の waiting-input 保留（#272）', () => {
+    // 再現元: vektor-inc/bill-vektor#326。
+    //   07:09 テスト担当が e2e FAIL 報告を `Status: waiting-input` で投稿
+    //   07:26〜07:27 司が `Status: no-action` を 3 件投稿（チーム内で修正対応を継続）
+    //   → no-action は pending を解除しない（意図的な安全側設計）ため hasPendingWaitingInput は
+    //     true のまま。作業ペインは動き続けているのにタスクカードが「入力待ち」に張り付いた。
+    const agentNoAction = ['Status: no-action', '', '修正対応を継続します'].join('\n');
+    const billVektorComments = [
+      { body: agentWaitingInput },
+      { body: agentNoAction },
+      { body: agentNoAction },
+      { body: agentNoAction },
+    ];
+
+    it('ペインが稼働中なら waiting-input に倒さず none（pane-busy として保留）', () => {
+      const r = decideInProgressAction({
+        comments: billVektorComments,
+        pr: { state: 'open', merged: false },
+        prCompletionReady: false,
+        paneWorking: true,
+      });
+      assert.equal(r.type, 'none');
+      assert.equal(r.deferred, 'pane-busy');
+    });
+
+    it('ペインが静止したら従来どおり waiting-input に倒す（遅延であって欠落ではない）', () => {
+      const r = decideInProgressAction({
+        comments: billVektorComments,
+        pr: { state: 'open', merged: false },
+        prCompletionReady: false,
+        paneWorking: false,
+      });
+      assert.equal(r.type, 'waiting-input');
+    });
+
+    it('paneWorking 未指定（材料が取れないとき）は従来どおり waiting-input に倒す（fail-open）', () => {
+      const r = decideInProgressAction({
+        comments: billVektorComments,
+        pr: { state: 'open', merged: false },
+      });
+      assert.equal(r.type, 'waiting-input');
+    });
+
+    it('automerge でもレビュー完了マーカーが無ければ（＝本物の判断待ち）稼働中は保留', () => {
+      // automerge の override は「マージ可能な PR」に限定されるため、ここでは効かない。
+      // その状態で稼働中なら waiting-input ではなく保留になる。
+      const r = decideInProgressAction({
+        comments: billVektorComments,
+        pr: { state: 'open', merged: false },
+        prCompletionReady: true,
+        automerge: true,
+        reviewGateReady: false,
+        paneWorking: true,
+      });
+      assert.equal(r.type, 'none');
+      assert.equal(r.deferred, 'pane-busy');
+    });
+
+    it('needsPaneActivity は未応答の確認が残っているときだけ true（取得ガード）', () => {
+      assert.equal(needsPaneActivity({ comments: billVektorComments }), true);
+      // 返信済み・answered 済み・そもそも確認が無い場合は paneWorking が結果を変えない。
+      assert.equal(needsPaneActivity({ comments: [{ body: agentWaitingInput }, { body: userReply }] }), false);
+      assert.equal(needsPaneActivity({ comments: [{ body: agentWaitingInput }, { body: agentAnswered }] }), false);
+      assert.equal(needsPaneActivity({ comments: [] }), false);
+      assert.equal(needsPaneActivity(), false);
+    });
+
+    it('needsPaneActivity が false の状態では paneWorking の値が判定を変えない', () => {
+      // 述語の意味（＝ペイン状態を取りに行かなくても結果が同じ）を実証する。
+      const cases = [
+        { comments: [], pr: { state: 'open', merged: false }, prCompletionReady: true },
+        { comments: [{ body: agentWaitingInput }, { body: userReply }], pr: null },
+        { comments: [{ body: agentWaitingInput }, { body: agentAnswered }], pr: { state: 'closed', merged: true } },
+      ];
+      for (const base of cases) {
+        assert.equal(needsPaneActivity({ comments: base.comments }), false);
+        assert.equal(
+          decideInProgressAction({ ...base, paneWorking: true }).type,
+          decideInProgressAction({ ...base, paneWorking: false }).type
+        );
+      }
+    });
+
+    it('pending が無ければ paneWorking でも保留せず PR 遷移へ進む（保留は waiting-input 判定だけに効く）', () => {
+      const r = decideInProgressAction({
+        comments: [{ body: agentWaitingInput }, { body: userReply }],
+        pr: { state: 'open', merged: false },
+        prCompletionReady: true,
+        paneWorking: true,
+      });
+      assert.equal(r.type, 'waiting-merge');
+    });
+
+    it('automerge override が効く場面では paneWorking に関係なく PR 遷移へ進む', () => {
+      const r = decideInProgressAction({
+        comments: billVektorComments,
+        pr: { state: 'closed', merged: true },
+        automerge: true,
+        paneWorking: true,
+      });
+      assert.equal(r.type, 'merged');
+    });
   });
 
   describe('automerge ラベルとの相互作用', () => {
