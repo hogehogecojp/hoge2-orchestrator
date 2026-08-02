@@ -1153,10 +1153,29 @@ async function main() {
       if (process.platform === 'win32') {
         console.warn(
           '⚠ Windows では、node-pty / electron のネイティブビルドに Visual Studio Build Tools の\n' +
-          '  「C++ によるデスクトップ開発」ワークロードが必要です（未導入だとビルドが失敗します）。\n' +
+          '  「C++ によるデスクトップ開発」ワークロードに加えて、\n' +
+          '  「MSVC v143 - VS 2022 C++ x64/x86 Spectre 軽減ライブラリ (最新)」が必要です。\n' +
+          '  （Spectre 軽減ライブラリは「推奨コンポーネントを含める」でも入らないため、\n' +
+          '    未導入だと node-pty のビルドが MSB8040 で失敗します）\n' +
           '  また VSCode の統合ターミナルから実行する場合は、環境変数 ELECTRON_RUN_AS_NODE を\n' +
           '  外してから実行してください（残っていると GUI が起動せず Node として動きます）。\n'
         );
+        // node-pty に同梱の winpty は、ビルド中に `cmd /c "cd shared && GetCommitHash.bat"` を実行する。
+        // この環境変数が設定されていると cmd はカレントディレクトリから実行ファイルを探さないため、
+        // 「'GetCommitHash.bat' is not recognized」でビルドが失敗する。
+        //
+        // **こちらで勝手に消さない。** カレントディレクトリからの実行を禁じるのは意図的な
+        // セキュリティ設定で、子プロセスのために黙って外すと利用者の意図を裏切る。
+        // 何が起きるかと外し方だけを伝えて、判断は利用者に残す。
+        if (process.env.NoDefaultCurrentDirectoryInExePath) {
+          console.warn(
+            '⚠ 環境変数 NoDefaultCurrentDirectoryInExePath が設定されています。\n' +
+            '  この設定があると cmd がカレントディレクトリを探さないため、node-pty に同梱の\n' +
+            '  winpty のビルドが「\'GetCommitHash.bat\' is not recognized」で失敗します。\n' +
+            '  導入時だけこの変数を外して実行し直してください（PowerShell の例:\n' +
+            '  `Remove-Item Env:\\NoDefaultCurrentDirectoryInExePath` を実行してから `npm run setup:terminals`）。\n'
+          );
+        }
       } else if (process.platform !== 'darwin') {
         console.warn(
           `⚠ 現在のプラットフォームは ${process.platform} です。node-pty / electron の\n` +
@@ -1185,6 +1204,10 @@ async function main() {
             ? '   - Xcode Command Line Tools 未導入 → `xcode-select --install` を実行して再試行\n'
             : process.platform === 'win32'
               ? '   - Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード未導入\n' +
+                '   - Spectre 軽減ライブラリ未導入（ビルドログに MSB8040 が出ていればこれです）\n' +
+                '     → VS Installer で「MSVC v143 - VS 2022 C++ x64/x86 Spectre 軽減ライブラリ (最新)」を追加\n' +
+                '   - 環境変数 NoDefaultCurrentDirectoryInExePath が設定されている\n' +
+                '     （ビルドログに \'GetCommitHash.bat\' is not recognized が出ていればこれです）\n' +
                 '   - リポジトリの場所が `C:\\Program Files\\...` や OneDrive 同期対象フォルダにある\n' +
                 '     （パスの空白・同期の競合でネイティブビルドが失敗します）\n'
               : '   - GUI 表示に必要なデスクトップ環境（WSLg 等）や依存ライブラリの不足\n') +

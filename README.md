@@ -29,7 +29,7 @@ VK Terminals                     … 実際に Claude を動かす実行面
 
 - **macOS** / **Windows** / **Linux**（WSL2 の WSLg 上の Ubuntu を含む）。VK Terminals は node-pty のネイティブビルドを伴う Electron アプリのため、OS ごとに次の前提があります
   - macOS … Xcode Command Line Tools（`xcode-select --install`）
-  - Windows … Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード、および Git for Windows（vk-agents の展開に同梱の Git Bash を使います）
+  - Windows … Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード **と Spectre 軽減ライブラリ**、および Git for Windows（vk-agents の展開に同梱の Git Bash を使います）。詳細は下記「Windows でネイティブに動かす場合」を参照
   - Linux … C/C++ ビルドツールと、GUI 表示のためのデスクトップ環境（WSL2 の場合は WSLg）
 - **Node.js 20 以上**
 - **タスク登録リポジトリ（task-queue）**と、そこに設定されたステータスラベル群（`status:ready` ほか。`config.example.json` の owner/repo で指定）
@@ -42,13 +42,34 @@ VK Terminals は `npm install` 時に依存として自動導入されます（`
 
 > **WSL Ubuntu で動かす場合** — システム依存ライブラリの導入・GPU 設定・トラブルシューティングを含む、まっさらな環境からの手順を [`docs/WSL-UBUNTU-SETUP.md`](docs/WSL-UBUNTU-SETUP.md) にまとめています。
 
-> **Windows でネイティブに動かす場合** — WSL2 を経由せず、Windows 上で直接動かせます。次の点に注意してください。
->
-> - パスは Windows ネイティブ形式（`C:\Users\...`）で指定します。Git Bash / WSL 由来の POSIX 形式（`/c/Users/...`）は使えません
-> - リポジトリの置き場所は `C:\Program Files\...` や OneDrive の同期対象フォルダを避けてください（パスの空白・同期の競合でネイティブビルドが失敗します）
-> - VSCode の統合ターミナルから `npm start` する場合は、環境変数 `ELECTRON_RUN_AS_NODE` を外してから実行してください（残っていると GUI が起動せず Node として動きます）
-> - vk-agents の展開（`npm run setup:agents`）には bash が必要です。Git for Windows に同梱の Git Bash を自動で探して使います。既定以外の場所へ入れている場合は、`bash.exe` の絶対パスを環境変数 `VK_BASH` に設定してください
-> - `terminals.mode` の **tmux モードはネイティブ Windows では使えません**（tmux が存在しないため）。tmux モードを使う場合は WSL2 の中で実行してください
+### Windows でネイティブに動かす場合
+
+WSL2 を経由せず、Windows 上で直接動かせます（Node.js 20 / 24 で動作を確認しています）。
+
+**必要なビルドツール** — `npm run setup:terminals` は node-pty と electron のネイティブビルドを伴います。
+
+```powershell
+# 1) Visual Studio Build Tools（C++ ワークロード）
+winget install --id Microsoft.VisualStudio.2022.BuildTools `
+  --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" `
+  --accept-package-agreements --accept-source-agreements
+
+# 2) Spectre 軽減ライブラリ（1 の --includeRecommended には含まれません／管理者 PowerShell で実行）
+& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe" modify `
+  --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" `
+  --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre --passive --norestart
+```
+
+2 を飛ばすと node-pty のビルドが `error MSB8040: Spectre 軽減のライブラリは、このプロジェクトに必要です` で失敗します。**「C++ によるデスクトップ開発」ワークロードだけでは足りません。**
+
+**その他の注意点**
+
+- パスは Windows ネイティブ形式（`C:\Users\...`）で指定します。Git Bash / WSL 由来の POSIX 形式（`/c/Users/...`）は使えません
+- リポジトリの置き場所は `C:\Program Files\...` や OneDrive の同期対象フォルダを避けてください（パスの空白・同期の競合でネイティブビルドが失敗します）
+- VSCode の統合ターミナルから `npm start` する場合は、環境変数 `ELECTRON_RUN_AS_NODE` を外してから実行してください（残っていると GUI が起動せず Node として動きます）
+- 環境変数 `NoDefaultCurrentDirectoryInExePath` が設定された環境（一部の CLI ツールやエージェントのシェルが設定します）では、node-pty 同梱の winpty のビルドが `'GetCommitHash.bat' is not recognized` で失敗します。**導入のときだけ**この変数を外してください（`Remove-Item Env:\NoDefaultCurrentDirectoryInExePath`）
+- vk-agents の展開（`npm run setup:agents`）には bash が必要です。Git for Windows に同梱の Git Bash を自動で探して使います。既定以外の場所へ入れている場合は、`bash.exe` の絶対パスを環境変数 `VK_BASH` に設定してください
+- `terminals.mode` の **tmux モードはネイティブ Windows では使えません**（tmux が存在しないため）。tmux モードを使う場合は WSL2 の中で実行してください
 
 ### 対応 PR の紐付け規約（必須）
 

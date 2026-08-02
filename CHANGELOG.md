@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 不具合修正 ] Node 22 以降で `npm run setup:terminals` が成功したように見えて electron の実行ファイルが展開されず、GUI を起動できない不具合を修正。electron のインストーラが使う `extract-zip` は `yauzl` 2.x（`fd-slicer`）に依存しており、これが新しい Node では巨大な zip の展開中に無言で停止する（エラーも出さず終了コード 0 を返すため、原因に辿り着けない状態でした）。`yauzl` を 3.x へ上げる overrides を追加し、Node 24 で 107MB の electron zip が完全に展開されることを確認
+- [ その他 ] Windows のネイティブビルドに Spectre 軽減ライブラリが必要であることを、`npm run setup:terminals` の案内と README に明記。「C++ によるデスクトップ開発」ワークロードの「推奨コンポーネントを含める」でも入らないため、未導入だと node-pty のビルドが MSB8040 で失敗します。併せて、環境変数 `NoDefaultCurrentDirectoryInExePath` が設定されていると winpty のビルドが失敗する件も検知して案内するようにしました
 - [ 機能追加 ] Windows で WSL2 を経由せずネイティブに動作するよう対応。`vk-orchestrator doctor` の対応プラットフォーム判定に Windows を追加し、「macOS 専用」という実態と合わない案内を各所で修正（VK Terminals(GUI) 自体は以前から Windows へ対応済みで、orchestrator 側の判定と文言だけが古い状態でした）。tmux モードはネイティブ Windows に tmux が無いため従来どおり非対応で、WSL2 か GUI モードへ誘導します
 - [ 不具合修正 ] Windows で `npm start`（`up`）の GUI 起動・`npm run setup:terminals`・`up` 時の vk-terminals 追従インストール・アップデート時の `npm install` / `npm ci` がいずれも起動できず ENOENT で失敗する不具合を修正。Windows の `npm` は `.cmd` のシムで `spawn` からは起動できず、Node 20.12 以降は `.cmd` の直接起動も EINVAL で弾かれるため、npm の本体（`npm-cli.js`）を Node で直接実行するように変更（macOS / Linux の挙動は変わりません）
 - [ 不具合修正 ] Windows で `npm run setup:agents`（および `up` 起動時の自動展開）が bash を起動できず、vk-agents の skills/rules を展開できない不具合を修正。Git for Windows が PATH に載せるのは `<Git>\cmd` だけで `bash.exe` のある `<Git>\bin` は載らないため、Git Bash を自動で探して使うように変更（環境変数 `VK_BASH` で明示指定も可能。見つからない場合は Git for Windows の導入を案内します）
