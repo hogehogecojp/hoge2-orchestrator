@@ -125,6 +125,24 @@ function Get-CommandPath {
     return $null
 }
 
+<#
+    origin の URL から "owner/repo" を取り出す（取れなければ $null）。
+
+    リポジトリ名を直接書かずに origin から導くのは、フォーク先の名前が変わっても
+    追従させるため。https/ssh のどちらの形式でも拾えるようにしている。
+#>
+function Get-OriginSlug {
+    param([string]$RepoPath)
+    try {
+        $url = & git -C $RepoPath remote get-url origin 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $url) { return $null }
+        if ($url -match '[:/]([^/:]+/[^/]+?)(?:\.git)?\s*$') { return $Matches[1] }
+    } catch {
+        # git が無い / origin が無い場合は設定そのものを見送る（致命ではない）。
+    }
+    return $null
+}
+
 function Get-VsWherePath {
     $p = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path $p) { return $p }
@@ -275,6 +293,33 @@ if ($ghPath) {
 Add-Check -Name 'GitHub CLI（gh）と認証' -Ok $ghAuthed `
     -Detail $(if (-not $ghPath) { '未導入' } elseif ($ghAuthed) { '認証済み' } else { '未認証' }) `
     -Fix 'winget install GitHub.cli の後 gh auth login' -Required $false -CanAutoInstall $true
+
+<#
+    gh の既定リポジトリ（base repository）の確認。
+
+    このリポジトリは vektor-inc/vk-orchestrator の Public フォーク。gh は remote から
+    フォーク関係を検出し、`--repo` を省略すると **親リポジトリ** を既定にする
+    （設定前は `gh issue list` が vektor-inc 側の issue を返していた）。読み取りなら
+    実害は無いが、書き込み系のコマンドで同じことが起きるとフォーク元へ意図しない
+    Issue や PR を作ってしまう。
+
+    `gh repo set-default` は .git/config のローカル設定なので clone には引き継がれない。
+    配布先ごとに設定が要るため、ここで検知して -Install で設定する。
+#>
+$originSlug = Get-OriginSlug -RepoPath $RepoRoot
+$ghDefaultSet = $false
+if ($ghPath) {
+    try {
+        $current = & git -C $RepoRoot config --local --get remote.origin.gh-resolved 2>$null
+        $ghDefaultSet = ($LASTEXITCODE -eq 0 -and $current)
+    } catch {
+        $ghDefaultSet = $false
+    }
+}
+Add-Check -Name 'gh の既定リポジトリをフォーク自身に固定' -Ok $ghDefaultSet `
+    -Detail $(if ($ghDefaultSet) { "設定済み（$originSlug）" } else { '未設定（gh が親リポジトリ vektor-inc を既定にします）' }) `
+    -Fix $(if ($originSlug) { "gh repo set-default $originSlug" } else { 'origin の URL を解決できませんでした' }) `
+    -Required $false -CanAutoInstall $true
 
 # 環境変数の落とし穴（値は変えない。このプロセスの中だけ後で外す）
 $hasNoDefaultCwd = [bool]$env:NoDefaultCurrentDirectoryInExePath
@@ -464,6 +509,44 @@ if ($blockers.Count -gt 0) {
     Write-Host '  導入直後であれば、PowerShell を開き直してからもう一度実行すると解決することがあります' -ForegroundColor Yellow
     Write-Host '  （インストーラが更新した PATH が、実行中のプロセスへ届いていない場合があるため）。' -ForegroundColor Yellow
     exit 1
+}
+
+Write-Section 'フォーク元への誤操作を防ぐ設定'
+
+# 1. gh の既定リポジトリを origin 自身へ固定する。
+#    未設定だと gh がフォーク関係から親（vektor-inc）を既定にするため、
+#    `--repo` を省略した書き込みコマンドがフォーク元へ飛ぶ余地が残る。
+if (-not $originSlug) {
+    Write-Host '  origin の URL を解決できないため、gh の既定リポジトリは設定しません。' -ForegroundColor Yellow
+} elseif (-not (Get-CommandPath 'gh')) {
+    Write-Host '  gh が見つからないため、既定リポジトリの設定は見送ります。' -ForegroundColor Yellow
+    Write-Host "  gh 導入後に手動で実行してください: gh repo set-default $originSlug" -ForegroundColor Yellow
+} else {
+    try {
+        & gh repo set-default $originSlug 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  gh の既定リポジトリを $originSlug に固定しました" -ForegroundColor Green
+        } else {
+            # 未認証だとここで失敗する。致命ではないので案内だけ出して進む。
+            Write-Host "  gh の既定リポジトリを設定できませんでした。gh auth login のあと次を実行してください:" -ForegroundColor Yellow
+            Write-Host "    gh repo set-default $originSlug" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  gh の既定リポジトリを設定できませんでした。gh auth login のあと次を実行してください:" -ForegroundColor Yellow
+        Write-Host "    gh repo set-default $originSlug" -ForegroundColor Yellow
+    }
+}
+
+# 2. upstream リモートがある場合は push 先を潰す。
+#    fetch URL はそのまま残すので、upstream からの一方向の取り込みは維持される。
+try {
+    $upstreamPush = & git -C $RepoRoot remote get-url --push upstream 2>$null
+    if ($LASTEXITCODE -eq 0 -and $upstreamPush -and $upstreamPush -notmatch '^DISABLED') {
+        & git -C $RepoRoot remote set-url --push upstream 'DISABLED_no_push_to_upstream' 2>&1 | Out-Null
+        Write-Host '  upstream への push を無効化しました（fetch は従来どおり可能）' -ForegroundColor Green
+    }
+} catch {
+    # upstream リモートが無い環境（通常の clone）ではここへ来る。何もしないのが正しい。
 }
 
 Write-Section 'VK Terminals(GUI) の導入'
