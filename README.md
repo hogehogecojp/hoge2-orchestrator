@@ -1,5 +1,10 @@
 # VK Orchestrator
 
+> **このリポジトリは [`vektor-inc/vk-orchestrator`](https://github.com/vektor-inc/vk-orchestrator) をベースにしたフォークです。**
+> 株式会社hogehoge が自社運用向けに Windows ネイティブ対応などの変更を加えています。
+> オリジナルの著作権は Vektor,Inc. に帰属し、本リポジトリも同じ **GPL-2.0-only** で配布します（[`LICENSE`](LICENSE)）。
+> 上流の変更履歴・不具合報告はオリジナルのリポジトリを参照してください。
+
 GitHub issues をタスクキューとして使い、[VK Terminals](https://github.com/vektor-inc/vk-terminals) 上の Claude に自動実行させる**再利用可能なオーケストレーター**です。
 
 これまで [task-queue](https://github.com/vektor-inc/task-queue) リポジトリに同居していたオーケストレーター部分を切り出したものです。task-queue は「実行する issue の管理（キューの実体）」に専念し、実行ロジックはこの VK Orchestrator が担います。
@@ -22,7 +27,10 @@ VK Terminals                     … 実際に Claude を動かす実行面
 
 このツールを動かすには次が必要です。
 
-- **macOS**、または **Windows の WSL2（WSLg）上の Ubuntu**（VK Terminals が node-pty のネイティブビルドを伴う Electron アプリのため。GUI 表示に WSLg が必要）
+- **macOS** / **Windows** / **Linux**（WSL2 の WSLg 上の Ubuntu を含む）。VK Terminals は node-pty のネイティブビルドを伴う Electron アプリのため、OS ごとに次の前提があります
+  - macOS … Xcode Command Line Tools（`xcode-select --install`）
+  - Windows … Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード、および Git for Windows（vk-agents の展開に同梱の Git Bash を使います）
+  - Linux … C/C++ ビルドツールと、GUI 表示のためのデスクトップ環境（WSL2 の場合は WSLg）
 - **Node.js 20 以上**
 - **タスク登録リポジトリ（task-queue）**と、そこに設定されたステータスラベル群（`status:ready` ほか。`config.example.json` の owner/repo で指定）
 - **GitHub CLI (`gh`)** と `gh auth login` 済みの認証
@@ -33,6 +41,14 @@ VK Terminals                     … 実際に Claude を動かす実行面
 VK Terminals は `npm install` 時に依存として自動導入されます（`optionalDependencies`）。
 
 > **WSL Ubuntu で動かす場合** — システム依存ライブラリの導入・GPU 設定・トラブルシューティングを含む、まっさらな環境からの手順を [`docs/WSL-UBUNTU-SETUP.md`](docs/WSL-UBUNTU-SETUP.md) にまとめています。
+
+> **Windows でネイティブに動かす場合** — WSL2 を経由せず、Windows 上で直接動かせます。次の点に注意してください。
+>
+> - パスは Windows ネイティブ形式（`C:\Users\...`）で指定します。Git Bash / WSL 由来の POSIX 形式（`/c/Users/...`）は使えません
+> - リポジトリの置き場所は `C:\Program Files\...` や OneDrive の同期対象フォルダを避けてください（パスの空白・同期の競合でネイティブビルドが失敗します）
+> - VSCode の統合ターミナルから `npm start` する場合は、環境変数 `ELECTRON_RUN_AS_NODE` を外してから実行してください（残っていると GUI が起動せず Node として動きます）
+> - vk-agents の展開（`npm run setup:agents`）には bash が必要です。Git for Windows に同梱の Git Bash を自動で探して使います。既定以外の場所へ入れている場合は、`bash.exe` の絶対パスを環境変数 `VK_BASH` に設定してください
+> - `terminals.mode` の **tmux モードはネイティブ Windows では使えません**（tmux が存在しないため）。tmux モードを使う場合は WSL2 の中で実行してください
 
 ### 対応 PR の紐付け規約（必須）
 
@@ -145,7 +161,7 @@ npm run up                           # 設定を反映して VK Terminals(GUI) �
 > npm run setup:terminals
 > ```
 >
-> よくある失敗原因: **macOS で Xcode Command Line Tools 未導入**（→ `xcode-select --install`）、**macOS 以外**（GUI は macOS 専用。別マシンの VK Terminals API を使う構成なら `up` ではなく `start` を使い `~/.vk-terminals/config.json` の `apiHost` または `VK_TERMINALS_HOST` を対象マシンに向ける）、C/C++ ビルドツール不足やネットワークエラー。
+> よくある失敗原因: **macOS で Xcode Command Line Tools 未導入**（→ `xcode-select --install`）、**Windows で Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード未導入**、**リポジトリが `C:\Program Files\...` や OneDrive 同期対象フォルダにある**、C/C++ ビルドツール不足やネットワークエラー。手元で GUI を起動しない構成（別マシンの VK Terminals API を使う）なら `up` ではなく `start` を使い、`~/.vk-terminals/config.json` の `apiHost` または `VK_TERMINALS_HOST` を対象マシンに向けてください。
 
 **最低限、`github.owner` / `github.repo` の 2 つを自分の値に書き換えれば動きます。** GitHub トークンは `gh auth login` 済みなら `gh auth token` から自動取得します。その後に `npm run setup:agents` を実行すると、このリポジトリに同梱された `vendor/vk-agents-public/` から skills/rules が `~/.claude/` へ展開されます。private な vk-agents リポジトリを別途 clone する必要はありません。
 
@@ -363,7 +379,7 @@ npx vk-orchestrator apply
 
 ## VK Terminals との結合
 
-VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ、実行時の連携は HTTP API 契約だけで行います。その API クライアントは `src/terminals/` に閉じており、コードとしては import していません（＝疎結合のまま、導入と起動だけまとめている）。macOS 以外や native ビルド失敗時でも `npm install` 自体は成功し、`up` 実行時に未導入なら分かりやすくエラーを出します。
+VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ、実行時の連携は HTTP API 契約だけで行います。その API クライアントは `src/terminals/` に閉じており、コードとしては import していません（＝疎結合のまま、導入と起動だけまとめている）。native ビルドに失敗した環境でも `npm install` 自体は成功し、`up` 実行時に未導入なら分かりやすくエラーを出します。
 
 > **なぜ `@electron/rebuild` が optionalDependencies にあるか**: VK Terminals の `postinstall` は `electron-rebuild`（`@electron/rebuild` が提供）で node-pty を Electron 向けに再ビルドします。ところが `@electron/rebuild` は VK Terminals 側では **devDependencies** にあり、依存として導入する側（この VK Orchestrator）ではインストールされません。その結果 `electron-rebuild: command not found` で postinstall が失敗し、optional 依存の VK Terminals ごと破棄され「見つかりません」となります。これを避けるため VK Orchestrator 自身の依存に `@electron/rebuild` を持たせ、npm が nested postinstall 実行時に親の `node_modules/.bin` を PATH へ加える挙動を使って解決させています。
 
@@ -407,13 +423,13 @@ VK Terminals は `optionalDependencies` として同梱（git 依存）しつつ
 
 注意: 起点（cwd）は「起点」であって「隔離」ではありません。絶対パス指定でのファイル読み取りは起点に関わらず可能なので、`GITHUB_TOKEN` 等の機密保護は起点設定だけでは達成できません。秘密管理・権限分離は別途行ってください。`TASK_CWD` に相対パスを指定した場合はオーケストレーター起動時の作業ディレクトリ基準で解決されます。
 
-> **`gpu`（GUI の GPU 起動モード）** — VK Terminals(GUI) は Electron アプリで、macOS 以外（WSLg 等の Linux）では Chromium の GPU 初期化が失敗し `up` 起動時に `Exiting GPU process` / `kTransientFailure` 等のエラーログが大量に出ます。値で挙動を選べます。
+> **`gpu`（GUI の GPU 起動モード）** — VK Terminals(GUI) は Electron アプリで、環境によっては Chromium の GPU 初期化が失敗し `up` 起動時に `Exiting GPU process` / `kTransientFailure` 等のエラーログが大量に出ます（とくに WSLg 等の Linux）。既定はこれを避けるため、macOS 以外では GPU を無効化します。値で挙動を選べます。
 >
 > 設定は VK Terminals 本体 config（`~/.vk-terminals/config.json` の `gpu`）に保存します。設定パネルでは「VK Terminals（本体設定）」から編集できます。解決順は `VK_TERMINALS_GPU` 環境変数 > `~/.vk-terminals/config.json` の `gpu` > プラットフォーム既定です。
 >
 > - **空（既定・自動）** — macOS は通常起動、それ以外は `off` 相当。通常はこのままで OK。
 > - **`off`** — GPU を無効化してエラーログを抑制（描画はソフトウェア。ターミナル用途で実害なし）。
-> - **`default`** — フラグを足さず Chromium 任せ（元の挙動。macOS 以外では GPU 初期化エラーが出る場合あり）。
+> - **`default`** — フラグを足さず Chromium 任せ（元の挙動。macOS 以外では GPU 初期化エラーが出る場合あり）。Windows で GPU アクセラを効かせたい場合はこの値にします。
 >
 > 反映は次回 `up` 時。ターミナル用途では GPU アクセラの体感差はほぼ無いため、既定（`off` 相当）で十分です。
 >

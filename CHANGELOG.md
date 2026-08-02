@@ -1,5 +1,10 @@
 # Changelog
 
+- [ 機能追加 ] Windows で WSL2 を経由せずネイティブに動作するよう対応。`vk-orchestrator doctor` の対応プラットフォーム判定に Windows を追加し、「macOS 専用」という実態と合わない案内を各所で修正（VK Terminals(GUI) 自体は以前から Windows へ対応済みで、orchestrator 側の判定と文言だけが古い状態でした）。tmux モードはネイティブ Windows に tmux が無いため従来どおり非対応で、WSL2 か GUI モードへ誘導します
+- [ 不具合修正 ] Windows で `npm start`（`up`）の GUI 起動・`npm run setup:terminals`・`up` 時の vk-terminals 追従インストール・アップデート時の `npm install` / `npm ci` がいずれも起動できず ENOENT で失敗する不具合を修正。Windows の `npm` は `.cmd` のシムで `spawn` からは起動できず、Node 20.12 以降は `.cmd` の直接起動も EINVAL で弾かれるため、npm の本体（`npm-cli.js`）を Node で直接実行するように変更（macOS / Linux の挙動は変わりません）
+- [ 不具合修正 ] Windows で `npm run setup:agents`（および `up` 起動時の自動展開）が bash を起動できず、vk-agents の skills/rules を展開できない不具合を修正。Git for Windows が PATH に載せるのは `<Git>\cmd` だけで `bash.exe` のある `<Git>\bin` は載らないため、Git Bash を自動で探して使うように変更（環境変数 `VK_BASH` で明示指定も可能。見つからない場合は Git for Windows の導入を案内します）
+- [ 不具合修正 ] シェルスクリプトが Windows で CRLF に変換されてチェックアウトされる問題を修正（`.gitattributes` で `*.sh` を LF に固定）。改行コードはシェルの構文の一部のため、CRLF で展開されると vk-agents の配布内容が壊れるおそれがありました
+- [ その他 ] Windows でユニットテスト 11 件が失敗していた問題を修正。いずれもテスト側が POSIX を前提にしていたもの（パス区切りのリテラル比較・POSIX 権限ビットの検証・`/dev/null` への書き込み失敗前提・CRLF でのソース文字列検索）で、製品コードの不具合ではありません
 - [ 機能追加 ] レビュー完了マーカーが無くて自動マージが保留されているとき、メタ issue へ復帰手順を 1 回通知し、タスクカードに「要対応: レビュー未完了」バッジを出す機能を追加。ログにしか出ず「マージ待ち」表示のまま気づかず止まり続ける状態を解消
 - [ 仕様変更 ] VK Terminals API の接続先に `127.0.1.1` や `0.0.0.0`、自分のマシンの名前（`mymac.local` など）を設定している場合も手元のマシンとして扱うように変更。タスクのペインが対象リポジトリのクローン先で開くようになる（クローンが見つからない場合は従来どおり既定のディレクトリ） (#256)
 - [ 不具合修正 ] `vk-orchestrator doctor` で設定値の制御文字を表示のために除去したことが伝わらず、表示は一致しているのに未充足と出て原因に辿り着けない不具合を修正（除去した項目に注記を添え、レポートにも見直しを促す警告を表示。合否判定は従来どおり除去前の値で実施） (#252)
