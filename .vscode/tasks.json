@@ -1,0 +1,104 @@
+{
+  // Ctrl+Shift+B（既定のビルドタスク）で「何を実行するか」を先に選ばせる。
+  //
+  // 押した瞬間に GUI が起動すると、doctor を見たいだけ・テストを流したいだけのときに
+  // 事故になる（up は常駐して Electron を起動し、ペインで Claude Code が動き出す）。
+  // そのため既定タスクは選択肢を出すだけにして、実行内容は毎回選んでもらう。
+  //
+  // Windows では、VS Code の統合ターミナルから実行するときに 2 つの環境変数が邪魔をする。
+  // どちらも「実行元の環境に依存して黙って壊れる」類なので、タスク側で確実に外す。
+  //
+  //   - ELECTRON_RUN_AS_NODE
+  //       VS Code 自身が Electron アプリのため、統合ターミナルの環境に残ることがある。
+  //       残っていると electron が GUI ではなく素の Node として起動し、ウィンドウが出ない。
+  //   - NoDefaultCurrentDirectoryInExePath
+  //       cmd がカレントディレクトリから実行ファイルを探さなくなる設定。設定されていると
+  //       node-pty 同梱の winpty のビルドが 'GetCommitHash.bat' is not recognized で失敗する。
+  //       （setup:terminals のときだけ効く問題だが、外し忘れを防ぐため一律で外す）
+  //
+  // 外すのはこのタスクが起動する子プロセスの中だけで、OS の設定は変更しない。
+  //
+  // シェルは options.shell で明示する。既定のターミナルが cmd や Git Bash の人の手元で
+  // PowerShell 構文が流れて壊れるのを防ぐため（コマンド文字列の組み立ては VS Code ではなく
+  // こちらの責任にする）。
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "hoge2-orchestrator",
+      "detail": "実行する内容を選んでから起動します",
+      "type": "shell",
+      "command": "${input:vkCommand}",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "windows": {
+        "command": "Remove-Item Env:\\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; Remove-Item Env:\\NoDefaultCurrentDirectoryInExePath -ErrorAction SilentlyContinue; ${input:vkCommand}",
+        "options": {
+          "cwd": "${workspaceFolder}",
+          "shell": {
+            "executable": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+          }
+        }
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "vkCommand",
+      "type": "pickString",
+      "description": "hoge2-orchestrator: 実行する内容を選んでください",
+      // 既定は doctor にしておく。Enter を押しただけで GUI が起動して常駐する、
+      // という一番戻しにくい選択が既定にならないようにする。
+      "default": "npm run doctor",
+      "options": [
+        {
+          "label": "doctor — セットアップ診断（副作用なし）",
+          "value": "npm run doctor"
+        },
+        {
+          "label": "up — GUI + オーケストレーター起動（常駐）",
+          "value": "npm run up"
+        },
+        {
+          "label": "up (GUI のみ) — オーケストレーターを起動しない",
+          "value": "node bin/vk-orchestrator.js up --no-orchestrator"
+        },
+        {
+          "label": "start — オーケストレーターのみ（GUI を起動しない）",
+          "value": "npm run orchestrator"
+        },
+        {
+          "label": "run-once — キューを 1 巡だけ処理して終了",
+          "value": "npm run run-once"
+        },
+        {
+          "label": "check-status — 現在のタスク状況を表示",
+          "value": "npm run check-status"
+        },
+        {
+          "label": "test — ユニットテスト",
+          "value": "npm test"
+        },
+        {
+          "label": "setup:terminals — VK Terminals(GUI) を導入・更新",
+          "value": "npm run setup:terminals"
+        },
+        {
+          "label": "setup:agents — vk-agents を ~/.claude へ展開（グローバル設定を変更します）",
+          "value": "npm run setup:agents"
+        }
+      ]
+    }
+  ]
+}

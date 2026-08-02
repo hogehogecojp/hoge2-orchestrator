@@ -71,6 +71,14 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools `
 - vk-agents の展開（`npm run setup:agents`）には bash が必要です。Git for Windows に同梱の Git Bash を自動で探して使います。既定以外の場所へ入れている場合は、`bash.exe` の絶対パスを環境変数 `VK_BASH` に設定してください
 - `terminals.mode` の **tmux モードはネイティブ Windows では使えません**（tmux が存在しないため）。tmux モードを使う場合は WSL2 の中で実行してください
 
+### VS Code から起動する
+
+`Ctrl` + `Shift` + `B`（既定のビルドタスク）で、実行する内容を選ぶメニューが出ます。**選んでから実行される**ので、押した瞬間に GUI が起動することはありません（既定の選択は副作用の無い `doctor`）。
+
+選べる内容: `doctor` / `up` / `up`（GUI のみ）/ `start`（オーケストレーターのみ）/ `run-once` / `check-status` / `test` / `setup:terminals` / `setup:agents`
+
+このタスクは Windows で `ELECTRON_RUN_AS_NODE` と `NoDefaultCurrentDirectoryInExePath` を子プロセスから外してから実行するため、上記 2 つの落とし穴を踏みません（OS の設定は変更しません）。定義は [`.vscode/tasks.json`](.vscode/tasks.json) にあります。
+
 ### 対応 PR の紐付け規約（必須）
 
 orchestrator は「issue に対応する PR」を、**PR 本文に含まれる GitHub 標準のクローズキーワード＋issue 番号（`Closes #N` / `Fixes #N` / `Resolves #N` など）、または対象 issue の URL** で特定します。対応 PR を作成する際は **PR 本文に必ず `Closes #N` を記載してください**。記載のない PR は対応 PR として認識されず、完了判定（CodeRabbit / CI 監視）や automerge が進みません。ラベルやブランチ名規約による紐付けには対応していません（既定の vk-kore スキル経由で作成される PR はこの規約を満たします）。
