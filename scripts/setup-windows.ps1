@@ -17,6 +17,11 @@
       - Git for Windows 未導入
         vk-agents の展開に使う sync.sh は bash が要る。PATH に載るのは <Git>\cmd だけで
         bash.exe のある <Git>\bin は載らないため、orchestrator 側が自動で探しに行く。
+      - Python 3 未導入
+        node-pty のビルド（node-gyp）が Python を要求する。さらに sync.sh が
+        CLAUDE.md の書き換え・settings.json へのパーミッション追加・
+        無効スキル一覧の読み取りを python3 で行うため、欠けると setup:agents が
+        警告だけ出してそれらを見送る。doctor は「展開済み」と表示するため気づけない。
       - 環境変数 NoDefaultCurrentDirectoryInExePath
         設定されていると node-pty 同梱の winpty のビルドが
         'GetCommitHash.bat' is not recognized で失敗する。
@@ -204,6 +209,38 @@ Add-Check -Name 'Git for Windows（Git Bash 同梱）' -Ok ([bool]$bashPath) `
     -Fix 'winget install Git.Git（導入済みで見つからない場合は環境変数 VK_BASH に bash.exe の絶対パスを設定）' `
     -CanAutoInstall $true
 
+<#
+    Python 3 の解決。判定は **Git Bash 経由**で行う。
+
+    sync.sh は python3 という名前で呼ぶ（sync.sh:198 / 1391 / 1466 / 1541）。Windows の
+    公式インストーラは python.exe と py.exe しか置かないことがあり、その場合
+    node-gyp のビルドは通るのに sync.sh だけが黙って失敗する。両方を満たしているかを
+    見るには、sync.sh と同じ経路で python3 が解決できるかを確かめるのが確実。
+#>
+function Resolve-Python3 {
+    param([string]$BashExe)
+    if ($BashExe) {
+        try {
+            $found = & $BashExe -lc 'command -v python3' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $found) {
+                return ($found | Select-Object -First 1).Trim()
+            }
+        } catch {
+            # bash を起動できない場合のほか、PowerShell 7.4 以降では
+            # $PSNativeCommandUseErrorActionPreference が既定で有効なため、python3 が
+            # 無くて command -v が終了コード 1 を返すこと自体がここへ飛んでくる。
+            # どちらの場合も下の native 検出へ落とす。
+        }
+    }
+    return (Get-CommandPath 'python3')
+}
+
+$python3Path = Resolve-Python3 -BashExe $bashPath
+Add-Check -Name 'Python 3（ネイティブビルドと vk-agents の展開に必要）' -Ok ([bool]$python3Path) `
+    -Detail $(if ($python3Path) { $python3Path } else { '未導入 / Git Bash から python3 を解決できない' }) `
+    -Fix 'winget install Python.Python.3.12（導入後、Git Bash で python3 --version が通ることを確認してください）' `
+    -CanAutoInstall $true
+
 # Visual Studio Build Tools（C++ ワークロード）
 $vcToolsPath = Get-VsInstallPathWith -ComponentId $VsComponentVCTools
 Add-Check -Name 'VS Build Tools（C++ によるデスクトップ開発）' -Ok ([bool]$vcToolsPath) `
@@ -312,6 +349,20 @@ if (-not $ghPath) {
     Update-ProcessPath
 }
 
+# Python 3（node-pty のビルドと vk-agents の展開の両方が要る）
+if (-not $python3Path) {
+    [void](Invoke-Winget -Id 'Python.Python.3.12')
+    Update-ProcessPath
+    # 導入しても python3 という名前で解決できるとは限らないため、ここで確かめ直す。
+    # 解決できないまま進むと、ビルドは通るのに setup:agents だけが黙って欠ける。
+    $python3Path = Resolve-Python3 -BashExe $bashPath
+    if (-not $python3Path) {
+        Write-Host '  Python は導入しましたが python3 という名前で解決できません。' -ForegroundColor Yellow
+        Write-Host '  Git Bash で python3 --version が通るか確認してください（通らない場合は' -ForegroundColor Yellow
+        Write-Host '  python.exe と同じ場所に python3.exe のコピーを置くか、PATH を調整してください）。' -ForegroundColor Yellow
+    }
+}
+
 # VS Build Tools と Spectre 軽減ライブラリ
 if (-not $SkipBuildTools) {
     if (-not $vcToolsPath) {
@@ -386,6 +437,15 @@ if ($nodePath) {
 
 if (-not (Get-CommandPath 'npm')) { $blockers += 'npm が見つかりません' }
 else { Write-Host "  npm … $(& npm -v)" -ForegroundColor Green }
+
+# node-pty のビルドは node-gyp 経由で Python を要求する。ここで止めずに進むと、
+# 長いビルドログの末尾に出る node-gyp のエラーまで読まないと原因に辿り着けない。
+$python3Path = Resolve-Python3 -BashExe $bashPath
+if (-not $python3Path) {
+    $blockers += 'python3 が見つかりません（node-pty のビルドと vk-agents の展開に必要です）'
+} else {
+    Write-Host "  python3 … $python3Path" -ForegroundColor Green
+}
 
 if (-not $SkipBuildTools) {
     if (-not (Get-VsInstallPathWith -ComponentId $VsComponentVCTools)) {
