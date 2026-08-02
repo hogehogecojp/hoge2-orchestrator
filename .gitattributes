@@ -1,0 +1,14 @@
+# 改行コードの正規化。
+#
+# Windows の Git は既定が core.autocrlf=true で、チェックアウト時に LF を CRLF へ変換する。
+# 通常のソースでは問題にならないが、**シェルスクリプトは改行コード自体が構文の一部**なので、
+# CRLF で展開されると行末の `\r` がコマンド名や変数値に混ざる（`$'\r': command not found`、
+# 生成したファイルへ `\r` が紛れ込む、など）。vendor/vk-agents-public/scripts/sync.sh は
+# vk-agents の展開を担う 1400 行超のスクリプトで、ここが壊れると Claude 側の
+# skills/rules が壊れた状態で配布される。
+#
+# したがって、実行時に改行コードが意味を持つファイルは環境の設定に関わらず LF で固定する。
+*.sh text eol=lf
+
+# シェルから読まれる設定・フックの類も同様に LF で固定する。
+.node-version text eol=lf
