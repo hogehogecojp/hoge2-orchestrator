@@ -23,6 +23,18 @@
 
     既定は**診断のみ**（何も変更しない）。実際に導入するには -Install を付ける。
 
+    このスクリプトはリポジトリの中にあるので、実行するにはリポジトリが手元に必要。
+    Git がまだ入っていない環境では、先に Git を入れるか、GitHub から ZIP で取得する:
+
+        winget install Git.Git
+        git clone https://github.com/hogehogecojp/hoge2-orchestrator.git
+        cd hoge2-orchestrator
+        powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Install
+
+    なお、このスクリプトが済ませられるのは「手元のマシンで GUI が起動するところ」まで。
+    利用者ごとの認証（Claude Code へのログイン、gh auth login）と、チームで共有する設定
+    （タスク登録リポジトリの指定など）は別途必要になる。締めの案内に一覧を出す。
+
 .PARAMETER Install
     不足している前提を実際に導入する。省略時は診断結果と、やろうとしている操作を表示するだけ。
 
@@ -135,6 +147,20 @@ function Test-IsElevated {
     return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+<#
+    winget で何かを導入した直後に、このプロセスの PATH を作り直す。
+
+    winget が書き換えるのは「マシン／ユーザーの環境変数」で、既に動いているプロセスの
+    PATH には反映されない。そのため node や git を入れた直後でも、同じ実行の中では
+    `npm` が「見つからない」と言われて落ちる。レジストリ側の現在値を読み直して差し替える。
+#>
+function Update-ProcessPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $joined  = @($machine, $user) | Where-Object { $_ }
+    if ($joined) { $env:Path = ($joined -join ';') }
+}
+
 # ---------------------------------------------------------------- 診断
 
 Write-Host ''
@@ -152,10 +178,11 @@ if ($nodePath) {
     $nodeVersion = (& node -v).TrimStart('v')
     $nodeMajor = [int]($nodeVersion.Split('.')[0])
     Add-Check -Name "Node.js $MinNodeMajor 以上" -Ok ($nodeMajor -ge $MinNodeMajor) -Detail "v$nodeVersion" `
-        -Fix 'https://nodejs.org/ から LTS を導入するか、winget install OpenJS.NodeJS.LTS'
+        -Fix 'https://nodejs.org/ から LTS を導入するか、winget install OpenJS.NodeJS.LTS' `
+        -CanAutoInstall $true
 } else {
     Add-Check -Name "Node.js $MinNodeMajor 以上" -Ok $false -Detail '未導入' `
-        -Fix 'winget install OpenJS.NodeJS.LTS'
+        -Fix 'winget install OpenJS.NodeJS.LTS' -CanAutoInstall $true
 }
 
 # Git（Git Bash が要る。PATH に載るのは <Git>\cmd だけなので bin\bash.exe を自分で探す）
@@ -267,9 +294,22 @@ function Invoke-Winget {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Git
+# Node.js（これが無いと後段の npm install / setup:terminals が動かない）
+if (-not $nodePath -or $nodeMajor -lt $MinNodeMajor) {
+    [void](Invoke-Winget -Id 'OpenJS.NodeJS.LTS')
+    Update-ProcessPath
+}
+
+# Git（Git Bash が vk-agents の展開に要る）
 if (-not $bashPath) {
     [void](Invoke-Winget -Id 'Git.Git')
+    Update-ProcessPath
+}
+
+# GitHub CLI（GitHub をタスクキューに使う場合。認証は利用者が自分で行う）
+if (-not $ghPath) {
+    [void](Invoke-Winget -Id 'GitHub.cli')
+    Update-ProcessPath
 }
 
 # VS Build Tools と Spectre 軽減ライブラリ
@@ -322,6 +362,49 @@ if (-not $claudePath) {
 }
 
 # ---------------------------------------------------------------- ビルドと検証
+
+Write-Section 'ビルド前の再確認'
+
+# 導入を試みたあとに、後段（npm install / setup:terminals）が本当に動く状態かを見る。
+#
+# ここで止めずに進むと `npm` が見つからないという分かりにくいエラーで落ちる。とくに
+# winget での導入直後は、PATH の更新が既存プロセスへ届かないことがある（Update-ProcessPath で
+# レジストリから読み直してはいるが、インストーラの都合で反映が遅れる場合がある）。
+# その場合はシェルを開き直せば直るので、そう案内して終わる。
+Update-ProcessPath
+$blockers = @()
+
+$nodePath = Get-CommandPath 'node'
+if ($nodePath) {
+    $nodeVersion = (& node -v).TrimStart('v')
+    $nodeMajor = [int]($nodeVersion.Split('.')[0])
+    if ($nodeMajor -lt $MinNodeMajor) { $blockers += "Node.js が $MinNodeMajor 未満です（v$nodeVersion）" }
+    else { Write-Host "  Node.js … v$nodeVersion" -ForegroundColor Green }
+} else {
+    $blockers += 'Node.js が見つかりません'
+}
+
+if (-not (Get-CommandPath 'npm')) { $blockers += 'npm が見つかりません' }
+else { Write-Host "  npm … $(& npm -v)" -ForegroundColor Green }
+
+if (-not $SkipBuildTools) {
+    if (-not (Get-VsInstallPathWith -ComponentId $VsComponentVCTools)) {
+        $blockers += 'VS Build Tools の C++ ワークロードが見つかりません'
+    }
+    if (-not (Get-VsInstallPathWith -ComponentId $VsComponentSpectre)) {
+        $blockers += 'Spectre 軽減ライブラリが見つかりません（node-pty のビルドが MSB8040 で失敗します）'
+    }
+}
+
+if ($blockers.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  ビルドに進めません:' -ForegroundColor Red
+    foreach ($b in $blockers) { Write-Host "   - $b" -ForegroundColor Red }
+    Write-Host ''
+    Write-Host '  導入直後であれば、PowerShell を開き直してからもう一度実行すると解決することがあります' -ForegroundColor Yellow
+    Write-Host '  （インストーラが更新した PATH が、実行中のプロセスへ届いていない場合があるため）。' -ForegroundColor Yellow
+    exit 1
+}
 
 Write-Section 'VK Terminals(GUI) の導入'
 
