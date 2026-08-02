@@ -83,11 +83,19 @@ async function resolveVkDirOrExit() {
     console.error(
       'VK Terminals が見つかりません（未導入、または optional 依存のビルド失敗で除外されています）。\n' +
       '  導入するには: npm run setup:terminals（ビルドログを表示しながら導入し、結果を検証します）\n' +
+      // ネイティブビルド（node-pty / electron）に必要なツールチェーンは OS ごとに違うので、
+      // 「今の OS で何を入れればよいか」だけを出す。VK Terminals は macOS / Linux(WSLg) /
+      // Windows のいずれでも動くため、OS を理由に「起動できない」と言い切らない
+      // （以前は非 macOS を一律「macOS 専用のため起動できません」と案内しており、
+      //  Windows の利用者が導入をあきらめる案内になっていた）。
       (process.platform === 'darwin'
         ? '  macOS では Xcode Command Line Tools が必要です → `xcode-select --install`'
-        : `  現在のプラットフォームは ${process.platform} です。VK Terminals(GUI) は macOS 専用のため\n` +
-          '  この環境では起動できません。別マシンの VK Terminals API を使う場合は `up` ではなく\n' +
-          '  `start` を使い、VK_TERMINALS_HOST を対象マシンに向けてください。')
+        : process.platform === 'win32'
+          ? '  Windows では Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロードが必要です\n' +
+            '  （Node.js は 20 以上）。導入後に `npm run setup:terminals` を実行し直してください。'
+          : `  現在のプラットフォームは ${process.platform} です。Linux では GUI 表示に WSLg 等の\n` +
+            '  デスクトップ環境と C/C++ ビルドツールが必要です。GUI を手元で起動しない場合は\n' +
+            '  `up` ではなく `start` を使い、VK_TERMINALS_HOST を対象マシンに向けてください。')
     );
     process.exit(1);
   }
@@ -1138,11 +1146,23 @@ async function main() {
       const { resolveVkTerminalsDir } = await import('../src/config.js');
       const repoRoot = resolve(__dirname, '..');
 
-      if (process.platform !== 'darwin') {
+      // OS ごとに前提が違うだけで、どの OS でも導入はできる。非 macOS を一括で
+      // 「GUI を起動できません」と警告していたのは VK Terminals が Windows へ対応する前の
+      // 文言で、現在は実態と合っていない（Windows / Linux の利用者に、導入前から
+      // 「この環境では無理」と伝えてしまっていた）。
+      if (process.platform === 'win32') {
         console.warn(
-          `⚠ 現在のプラットフォームは ${process.platform} です。VK Terminals(GUI) は node-pty /\n` +
-          `  electron のネイティブビルドを伴い macOS 専用です。macOS 以外では GUI を起動できません。\n` +
-          `  別マシンの VK Terminals API を叩く構成（VK_TERMINALS_HOST 指定 + start）なら導入は不要です。\n`
+          '⚠ Windows では、node-pty / electron のネイティブビルドに Visual Studio Build Tools の\n' +
+          '  「C++ によるデスクトップ開発」ワークロードが必要です（未導入だとビルドが失敗します）。\n' +
+          '  また VSCode の統合ターミナルから実行する場合は、環境変数 ELECTRON_RUN_AS_NODE を\n' +
+          '  外してから実行してください（残っていると GUI が起動せず Node として動きます）。\n'
+        );
+      } else if (process.platform !== 'darwin') {
+        console.warn(
+          `⚠ 現在のプラットフォームは ${process.platform} です。node-pty / electron の\n` +
+          '  ネイティブビルドに C/C++ ビルドツールが必要です。GUI の表示には WSLg 等の\n' +
+          '  デスクトップ環境も必要になります。\n' +
+          '  別マシンの VK Terminals API を叩く構成（VK_TERMINALS_HOST 指定 + start）なら導入は不要です。\n'
         );
       }
 
@@ -1163,7 +1183,11 @@ async function main() {
           '   上のビルドログのエラーを確認してください。よくある原因:\n' +
           (process.platform === 'darwin'
             ? '   - Xcode Command Line Tools 未導入 → `xcode-select --install` を実行して再試行\n'
-            : `   - macOS 以外のため node-pty / electron をビルドできない（GUI は macOS のみ対応）\n`) +
+            : process.platform === 'win32'
+              ? '   - Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード未導入\n' +
+                '   - リポジトリの場所が `C:\\Program Files\\...` や OneDrive 同期対象フォルダにある\n' +
+                '     （パスの空白・同期の競合でネイティブビルドが失敗します）\n'
+              : '   - GUI 表示に必要なデスクトップ環境（WSLg 等）や依存ライブラリの不足\n') +
           '   - C/C++ ビルドツール不足、または clone 時のネットワークエラー'
         );
         process.exit(1);

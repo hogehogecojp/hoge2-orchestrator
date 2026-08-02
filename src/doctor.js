@@ -476,20 +476,39 @@ export function runDoctor(options = {}) {
   });
 
   // 0-2 プラットフォーム（実行面モードで文言が変わる。tmux モードは GUI 非依存）
-  const platformOk = platform === 'darwin' || platform === 'linux';
+  //
+  // 判定は実行面モードで分ける。「対応 OS」は 1 つではなく、モードごとに何が必要かが違うため。
+  //
+  // - vk-terminals モード（GUI）: macOS / Linux(WSLg) / Windows。VK Terminals は node-pty と
+  //   electron のネイティブビルドを伴うが、いずれの OS でもビルドできる（Windows は Visual Studio
+  //   Build Tools の C++ ワークロードが前提）。以前は macOS / WSL2 のみを通していたが、これは
+  //   VK Terminals が Windows へ対応する前の判定が残っていたもので、実態と合っていなかった。
+  // - tmux モード: macOS / Linux のみ。tmux はネイティブ Windows では動作しないため win32 は
+  //   通さない。ここで win32 を通すと「対応プラットフォーム ✅」の次の行に「tmux コマンド導入 ❌」が
+  //   並ぶ矛盾したレポートになり、読んだ人は tmux を入れれば直ると受け取ってしまう
+  //   （ネイティブ Windows で tmux は入れられないので、打つ手が無い案内になる）。
+  //   ネイティブ Windows で tmux モードを使いたい場合の答えは「WSL2 の中で動かす」なので、
+  //   ❌ にしたうえで hint でそちらへ誘導する。
+  const platformOk = tmuxMode
+    ? platform === 'darwin' || platform === 'linux'
+    : platform === 'darwin' || platform === 'linux' || platform === 'win32';
   requirements.push({
     id: 'platform',
     group: '前提',
-    label: tmuxMode ? '対応プラットフォーム（macOS / Linux）' : '対応プラットフォーム（macOS / WSL2）',
+    label: tmuxMode
+      ? '対応プラットフォーム（macOS / Linux）'
+      : '対応プラットフォーム（macOS / Linux / Windows）',
     required: true,
     target: 'external',
     ok: platformOk,
     current: platform,
     hint: tmuxMode
-      ? 'tmux モードは GUI を起動しないため、macOS / Linux（コンテナ・SSH 先・WSL2 を含む）であれば動作します。'
+      ? 'tmux モードは GUI を起動しないため、macOS / Linux（コンテナ・SSH 先・WSL2 を含む）であれば動作します。ネイティブ Windows では tmux が動かないため、WSL2 の中で実行するか、vk-terminals モード（GUI）を使ってください。'
       : platform === 'darwin'
         ? 'macOS では VK Terminals(GUI) をそのまま起動できます。'
-        : 'macOS または WSL2(WSLg) 上の Ubuntu で GUI を起動できます。それ以外の環境では別マシンの VK Terminals API を使う構成（~/.vk-terminals/config.json の apiHost + `vk-orchestrator start`）を検討してください。',
+        : platform === 'win32'
+          ? 'Windows では VK Terminals(GUI) をネイティブに起動できます（Node.js 20+ と Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロードが必要です）。'
+          : 'macOS / Linux(WSLg) / Windows で GUI を起動できます。それ以外の環境では別マシンの VK Terminals API を使う構成（~/.vk-terminals/config.json の apiHost + `vk-orchestrator start`）を検討してください。',
   });
 
   // terminals.mode（実行面のモード選択。以降の required がこの値で変わる）
@@ -531,7 +550,7 @@ export function runDoctor(options = {}) {
     current: vkTerminalsOk ? vkTerminalsView.display : '未導入',
     hint: tmuxMode
       ? 'tmux モードでは VK Terminals(GUI) は不要です（vk-terminals モードに切り替えるときだけ `npm run setup:terminals` で導入してください）。'
-      : '`npm run setup:terminals` で導入してください（GUI は macOS 専用。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
+      : '`npm run setup:terminals` で導入してください（GUI は macOS / Linux(WSLg) / Windows で動作します。非対応 OS では別マシンの VK Terminals API を使う構成を利用）。',
     ...displaySanitizedFlag(vkTerminalsAltered),
   });
 

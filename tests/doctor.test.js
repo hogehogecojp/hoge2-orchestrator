@@ -204,8 +204,8 @@ test('runDoctor: vk-terminals モード（既定）では VK Terminals 必須・
       undefined,
       'vk-terminals モードでは tmux 要件の行を出さないこと',
     );
-    // プラットフォームは GUI 前提の文言のまま。
-    assert.match(byId(reqs, 'platform').label, /WSL2/);
+    // プラットフォームは GUI 前提の文言のまま（GUI が動く 3 つの OS を並べる）。
+    assert.match(byId(reqs, 'platform').label, /macOS \/ Linux \/ Windows/);
     assert.equal(byId(reqs, 'terminals.mode').current, 'vk-terminals（既定）');
     assert.equal(byId(reqs, 'terminals.mode').ok, true);
     assert.equal(byId(reqs, 'terminals.mode').required, true);
@@ -1072,11 +1072,51 @@ test('runDoctor: terminals.mode を options ではなく config から解決す�
 });
 
 test('runDoctor: Node 20 未満・非対応プラットフォームは ok=false になる', () => {
-  withDoctorEnv({ nodeVersion: '18.20.0', platform: 'win32', allowedOwners: ['vektor-inc'] }, (options) => {
+  withDoctorEnv({ nodeVersion: '18.20.0', platform: 'aix', allowedOwners: ['vektor-inc'] }, (options) => {
     const reqs = runDoctor(options);
     assert.equal(byId(reqs, 'node').ok, false);
     assert.equal(byId(reqs, 'platform').ok, false);
   });
+});
+
+// win32 の扱いは実行面モードで割れる。VK Terminals(GUI) は Windows でネイティブに動くが、
+// tmux はネイティブ Windows には無い。片方だけ見て「Windows 対応済み／未対応」と決めると、
+// どちらかのモードの利用者に嘘の案内が出るため、2 つとも固定する。
+test('runDoctor: vk-terminals モードの Windows は対応プラットフォームとして ok になる', () => {
+  withDoctorEnv(
+    { terminalsMode: 'vk-terminals', platform: 'win32', allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const platformReq = byId(runDoctor(options), 'platform');
+      assert.equal(platformReq.ok, true);
+      assert.equal(platformReq.current, 'win32');
+      assert.match(platformReq.label, /Windows/);
+      // hint は Windows 固有の前提（Build Tools）を案内する。
+      assert.match(platformReq.hint, /Visual Studio Build Tools/);
+    },
+  );
+});
+
+test('runDoctor: tmux モードの Windows は ok=false になり WSL2 か GUI へ誘導する', () => {
+  withDoctorEnv(
+    { terminalsMode: 'tmux', platform: 'win32', allowedOwners: ['vektor-inc'] },
+    (options) => {
+      const platformReq = byId(runDoctor(options), 'platform');
+      // ネイティブ Windows に tmux は無いので、ここを ok にすると
+      // 「対応プラットフォーム ✅ / tmux コマンド導入 ❌」という打つ手の無い案内になる。
+      assert.equal(platformReq.ok, false);
+      assert.equal(platformReq.required, true);
+      assert.match(platformReq.label, /macOS \/ Linux/);
+      assert.match(platformReq.hint, /WSL2/);
+    },
+  );
+});
+
+test('runDoctor: Linux は両モードとも対応プラットフォームのまま', () => {
+  for (const terminalsMode of ['vk-terminals', 'tmux']) {
+    withDoctorEnv({ terminalsMode, platform: 'linux', allowedOwners: ['vektor-inc'] }, (options) => {
+      assert.equal(byId(runDoctor(options), 'platform').ok, true, `${terminalsMode} で linux が ok であること`);
+    });
+  }
 });
 
 test('runDoctor: github.owner 未設定は ok=false・既定 vektor-inc を表示する', () => {
