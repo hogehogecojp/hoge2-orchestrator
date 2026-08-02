@@ -46,6 +46,20 @@ VK Terminals は `npm install` 時に依存として自動導入されます（`
 
 WSL2 を経由せず、Windows 上で直接動かせます（Node.js 20 / 24 で動作を確認しています）。
 
+**セットアップスクリプト（推奨）** — 前提の診断から VK Terminals の導入・`doctor` までを 1 コマンドで行えます。
+
+```powershell
+# まず診断だけ（何も変更しません）
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
+
+# 不足しているものを導入して、doctor まで通す
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Install
+```
+
+下記の落とし穴（Spectre 軽減ライブラリ、`NoDefaultCurrentDirectoryInExePath`、Git Bash）はスクリプトが面倒を見ます。Claude Code CLI だけは、利用者ごとの認証が必要なため自動導入せず案内に留めています。
+
+以下は、スクリプトを使わず手で進める場合の内容です。
+
 **必要なビルドツール** — `npm run setup:terminals` は node-pty と electron のネイティブビルドを伴います。
 
 ```powershell
