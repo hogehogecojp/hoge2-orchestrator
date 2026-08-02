@@ -744,26 +744,85 @@ export async function downloadZip({
 }
 
 /**
- * zip を展開する。macOS / Linux の標準コマンドを使う（Node に zip 展開は無い）。
+ * PowerShell へ渡す値を単引用符で括る。
+ *
+ * PowerShell の単引用符文字列では、単引用符自身を 2 つ重ねることで表す（バックスラッシュは
+ * エスケープにならない）。一時ディレクトリの経路は OS とユーザー名から決まるため、
+ * 単引用符を含みうる値として扱う。
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function quoteForPowerShell(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * zip を展開するコマンドの候補を、試す順に並べて返す（判断だけを行い、実行はしない）。
+ *
+ * Node 自身に zip 展開が無いため OS 標準のコマンドに頼るが、`unzip` は **Windows に存在しない**
+ * （Git for Windows にも同梱されない）。プラットフォームごとに「まず確実に在るもの」から
+ * 順に試す。
+ *
+ * @param {string} platform `process.platform` の値
+ * @param {string} zipPath
+ * @param {string} destDir
+ * @returns {{ command:string, args:string[] }[]}
+ */
+export function zipExtractCommands(platform, zipPath, destDir) {
+  if (platform === 'win32') {
+    return [
+      // Windows 10 1803 以降に標準で入っている bsdtar。GNU tar と違い zip も展開できる。
+      { command: 'tar', args: ['-x', '-f', zipPath, '-C', destDir] },
+      // tar.exe を持たない古い Windows 向け。Expand-Archive は PowerShell 5.0 以降。
+      {
+        command: 'powershell',
+        args: [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `Expand-Archive -LiteralPath ${quoteForPowerShell(zipPath)} `
+            + `-DestinationPath ${quoteForPowerShell(destDir)} -Force`,
+        ],
+      },
+    ];
+  }
+  if (platform === 'darwin') {
+    return [
+      { command: 'unzip', args: ['-q', '-o', zipPath, '-d', destDir] },
+      // unzip が無い環境向けのフォールバック（macOS 標準の ditto）。
+      { command: 'ditto', args: ['-x', '-k', zipPath, destDir] },
+    ];
+  }
+  return [{ command: 'unzip', args: ['-q', '-o', zipPath, '-d', destDir] }];
+}
+
+/**
+ * zip を展開する。OS 標準のコマンドを使う（Node に zip 展開は無い）。
  * @param {string} zipPath
  * @param {string} destDir
  * @returns {{ ok:true, rootDir:string } | { ok:false, code:string, message:string }}
  */
 export function extractZip(zipPath, destDir) {
   mkdirSync(destDir, { recursive: true });
-  let r = spawnSync('unzip', ['-q', '-o', zipPath, '-d', destDir], { stdio: 'inherit' });
-  if (r.error || r.status !== 0) {
-    if (process.platform === 'darwin') {
-      // unzip が無い環境向けのフォールバック（macOS 標準の ditto）。
-      r = spawnSync('ditto', ['-x', '-k', zipPath, destDir], { stdio: 'inherit' });
+
+  const attempts = zipExtractCommands(process.platform, zipPath, destDir);
+  const tried = [];
+  let extracted = false;
+  for (const { command, args } of attempts) {
+    const r = spawnSync(command, args, { stdio: 'inherit' });
+    if (!r.error && r.status === 0) {
+      extracted = true;
+      break;
     }
-    if (r.error || r.status !== 0) {
-      return {
-        ok: false,
-        code: 'extract-failed',
-        message: 'zip を展開できませんでした（unzip コマンドが必要です）。',
-      };
-    }
+    tried.push(command);
+  }
+  if (!extracted) {
+    return {
+      ok: false,
+      code: 'extract-failed',
+      message: `zip を展開できませんでした（試したコマンド: ${tried.join(' / ')}）。`,
+    };
   }
 
   // 配布 zip は vk-orchestrator/ の 1 階層を含む。既知の形を先に見て確定させる。

@@ -1,5 +1,6 @@
 # Changelog
 
+- [ 不具合修正 ] Windows で `vk-orchestrator update`（起動時の自動アップデートを含む）が必ず失敗し、新しい版へ更新できない不具合を修正。配布 zip の展開に `unzip` を決め打ちで使っていましたが、`unzip` は Windows に存在せず（Git for Windows にも同梱されません）、フォールバックも macOS の `ditto` だけでした。Windows では標準搭載の `tar`（Windows 10 1803 以降の bsdtar。GNU tar と違い zip も展開できます）を使い、それ以前の環境には PowerShell の `Expand-Archive` を用意しました（macOS / Linux の挙動は変わりません）
 - [ 不具合修正 ] Node 22 以降で `npm run setup:terminals` が成功したように見えて electron の実行ファイルが展開されず、GUI を起動できない不具合を修正。electron のインストーラが使う `extract-zip` は `yauzl` 2.x（`fd-slicer`）に依存しており、これが新しい Node では巨大な zip の展開中に無言で停止する（エラーも出さず終了コード 0 を返すため、原因に辿り着けない状態でした）。`yauzl` を 3.x へ上げる overrides を追加し、Node 24 で 107MB の electron zip が完全に展開されることを確認
 - [ その他 ] Windows のネイティブビルドに Spectre 軽減ライブラリが必要であることを、`npm run setup:terminals` の案内と README に明記。「C++ によるデスクトップ開発」ワークロードの「推奨コンポーネントを含める」でも入らないため、未導入だと node-pty のビルドが MSB8040 で失敗します。併せて、環境変数 `NoDefaultCurrentDirectoryInExePath` が設定されていると winpty のビルドが失敗する件も検知して案内するようにしました
 - [ 機能追加 ] Windows で WSL2 を経由せずネイティブに動作するよう対応。`vk-orchestrator doctor` の対応プラットフォーム判定に Windows を追加し、「macOS 専用」という実態と合わない案内を各所で修正（VK Terminals(GUI) 自体は以前から Windows へ対応済みで、orchestrator 側の判定と文言だけが古い状態でした）。tmux モードはネイティブ Windows に tmux が無いため従来どおり非対応で、WSL2 か GUI モードへ誘導します

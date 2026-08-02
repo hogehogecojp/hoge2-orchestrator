@@ -24,6 +24,7 @@ import {
   downloadZip,
   evaluateBundledDependencies,
   executeSwapSteps,
+  extractZip,
   fetchUpdateManifest,
   isStagingDirInUse,
   isStartLockHeld,
@@ -39,6 +40,7 @@ import {
   validateApplyArguments,
   verifyStagedIdentity,
   writeUpdateState,
+  zipExtractCommands,
 } from '../src/engine/update-runner.js';
 import { STAGE_TARGET_FILENAME, backupDirFor, planSwap } from '../src/engine/update-apply.js';
 
@@ -1111,6 +1113,153 @@ describe('downloadZip', () => {
     });
     assert.equal(r.ok, false);
     assert.equal(called, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// zip の展開
+// ---------------------------------------------------------------------------
+
+/** zip の CRC-32。zip を手で組み立てるために必要（Node に zip 生成は無い）。 */
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let bit = 0; bit < 8; bit++) {
+      crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * 無圧縮（stored）の zip を組み立てる。
+ *
+ * 展開できることを本物の zip で確かめたいが、Node にも依存パッケージにも zip 生成が無い。
+ * 無圧縮なら形式が単純なので、ここで直接組み立てる。日時は 1980-01-01 で固定する。
+ */
+function buildStoredZip(entries) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+
+  for (const { name, content } of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const data = Buffer.from(content, 'utf8');
+    const crc = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);  // ローカルファイルヘッダの目印
+    local.writeUInt16LE(20, 4);          // 展開に必要な版
+    local.writeUInt16LE(0, 6);           // フラグ
+    local.writeUInt16LE(0, 8);           // 圧縮方式 0 = 無圧縮
+    local.writeUInt16LE(0, 10);          // 時刻
+    local.writeUInt16LE(0x21, 12);       // 日付（1980-01-01）
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);          // 拡張フィールド
+    locals.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); // 中央ディレクトリの目印
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0x21, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);   // 対応するローカルヘッダの位置
+    centrals.push(central, nameBuf);
+
+    offset += local.length + nameBuf.length + data.length;
+  }
+
+  const localPart = Buffer.concat(locals);
+  const centralPart = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);      // 中央ディレクトリ終端の目印
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralPart.length, 12);
+  end.writeUInt32LE(localPart.length, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([localPart, centralPart, end]);
+}
+
+describe('zip を展開するコマンドの選択', () => {
+  // Windows に unzip は無い（Git for Windows にも同梱されない）。
+  // 決め打ちで unzip を起動していたため、Windows では自己更新が必ず失敗していた。
+  it('Windows では unzip を候補に入れず、tar と Expand-Archive を順に試す', () => {
+    const cmds = zipExtractCommands('win32', 'C:\\tmp\\a.zip', 'C:\\tmp\\out');
+    assert.deepEqual(cmds.map((c) => c.command), ['tar', 'powershell']);
+  });
+
+  it('Windows の tar には展開先を -C で渡す', () => {
+    const [tar] = zipExtractCommands('win32', 'C:\\tmp\\a.zip', 'C:\\tmp\\out');
+    assert.deepEqual(tar.args, ['-x', '-f', 'C:\\tmp\\a.zip', '-C', 'C:\\tmp\\out']);
+  });
+
+  // PowerShell の単引用符文字列は、単引用符自身を 2 つ重ねて表す。重ねずに埋め込むと
+  // 経路の側から囲いを閉じられ、後ろが別のコマンドとして解釈されうる。
+  it('PowerShell へ渡す経路の単引用符を重ねて閉じ込める', () => {
+    const cmds = zipExtractCommands('win32', "C:\\it's\\a.zip", "C:\\out's");
+    const script = cmds[1].args.at(-1);
+    assert.match(script, /-LiteralPath 'C:\\it''s\\a\.zip'/);
+    assert.match(script, /-DestinationPath 'C:\\out''s'/);
+  });
+
+  it('macOS は unzip を試し、無ければ ditto へ回す', () => {
+    const cmds = zipExtractCommands('darwin', '/tmp/a.zip', '/tmp/out');
+    assert.deepEqual(cmds.map((c) => c.command), ['unzip', 'ditto']);
+  });
+
+  it('Linux は unzip を使う', () => {
+    const cmds = zipExtractCommands('linux', '/tmp/a.zip', '/tmp/out');
+    assert.deepEqual(cmds.map((c) => c.command), ['unzip']);
+  });
+});
+
+describe('zip の展開（この環境の標準コマンドで実行する）', () => {
+  it('配布 zip を展開し、vk-orchestrator/ の中身を取り出す', () => {
+    const zipPath = join(work, 'vk-orchestrator.zip');
+    writeFileSync(zipPath, buildStoredZip([
+      { name: 'vk-orchestrator/package.json', content: JSON.stringify({ name: 'vk-orchestrator', version: '1.5.0' }) },
+      { name: 'vk-orchestrator/src/engine/index.js', content: '// dummy\n' },
+    ]));
+
+    const destDir = join(work, 'extracted');
+    const r = extractZip(zipPath, destDir);
+
+    assert.equal(r.ok, true, r.ok ? '' : r.message);
+    assert.equal(r.rootDir, join(destDir, 'vk-orchestrator'));
+    assert.equal(
+      readFileSync(join(r.rootDir, 'src', 'engine', 'index.js'), 'utf8'),
+      '// dummy\n'
+    );
+  });
+
+  it('壊れた zip は展開できなかったと伝える', () => {
+    const zipPath = join(work, 'broken.zip');
+    writeFileSync(zipPath, Buffer.from('これは zip ではありません'));
+
+    const r = extractZip(zipPath, join(work, 'extracted'));
+
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'extract-failed');
   });
 });
 
