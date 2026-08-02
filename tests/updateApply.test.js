@@ -10,6 +10,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import {
   BACKUP_DIR_INFIX,
@@ -248,17 +249,20 @@ describe('evaluateUpdateBlockers', () => {
 });
 
 describe('展開先・控えのパス', () => {
+  // 期待値は join() で組む。stagingDirFor は join() で組み立てているため、区切り文字を
+  // リテラルで固定すると Windows では実装が正しくても落ちる。ここで検証したいのは
+  // 「親ディレクトリ（インストール先の兄弟）とディレクトリ名」であって区切り文字ではない。
   it('展開先はインストールディレクトリの兄弟に置く（原子的な rename を保証する）', () => {
     assert.equal(
       stagingDirFor('/Users/tester/apps', '1.5.0'),
-      '/Users/tester/apps/.vk-orchestrator-staging-1.5.0'
+      join('/Users/tester/apps', '.vk-orchestrator-staging-1.5.0')
     );
   });
 
   it('展開先に識別子を付けられる（同時実行が同じ展開先を掴まないようにする）', () => {
     assert.equal(
       stagingDirFor('/Users/tester/apps', '1.5.0', 12345),
-      '/Users/tester/apps/.vk-orchestrator-staging-1.5.0-12345'
+      join('/Users/tester/apps', '.vk-orchestrator-staging-1.5.0-12345')
     );
   });
 
@@ -296,7 +300,7 @@ describe('sanitizeVersionForPath（ディレクトリ名に埋める版の検証
     assert.equal(backupDirFor(INSTALL, evil), `${INSTALL}${BACKUP_DIR_INFIX}${UNKNOWN_VERSION_LABEL}`);
     assert.equal(
       stagingDirFor('/Users/tester/apps', evil),
-      `/Users/tester/apps/${STAGING_DIR_PREFIX}${UNKNOWN_VERSION_LABEL}`
+      join('/Users/tester/apps', `${STAGING_DIR_PREFIX}${UNKNOWN_VERSION_LABEL}`)
     );
   });
 });

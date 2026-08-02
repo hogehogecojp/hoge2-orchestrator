@@ -22,7 +22,13 @@ import { fileURLToPath } from 'url';
 import { evaluateUpdateBlockers } from '../src/engine/update-apply.js';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BIN_SOURCE = readFileSync(join(REPO_ROOT, 'bin', 'vk-orchestrator.js'), 'utf8');
+// 改行コードを LF へ揃えてから検査する。このテストはソースを**文字列として**読んで
+// 構造を確かめるため、`'    return;\n  }'` のような改行込みのパターンを使う。
+// Windows の Git は既定（core.autocrlf=true）でチェックアウト時に CRLF へ変換するので、
+// 素で読むと実装が正しくてもパターンが一致せず落ちる。検証したいのは処理の順序であって
+// 作業ツリーの改行コードではないので、読み取り時に吸収する。
+const BIN_SOURCE = readFileSync(join(REPO_ROOT, 'bin', 'vk-orchestrator.js'), 'utf8')
+  .replace(/\r\n/g, '\n');
 
 /** 関数本体を名前から切り出す（次の同レベル関数宣言までを本体とみなす）。 */
 function functionBody(source, name) {

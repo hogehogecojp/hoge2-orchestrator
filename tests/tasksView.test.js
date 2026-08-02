@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -145,19 +145,31 @@ test('writeTasksViewFile: 一時ファイル経由で JSON を書き出す', asy
 });
 
 test('refreshTasksViewSnapshot: 書き出し失敗は warn のみで握りつぶす', async () => {
-  const warnings = [];
-  const result = await refreshTasksViewSnapshot(
-    { owner: 'o', repo: 'r', octokit: { issues: {} } },
-    {
-      filePath: '/dev/null/tasks-view.json',
-      issues: [],
-      logger: { warn: (message) => warnings.push(message) },
-    },
-  );
+  // 書き出せないパスの作り方を OS 中立にする。以前は `/dev/null/tasks-view.json` を
+  // 使っていたが、これは「/dev/null は普通のファイルなのでその下へは書けない」という
+  // POSIX 固有の性質に頼っていた。Windows には /dev/null が無く `C:\dev\null\...` として
+  // 解釈されるため、**書き出しが成功してしまい**（しかもテストが実マシンに C:\dev\null を
+  // 作る）、握りつぶしの検証にならなかった。
+  // 代わりに「普通のファイルを親ディレクトリに指定する」形にする。親がディレクトリでない
+  // 以上どの OS でも書き出しは失敗するので、狙いどおりの経路を通る。
+  await withTmpDir(async (dir) => {
+    const notADir = join(dir, 'not-a-directory');
+    writeFileSync(notADir, 'この位置にあるのはディレクトリではなくファイル');
 
-  assert.equal(result, null);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /tasks-view\.json 書き出し失敗/);
+    const warnings = [];
+    const result = await refreshTasksViewSnapshot(
+      { owner: 'o', repo: 'r', octokit: { issues: {} } },
+      {
+        filePath: join(notADir, 'tasks-view.json'),
+        issues: [],
+        logger: { warn: (message) => warnings.push(message) },
+      },
+    );
+
+    assert.equal(result, null);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /tasks-view\.json 書き出し失敗/);
+  });
 });
 
 test('refreshTasksSnapshots: 掃除スイープへ再利用できる取得済み issues を返す', async () => {

@@ -8,6 +8,12 @@ async function makeTempDir() {
   return fs.mkdtemp(join(tmpdir(), 'vk-orchestrator-lock-'));
 }
 
+// 「所有者限定 mode」は POSIX の権限ビットの話で、Windows には対応する概念が無い。
+// Windows のアクセス制御は ACL が担い、Node の mode 引数はほぼ無視されるため、
+// stat().mode は常に 0o666 / 0o777 相当を返す（実装が正しくても 0o600 にはならない）。
+// そこで **mode の検証だけ** を POSIX 限定にし、作成されたこと自体は全 OS で検証する。
+const POSIX_MODES = process.platform !== 'win32';
+
 describe('start lock', () => {
   it('同時取得では片方だけがロック作成に成功する', async () => {
     const { createStartLock } = await import('../src/engine/start-lock.js');
@@ -208,7 +214,14 @@ describe('start lock', () => {
 
     await lock.acquire();
 
-    assert.equal((await fs.stat(lockDir)).mode & 0o777, 0o700);
-    assert.equal((await fs.stat(lockFile)).mode & 0o777, 0o600);
+    // 全 OS 共通: 親ディレクトリごと作られること。
+    assert.ok((await fs.stat(lockDir)).isDirectory(), 'ロックの親ディレクトリが作られること');
+    assert.ok((await fs.stat(lockFile)).isFile(), 'ロックファイルが作られること');
+
+    // mode の検証は POSIX 限定。理由は POSIX_MODES の定義箇所を参照。
+    if (POSIX_MODES) {
+      assert.equal((await fs.stat(lockDir)).mode & 0o777, 0o700);
+      assert.equal((await fs.stat(lockFile)).mode & 0o777, 0o600);
+    }
   });
 });

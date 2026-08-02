@@ -844,24 +844,27 @@ test('migrateLegacyVkAgentsGuiKeys: orchestrator config が無い・不正 JSON 
   }
 });
 
+// 期待値はリテラルではなく join() で組む。これらの関数自体が join() で組み立てているため、
+// リテラルで書くと OS の区切り文字を固定したことになり、Windows では実装が正しくても落ちる
+// （検証したいのは「どのディレクトリのどのファイルを指すか」であって区切り文字ではない）。
 test('vkAgentsGlobalSettingsPath: sync.sh と同じ Claude グローバル設定パスを返す', () => {
   assert.equal(
     vkAgentsGlobalSettingsPath('/tmp/home'),
-    '/tmp/home/.claude/vk-agents-settings.json',
+    join('/tmp/home', '.claude', 'vk-agents-settings.json'),
   );
 });
 
 test('vkAgentsSkillsManifestPath: sync.sh の Claude スキルマニフェストパスを返す', () => {
   assert.equal(
     vkAgentsSkillsManifestPath('/tmp/home'),
-    '/tmp/home/.claude/skills/.agent-skills-manifest',
+    join('/tmp/home', '.claude', 'skills', '.agent-skills-manifest'),
   );
 });
 
 test('vkAgentsSkillsManifestSourcePath: orchestrator 管理の展開元サイドカーパスを返す', () => {
   assert.equal(
     vkAgentsSkillsManifestSourcePath('/tmp/home'),
-    '/tmp/home/.claude/skills/.agent-skills-manifest-source',
+    join('/tmp/home', '.claude', 'skills', '.agent-skills-manifest-source'),
   );
 });
 

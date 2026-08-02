@@ -8,6 +8,13 @@ async function makeTempDir() {
   return fs.mkdtemp(join(tmpdir(), 'vk-orchestrator-logger-'));
 }
 
+// 「所有者限定 mode」は POSIX の権限ビットの話で、Windows には対応する概念が無い。
+// Windows のアクセス制御は ACL が担い、Node の mode 引数はほぼ無視されるため、
+// stat().mode は常に 0o666 / 0o777 相当を返す（実装が正しくても 0o600 にはならない）。
+// そこで **mode の検証だけ** を POSIX 限定にし、作成されたこと自体は全 OS で検証する
+// （テストごと skip すると、Windows ではファイルが作られない退行を拾えなくなる）。
+const POSIX_MODES = process.platform !== 'win32';
+
 describe('persistent logger', () => {
   it('console 出力を維持しつつ、ISO 時刻付き・秘匿情報マスク済みの行をファイルへ追記する', async () => {
     const { createPersistentLogger } = await import('../src/engine/persistent-logger.js');
@@ -67,7 +74,13 @@ describe('persistent logger', () => {
 
     logger.log('created');
 
-    assert.equal((await fs.stat(logDir)).mode & 0o777, 0o700);
-    assert.equal((await fs.stat(logFile)).mode & 0o777, 0o600);
+    // 全 OS 共通: 親ディレクトリごと作られること。
+    assert.ok((await fs.stat(logDir)).isDirectory(), 'ログの親ディレクトリが作られること');
+    assert.ok((await fs.stat(logFile)).isFile(), 'ログファイルが作られること');
+
+    if (POSIX_MODES) {
+      assert.equal((await fs.stat(logDir)).mode & 0o777, 0o700);
+      assert.equal((await fs.stat(logFile)).mode & 0o777, 0o600);
+    }
   });
 });
