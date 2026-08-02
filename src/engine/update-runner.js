@@ -65,6 +65,8 @@ import {
   validateUpdateJournalPaths,
 } from './update-apply.js';
 import { orchestratorUpdateDecision } from './self-update.js';
+// Windows では npm が .cmd シムのため spawn では起動できない。解決はここへ寄せる。
+import { resolveNpmLauncher } from '../platform/external-commands.js';
 import { formatVersionLine, selectUpdateNotice } from './update-messages.js';
 import {
   FETCH_TAGS_TIMEOUT_MS,
@@ -895,8 +897,15 @@ export function evaluateBundledDependencies(stagedDir, expectedLockSha256) {
  * @returns {{ ok:boolean, message?:string }}
  */
 export function installStagedDependencies(stagedDir) {
-  const r = spawnSync('npm', ['ci', '--omit=optional'], { cwd: stagedDir, stdio: 'inherit' });
-  if (r.error) return { ok: false, message: `npm ci を実行できませんでした: ${r.error.message}` };
+  const npm = resolveNpmLauncher();
+  const r = spawnSync(npm.command, [...npm.prefixArgs, 'ci', '--omit=optional'], {
+    cwd: stagedDir,
+    stdio: 'inherit',
+  });
+  if (r.error) {
+    const detail = npm.hint ? `${r.error.message}\n  ${npm.hint}` : r.error.message;
+    return { ok: false, message: `npm ci を実行できませんでした: ${detail}` };
+  }
   if (r.status !== 0) return { ok: false, message: 'npm ci が失敗しました（ネットワーク接続をご確認ください）。' };
   return { ok: true };
 }

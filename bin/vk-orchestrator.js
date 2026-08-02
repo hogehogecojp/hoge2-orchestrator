@@ -14,6 +14,14 @@
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { formatErrorSummary } from '../src/engine/format-error.js';
+// npm / bash の起動方法の解決。macOS / Linux では従来と同じ値を返し、Windows でだけ
+// 迂回する（npm は .cmd シム、bash は PATH 外にあるため spawn が解決できない）。
+// 判断はすべて src/platform/external-commands.js に閉じ込め、呼び出し側には出さない。
+import {
+  resolveNpmLauncher,
+  resolveBashLauncher,
+  toBashPath,
+} from '../src/platform/external-commands.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -317,10 +325,15 @@ async function applyGitUpdate(repoRoot, report, { relaunch = true } = {}) {
   const afterLock = gitBlobHash('package-lock.json');
   if (beforeLock !== afterLock) {
     console.log('[up] 依存関係が変わったため npm install を実行します...');
-    const install = spawnSync('npm', ['install'], { cwd: repoRoot, stdio: 'inherit' });
+    const npm = resolveNpmLauncher();
+    const install = spawnSync(npm.command, [...npm.prefixArgs, 'install'], {
+      cwd: repoRoot,
+      stdio: 'inherit',
+    });
     if (install.status !== 0) {
       console.warn(
         '[up] npm install に失敗しました。現行プロセスのまま起動を続行します。\n' +
+        (npm.hint ? `  ${npm.hint}\n` : '') +
         '  手動で `npm install` を実行してください。'
       );
       return;
@@ -400,7 +413,14 @@ async function reconcileVkAgentsDeployment() {
     console.warn(`[up] vk-agents 設定の書き出しに失敗しました（展開は続行）: ${err.message}`);
   }
 
-  const r = spawnSync('bash', [syncPath, '--claude-global'], {
+  const bash = resolveBashLauncher();
+  if (!bash.command) {
+    // bash が無い状態で spawn すると ENOENT のまま「展開に失敗」としか出ず、何を入れれば
+    // 直るのかが分からない。ここで打ち切って、導入すべきものを名指しで案内する。
+    console.warn(`[up] エージェント定義を展開できません（処理は継続）。\n  ${bash.hint}`);
+    return;
+  }
+  const r = spawnSync(bash.command, [toBashPath(syncPath), '--claude-global'], {
     cwd: agentsDir,
     stdio: 'inherit',
     env: process.env,
@@ -498,14 +518,16 @@ async function reconcileVkTerminalsVersion() {
       ? `vk-terminals を更新します（導入済み: ${installed} → 対象: ${targetTag}）...`
       : `vk-terminals が未導入です。${targetTag} をインストールします...`
   );
+  const npm = resolveNpmLauncher();
   const r = spawnSync(
-    'npm',
-    ['install', spec, '--no-save', '--include=optional', '--foreground-scripts'],
+    npm.command,
+    [...npm.prefixArgs, 'install', spec, '--no-save', '--include=optional', '--foreground-scripts'],
     { cwd: repoRoot, stdio: 'inherit' }
   );
   if (r.status !== 0) {
     console.warn(
       '[up] vk-terminals のインストールに失敗しました。古い版のまま起動する可能性があります。\n' +
+      (npm.hint ? `  ${npm.hint}\n` : '') +
       '  手動で `npm run setup:terminals` を実行してください。'
     );
   }
@@ -944,7 +966,9 @@ async function main() {
       }
 
       console.log(`VK Terminals(GUI) を起動します（${vkDir}, gpu=${gpuMode}, api=${host}:${apiPort}）...`);
-      const gui = spawn('npm', guiArgs, {
+      const guiNpm = resolveNpmLauncher();
+      if (guiNpm.hint) console.warn(`[up] ${guiNpm.hint}`);
+      const gui = spawn(guiNpm.command, [...guiNpm.prefixArgs, ...guiArgs], {
         cwd: vkDir,
         stdio: 'inherit',
         // ウィンドウタイトルバー／ヘッダーの表記を 'VK Orchestrator' にする。
@@ -1078,7 +1102,13 @@ async function main() {
       console.log(`vk-agents 派生設定を書き出しました → ${written.globalSettingsPath}`);
 
       console.log('vk-agents の skills/rules を Claude グローバル設定へ展開します...');
-      const r = spawnSync('bash', [syncPath, '--claude-global'], {
+      const bash = resolveBashLauncher();
+      if (!bash.command) {
+        // 明示的に叩かれたサブコマンドなので、up 側（警告して継続）と違いここは失敗で終わる。
+        console.error(`[setup:agents] ${bash.hint}`);
+        process.exit(1);
+      }
+      const r = spawnSync(bash.command, [toBashPath(syncPath), '--claude-global'], {
         cwd: agentsDir,
         stdio: 'inherit',
         env: process.env,
@@ -1117,7 +1147,9 @@ async function main() {
       }
 
       console.log('VK Terminals を導入します（ビルドログを表示します）...\n');
-      spawnSync('npm', ['install', '--foreground-scripts', '--include=optional'], {
+      const setupNpm = resolveNpmLauncher();
+      if (setupNpm.hint) console.warn(setupNpm.hint);
+      spawnSync(setupNpm.command, [...setupNpm.prefixArgs, 'install', '--foreground-scripts', '--include=optional'], {
         cwd: repoRoot,
         stdio: 'inherit',
       });
